@@ -10,10 +10,12 @@
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::sync::{mpsc, Notify};
 
 const MAX_TOOL_OUTPUT: usize = 50_000;
 const DEFAULT_MAX_TOKENS: u32 = 131_072;
@@ -33,6 +35,8 @@ enum Error {
     Http(Box<ureq::Error>),
     Json(serde_json::Error),
     Io(io::Error),
+    /// The coroutine was cancelled (Ctrl-C). Not a failure — a stop.
+    Interrupted,
 }
 
 impl std::fmt::Display for Error {
@@ -43,6 +47,7 @@ impl std::fmt::Display for Error {
             Self::Http(e) => write!(f, "{e}"),
             Self::Json(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "{e}"),
+            Self::Interrupted => write!(f, "interrupted"),
         }
     }
 }
@@ -144,15 +149,9 @@ fn tools() -> Vec<Tool> {
             run: |i| {
                 let prog_flag = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
                 match Command::new(prog_flag.0).args([prog_flag.1, i["command"].as_str().unwrap_or("")]).output() {
-                    Ok(o) => {
-                        let mut out = String::from_utf8_lossy(&o.stdout).into_owned();
-                        let err = String::from_utf8_lossy(&o.stderr);
-                        if !err.is_empty() {
-                            if !out.is_empty() && !out.ends_with('\n') { out.push('\n'); }
-                            out.push_str(&err);
-                        }
-                        format!("exit={}\n{out}", o.status.code().unwrap_or(-1))
-                    }
+                    Ok(o) => bash_output(Some(&o.status),
+                        &String::from_utf8_lossy(&o.stdout),
+                        &String::from_utf8_lossy(&o.stderr)),
                     Err(e) => format!("error: {e}"),
                 }
             },
@@ -211,6 +210,143 @@ fn dispatch(name: &str, input: &Value) -> String {
     tools().into_iter().find(|t| t.name == name)
         .map(|t| (t.run)(input))
         .unwrap_or_else(|| format!("error: unknown tool '{name}'"))
+}
+
+// ---- tools as coroutines ---------------------------------------------------
+
+/// Combined-output shape shared by the blocking registry tool and the
+/// cancellable coroutine version below.
+fn bash_output(status: Option<&ExitStatus>, out: &str, err: &str) -> String {
+    let mut s = format!("exit={}\n{out}", status.and_then(|st| st.code()).unwrap_or(-1));
+    if !err.is_empty() {
+        if !s.ends_with('\n') { s.push('\n'); }
+        s.push_str(err);
+    }
+    s
+}
+
+/// A child's pipe, drained on its own thread. Chunks stream back over an
+/// *async* channel — not one final buffer — so partial output survives even
+/// when the child is killed while a grandchild still holds the pipe open,
+/// and waiting for the rest suspends the coroutine instead of blocking the
+/// scheduler thread. What arrived so far lives in `got`, on the pipe itself,
+/// so it survives any cancelled collect.
+struct Drained {
+    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    got: Vec<u8>,
+}
+
+fn drain_pipe<R: Read + Send + 'static>(pipe: Option<R>) -> Drained {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    std::thread::spawn(move || {
+        let Some(mut r) = pipe else { return };
+        let mut buf = [0u8; 8192];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) | Err(_) => break, // EOF or broken pipe
+                Ok(n) => { if tx.blocking_send(buf[..n].to_vec()).is_err() { break } } // collector gone
+            }
+        }
+    });
+    Drained { rx, got: Vec::new() }
+}
+
+/// How long an interrupted pipe waits for stragglers before abandoning them.
+const PIPE_GRACE: Duration = Duration::from_millis(300);
+
+impl Drained {
+    /// Collect what the pipe produced, as a coroutine. With `eof` this
+    /// awaits EOF (the reader thread finishes when every writer closes the
+    /// pipe — the same contract as the blocking tool) — an await, not a
+    /// block, so a grandchild holding the pipe keeps the coroutine
+    /// suspensible. Every wait races the cancel token: Ctrl-C during the
+    /// EOF wait salvages whatever arrives within a short grace and
+    /// abandons the rest; without `eof` (child already killed) the grace
+    /// window is all there is.
+    async fn collect(&mut self, token: &CancelToken, eof: bool) -> String {
+        loop {
+            let chunk = if eof {
+                tokio::select! {
+                    c = self.rx.recv() => c,
+                    _ = token.cancelled() => match tokio::time::timeout(PIPE_GRACE, self.rx.recv()).await {
+                        Ok(c) => c,
+                        Err(_) => None, // grace elapsed: abandon the rest
+                    },
+                }
+            } else {
+                match tokio::time::timeout(PIPE_GRACE, self.rx.recv()).await {
+                    Ok(c) => c,
+                    Err(_) => None,
+                }
+            };
+            match chunk {
+                Some(c) => self.got.extend_from_slice(&c),
+                None => break, // EOF, grace elapsed, or abandoned after cancel
+            }
+        }
+        String::from_utf8_lossy(&self.got).into_owned()
+    }
+}
+
+/// bash as a coroutine: same tool as the registry's, but it watches the
+/// cancel token while the command runs. Ctrl-C kills the child at once — no
+/// waiting out a runaway `sleep 300` — and whatever output it already
+/// produced (plus an `[interrupted]` note) still reaches the model. If the
+/// child left grandchildren holding the pipe, they get a short grace period
+/// and are then abandoned.
+async fn run_bash(command: &str, token: &CancelToken) -> String {
+    let (prog, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+    let mut child = match Command::new(prog).args([flag, command])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+        Ok(c) => c,
+        Err(e) => return format!("error: {e}"),
+    };
+    let mut out_pipe = drain_pipe(child.stdout.take());
+    let mut err_pipe = drain_pipe(child.stderr.take());
+    let mut killed = false;
+    let status = loop {
+        if !killed && token.is_cancelled() {
+            killed = true;
+            let _ = child.kill();
+        }
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {}
+            Err(e) => return format!("error: {e}"),
+        }
+        if killed { break child.wait().ok(); } // kill sent: this returns promptly
+        // The wait itself is a suspension point — a sleep raced against
+        // cancellation, so waiting for the child is interruptible too.
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            _ = token.cancelled() => {}
+        }
+    };
+    // Gather the pipes as a coroutine: the EOF wait suspends (a grandchild
+    // holding the pipe can delay it) and races cancellation — Ctrl-C
+    // salvages what arrived within the grace window and moves on, so no
+    // background process can hold the agent hostage.
+    let (out, err) = tokio::join!(out_pipe.collect(token, !killed), err_pipe.collect(token, !killed));
+    if !killed && token.is_cancelled() { killed = true; } // pipes abandoned mid-collect
+    let mut s = bash_output(status.as_ref(), &out, &err);
+    if killed { s.push_str("\n[interrupted by user]"); }
+    s
+}
+
+/// Execute one tool call inside the agent coroutine. bash is cancellable (its
+/// child process is killed); the file tools are quick, run on the blocking
+/// pool, and are simply abandoned if cancellation wins the race.
+async fn run_tool(name: &str, input: &Value, token: &CancelToken) -> String {
+    if name == "bash" {
+        return run_bash(input["command"].as_str().unwrap_or(""), token).await;
+    }
+    let name = name.to_string();
+    let input = input.clone();
+    let job = tokio::task::spawn_blocking(move || dispatch(&name, &input));
+    tokio::select! {
+        out = job => out.unwrap_or_else(|e| format!("error: {e}")),
+        _ = token.cancelled() => "error: interrupted by user".into(),
+    }
 }
 
 // ---- config ----------------------------------------------------------------
@@ -345,6 +481,7 @@ BEHAVIOR:
     --cache <MODE>      auto (default, passive server cache) | active (Anthropic cache_control)
     --thinking <MODE>   preserve (default) | strip reasoning from sent history
     -s, --stream        stream output (default) · -S, --no-stream to block
+    Ctrl-C              interrupt the running agent (press twice to exit at once)
     -h, --help          this help
 
 EXAMPLES:
@@ -359,9 +496,28 @@ fn print_help() {
 // ---- entry -----------------------------------------------------------------
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("{}", paint(&format!(" jingwei: {e} "), ERR_BG, true));
-        std::process::exit(1);
+    // The agent runs as a coroutine on a single-threaded cooperative
+    // scheduler: coroutines take turns at their suspension points, and
+    // blocking work (HTTP, file tools) is farmed out to the blocking pool so
+    // those suspension points stay real. Cancellation — Ctrl-C — rides the
+    // same machinery: see `CancelToken` and `agent_turn`.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| panic!("runtime init: {e}"));
+    let result = rt.block_on(run());
+    // Abandoned blocking workers (an interrupted HTTP call still inside its
+    // read timeout, say) must not stall shutdown — give them one second to
+    // wind down, then drop the runtime regardless.
+    rt.shutdown_timeout(Duration::from_secs(1));
+    match result {
+        Ok(()) => {}
+        // interrupted by Ctrl-C — exit the way a shell command would
+        Err(Error::Interrupted) => std::process::exit(130),
+        Err(e) => {
+            eprintln!("{}", paint(&format!(" jingwei: {e} "), ERR_BG, true));
+            std::process::exit(1);
+        }
     }
 }
 
@@ -371,21 +527,21 @@ const SYSTEM: &str = "You are jingwei (精卫), a coding agent with these tools:
     When asked your name, say you are jingwei (精卫). \
     When finished, reply with a concise 1-3 sentence summary of what you did.";
 
-fn run() -> Result<()> {
+async fn run() -> Result<()> {
     let args = parse_from(env::args().skip(1))?;
     let cfg = build_config(&args)?;
-    if args.prompt.is_empty() { repl(&cfg) } else {
+    if args.prompt.is_empty() { repl(&cfg).await } else {
         let mut history = vec![json!({"role": "user", "content": args.prompt.join(" ")})];
-        agent_loop(&cfg, &mut history)
+        agent_turn(&cfg, &mut history).await
     }
 }
 
-fn repl(cfg: &Config) -> Result<()> {
+async fn repl(cfg: &Config) -> Result<()> {
     let mut history: Vec<Value> = vec![];
     let mut rl = rustyline::DefaultEditor::new().map_err(|e| Error::Msg(format!("readline init: {e}")))?;
     if let Some(dir) = home_dir() { let _ = rl.load_history(&dir.join(".jingwei_history")); }
     eprintln!("{}", paint(" 精卫 ", BANNER_BG, true));
-    println!("\x1b[1mjingwei\x1b[0m — 精卫填海，一石一石 · type a task, Ctrl-D to rest");
+    println!("\x1b[1mjingwei\x1b[0m — 精卫填海，一石一石 · type a task, Ctrl-C interrupts, Ctrl-D rests");
     println!("\x1b[2m{} · {} · {}{}\x1b[22m", cfg.protocol_label(), cfg.model, cfg.base_url,
         if cfg.show_thinking { " · thinking on" } else { "" });
     loop {
@@ -399,13 +555,47 @@ fn repl(cfg: &Config) -> Result<()> {
         if line.is_empty() { continue; }
         let _ = rl.add_history_entry(line);
         history.push(json!({"role": "user", "content": line}));
-        if let Err(e) = agent_loop(cfg, &mut history) {
-            eprintln!("{}", paint(&format!(" error: {e} "), ERR_BG, true));
+        // The agent runs as an interruptible coroutine: Ctrl-C during the run
+        // cancels it (reported by `agent_turn` itself) while the history —
+        // and this prompt — survive for the next task.
+        match agent_turn(cfg, &mut history).await {
+            Err(Error::Interrupted) => {}
+            Err(e) => eprintln!("{}", paint(&format!(" error: {e} "), ERR_BG, true)),
+            Ok(()) => {}
         }
         println!(); // blank line between interactions
     }
     if let Some(dir) = home_dir() { let _ = rl.save_history(&dir.join(".jingwei_history")); }
     Ok(())
+}
+
+/// Drive one agent run as an interruptible coroutine.
+///
+/// The first Ctrl-C cancels the token: the agent coroutine notices at its
+/// next suspension point (a streamed line, a tool poll, a turn boundary),
+/// tidies the history so every tool call stays paired, and unwinds — the
+/// REPL prompt comes back with everything the agent already carried still in
+/// place. A second Ctrl-C while it is unwinding exits immediately, for when
+/// even graceful is too slow.
+async fn agent_turn(cfg: &Config, history: &mut Vec<Value>) -> Result<()> {
+    let token = CancelToken::new();
+    let agent = agent_loop(cfg, history, &token);
+    tokio::pin!(agent);
+    tokio::select! {
+        res = &mut agent => return res,
+        _ = tokio::signal::ctrl_c() => token.cancel(),
+    }
+    let res = tokio::select! {
+        res = &mut agent => res,
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("{}", paint(" interrupted again — exiting ", ERR_BG, true));
+            std::process::exit(130);
+        }
+    };
+    if let Err(Error::Interrupted) = &res {
+        eprintln!("{}", paint(" interrupted — stopped at a safe point; history kept ", WARN_BG, false));
+    }
+    res
 }
 
 impl Config {
@@ -423,18 +613,86 @@ fn prompt_str() -> &'static str {
 }
 
 
+// ---- coroutine & cancellation ----------------------------------------------
+//
+// The agent is an async coroutine: a computation that suspends at every
+// `await` and can be abandoned at any of those suspension points. Suspension
+// points double as cancellation points — `CancelToken` is the cooperative
+// channel between the outside world (Ctrl-C) and the running coroutine, so
+// the agent can be interrupted at any moment, at a safe point of its own
+// choosing, with the conversation history left valid.
+
+/// One-shot cooperative cancellation. `cancel()` fires when the user hits
+/// Ctrl-C; code inside the coroutine races its real work against
+/// `cancelled().await` (suspends until cancelled) or peeks with
+/// `is_cancelled()` (no suspension).
+struct CancelToken {
+    flag: AtomicBool,
+    notify: Notify,
+}
+
+impl Default for CancelToken {
+    fn default() -> Self { Self::new() }
+}
+
+impl CancelToken {
+    fn new() -> Self {
+        Self { flag: AtomicBool::new(false), notify: Notify::new() }
+    }
+
+    /// Request cancellation. Idempotent; wakes every suspended `cancelled()`.
+    fn cancel(&self) {
+        self.flag.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the token is cancelled. Never spins — it suspends.
+    async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() { return; }
+            // Register the waiter *before* re-checking the flag, so a cancel
+            // landing in between can never be missed.
+            let notified = self.notify.notified();
+            if self.is_cancelled() { return; }
+            notified.await;
+        }
+    }
+}
+
+
 // ---- agent loop ------------------------------------------------------------
 
-fn agent_loop(cfg: &Config, history: &mut Vec<Value>) -> Result<()> {
+/// The agent itself, as a coroutine. Every await is a suspension point and a
+/// cancellation point: between turns, on every streamed line, while each tool
+/// runs. On cancellation it returns `Err(Interrupted)` after leaving the
+/// history valid — interrupted tools get results, unfinished tool calls are
+/// dropped from the turn, and the REPL prompt simply returns.
+async fn agent_loop(cfg: &Config, history: &mut Vec<Value>, token: &CancelToken) -> Result<()> {
     let schemas: Vec<Value> = tools().iter()
         .map(|t| json!({"name": t.name, "description": t.desc, "input_schema": t.schema}))
         .collect();
     for turn in 0..cfg.max_turns {
+        if token.is_cancelled() { return Err(Error::Interrupted); }
         if fit_context(history, cfg.context_size) {
             eprintln!("{}", paint(" trimmed history to fit --context-size ", WARN_BG, false));
         }
-        let resp = call_api(cfg, history, &schemas)?;
+        let (resp, interrupted) = call_api(cfg, history, &schemas, token).await?;
         let content = resp["content"].as_array().cloned().unwrap_or_default();
+        if interrupted {
+            // Cut off mid-response: keep finished text/thinking, drop tool
+            // calls — a tool_use whose tool_result never ran would poison
+            // the next request.
+            let kept: Vec<Value> = content.into_iter()
+                .filter(|b| b["type"] != "tool_use").collect();
+            if !kept.is_empty() {
+                history.push(json!({"role": "assistant", "content": kept}));
+            }
+            return Err(Error::Interrupted);
+        }
         let calls: Vec<_> = content.iter().filter(|b| b["type"] == "tool_use").cloned().collect();
         // Echo the full assistant turn back so interleaved thinking stays continuous —
         // including the final text-only turn, so follow-up questions keep context.
@@ -443,12 +701,25 @@ fn agent_loop(cfg: &Config, history: &mut Vec<Value>) -> Result<()> {
         }
         if calls.is_empty() { return Ok(()); }
 
-        history.push(json!({"role": "user", "content": calls.iter().map(|c| {
+        // Run the tools. Cancellation stops the batch: the interrupted call
+        // reports as much as it got, the rest are skipped, and every tool_use
+        // still leaves with its tool_result.
+        let mut results = Vec::with_capacity(calls.len());
+        let mut stopped = false;
+        for c in &calls {
             let name = c["name"].as_str().unwrap_or("");
-            let out = truncate(&dispatch(name, &c["input"]));
+            let out = if stopped {
+                "skipped: this run was interrupted before the tool ran".into()
+            } else {
+                run_tool(name, &c["input"], token).await
+            };
+            let out = truncate(&out);
             print_tool_call(name, &c["input"], &out);
-            json!({"type": "tool_result", "tool_use_id": c["id"], "content": out})
-        }).collect::<Vec<_>>()}));
+            results.push(json!({"type": "tool_result", "tool_use_id": c["id"], "content": out}));
+            if token.is_cancelled() { stopped = true; }
+        }
+        history.push(json!({"role": "user", "content": results}));
+        if stopped { return Err(Error::Interrupted); }
 
         if turn + 1 == cfg.max_turns {
             eprintln!("{}", paint(&format!(" warning: hit --max-turns={}, stopping ", cfg.max_turns), WARN_BG, false));
@@ -494,13 +765,13 @@ fn fit_context(history: &mut Vec<Value>, limit: u64) -> bool {
 
 // ---- api: shared dispatch --------------------------------------------------
 
-fn call_api(cfg: &Config, history: &[Value], schemas: &[Value]) -> Result<Value> {
+async fn call_api(cfg: &Config, history: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
     let messages = if cfg.thinking == Thinking::Strip { strip_thinking(history) } else { history.to_vec() };
-    let v = match (cfg.protocol, cfg.streaming) {
-        (Protocol::Anthropic, false) => anthropic_blocking(cfg, &messages, schemas)?,
-        (Protocol::Anthropic, true) => anthropic_streaming(cfg, &messages, schemas)?,
-        (Protocol::OpenAI, false) => openai_blocking(cfg, &messages, schemas)?,
-        (Protocol::OpenAI, true) => openai_streaming(cfg, &messages, schemas)?,
+    let (v, interrupted) = match (cfg.protocol, cfg.streaming) {
+        (Protocol::Anthropic, false) => anthropic_blocking(cfg, &messages, schemas, token).await?,
+        (Protocol::Anthropic, true) => anthropic_streaming(cfg, &messages, schemas, token).await?,
+        (Protocol::OpenAI, false) => openai_blocking(cfg, &messages, schemas, token).await?,
+        (Protocol::OpenAI, true) => openai_streaming(cfg, &messages, schemas, token).await?,
     };
     // Blocking paths don't print inline — emit text/thinking now.
     if !cfg.streaming {
@@ -522,7 +793,7 @@ fn call_api(cfg: &Config, history: &[Value], schemas: &[Value]) -> Result<Value>
         v["usage"]["input_tokens"], v["usage"]["output_tokens"],
         v["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0),
         v["usage"]["cache_creation_input_tokens"].as_u64().unwrap_or(0));
-    Ok(v)
+    Ok((v, interrupted))
 }
 
 fn strip_thinking(messages: &[Value]) -> Vec<Value> {
@@ -541,25 +812,54 @@ fn http() -> ureq::Agent {
         .build()
 }
 
-fn post(cfg: &Config, url: String, body: Value, anthropic: bool) -> Result<ureq::Response> {
-    let mut req = http().post(&url).set("Authorization", &format!("Bearer {}", cfg.api_key));
+fn post(api_key: &str, url: String, body: Value, anthropic: bool) -> Result<ureq::Response> {
+    let mut req = http().post(&url).set("Authorization", &format!("Bearer {api_key}"));
     if anthropic {
-        req = req.set("x-api-key", &cfg.api_key).set("anthropic-version", "2023-06-01");
+        req = req.set("x-api-key", api_key).set("anthropic-version", "2023-06-01");
     }
     Ok(req.send_json(body)?)
 }
 
-/// SSE lines from a response, newlines stripped.
-fn sse_lines(resp: ureq::Response) -> impl Iterator<Item = String> {
-    let mut reader = BufReader::new(resp.into_reader());
-    std::iter::from_fn(move || {
+/// SSE lines from a response, newlines stripped — produced on a plain reader
+/// thread and handed to the agent coroutine over a channel. A blocking
+/// socket can't suspend, so the socket gets its own thread and the
+/// *consumer* is the coroutine: cancellation just drops the receiver, and
+/// the thread winds down at its next read. Interrupting never waits on the
+/// network.
+fn sse_channel(resp: ureq::Response) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel(64);
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(resp.into_reader());
         let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => None,
-            Ok(_) => Some(line.trim_end_matches(['\r', '\n']).to_string()),
-            Err(_) => None,
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,                       // EOF or broken stream
+                Ok(_) => {
+                    let l = line.trim_end_matches(['\r', '\n']).to_string();
+                    if tx.blocking_send(l).is_err() { break; } // receiver gone: cancelled
+                }
+            }
         }
-    })
+    });
+    rx
+}
+
+/// Run a blocking computation on the runtime's blocking pool so the agent
+/// coroutine stays suspensible: the work races against cancellation, and on
+/// Ctrl-C nothing waits for the (uninterruptible) syscall — the pool thread
+/// finishes on its own and its answer is simply discarded.
+async fn blocking<T, F>(token: &CancelToken, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::select! {
+        res = tokio::task::spawn_blocking(f) => {
+            res.unwrap_or_else(|e| Err(Error::Msg(format!("worker: {e}"))))
+        }
+        _ = token.cancelled() => Err(Error::Interrupted),
+    }
 }
 
 fn empty_usage() -> Value {
@@ -606,19 +906,35 @@ fn anthropic_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: b
     body
 }
 
-fn anthropic_blocking(cfg: &Config, messages: &[Value], schemas: &[Value]) -> Result<Value> {
+async fn anthropic_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
     let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
-    let v: Value = post(cfg, url, anthropic_body(cfg, messages, schemas, false), true)?.into_json()?;
-    if let Some(err) = v.get("error") { return Err(Error::Msg(err.to_string())); }
-    Ok(v)
+    let body = anthropic_body(cfg, messages, schemas, false);
+    let key = cfg.api_key.clone();
+    let v = blocking(token, move || -> Result<Value> {
+        let v: Value = post(&key, url, body, true)?.into_json()?;
+        if let Some(err) = v.get("error") { return Err(Error::Msg(err.to_string())); }
+        Ok(v)
+    }).await?;
+    Ok((v, token.is_cancelled()))
 }
 
-fn anthropic_streaming(cfg: &Config, messages: &[Value], schemas: &[Value]) -> Result<Value> {
+async fn anthropic_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
     let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
-    let resp = post(cfg, url, anthropic_body(cfg, messages, schemas, true), true)?;
+    let body = anthropic_body(cfg, messages, schemas, true);
+    let key = cfg.api_key.clone();
+    let resp = blocking(token, move || post(&key, url, body, true)).await?;
     let (mut content, mut usage, mut lead, mut thinking_open, mut text_open) =
         (vec![], empty_usage(), false, false, false);
-    for line in sse_lines(resp) {
+    let mut interrupted = false;
+    let mut lines = sse_channel(resp);
+    // Consume the stream as a coroutine: each line is one suspension point,
+    // raced against cancellation — Ctrl-C lands between two deltas, and the
+    // partial answer assembled so far is kept rather than lost.
+    while let Some(line) = tokio::select! {
+        biased;
+        line = lines.recv() => line,
+        _ = token.cancelled() => { interrupted = true; None }
+    } {
         let Some(data) = line.strip_prefix("data: ") else { continue };
         if data == "[DONE]" { break }
         let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
@@ -677,7 +993,7 @@ fn anthropic_streaming(cfg: &Config, messages: &[Value], schemas: &[Value]) -> R
     }
     if thinking_open || text_open { println!(); } // terminate the streamed line before [usage] lands
     content.retain(|v| !v.is_null());
-    Ok(json!({"content": content, "usage": usage}))
+    Ok((json!({"content": content, "usage": usage}), interrupted))
 }
 
 // ---- api: openai wire ------------------------------------------------------
@@ -748,24 +1064,37 @@ fn openai_to_internal(v: &Value) -> Value {
         "cache_creation_input_tokens": 0})})
 }
 
-fn openai_blocking(cfg: &Config, messages: &[Value], schemas: &[Value]) -> Result<Value> {
+async fn openai_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
         "messages": to_openai_messages(SYSTEM, messages, cfg), "tools": openai_tools(schemas)});
-    let v: Value = post(cfg, url, body, false)?.into_json()?;
-    if let Some(err) = v.get("error") { return Err(Error::Msg(err.to_string())); }
-    Ok(openai_to_internal(&v))
+    let key = cfg.api_key.clone();
+    let v = blocking(token, move || -> Result<Value> {
+        let v: Value = post(&key, url, body, false)?.into_json()?;
+        if let Some(err) = v.get("error") { return Err(Error::Msg(err.to_string())); }
+        Ok(v)
+    }).await?;
+    Ok((openai_to_internal(&v), token.is_cancelled()))
 }
 
-fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value]) -> Result<Value> {
+async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens, "stream": true,
         "messages": to_openai_messages(SYSTEM, messages, cfg), "tools": openai_tools(schemas)});
-    let resp = post(cfg, url, body, false)?;
+    let key = cfg.api_key.clone();
+    let resp = blocking(token, move || post(&key, url, body, false)).await?;
     let (mut text, mut reasoning, mut tool_calls) = (String::new(), String::new(), vec![]);
     let (mut usage, mut lead, mut thinking_open, mut text_open) =
         (empty_usage(), false, false, false);
-    for line in sse_lines(resp) {
+    let mut interrupted = false;
+    let mut lines = sse_channel(resp);
+    // Same contract as the anthropic consumer: one suspension point per line,
+    // raced against cancellation, partial answer kept on interrupt.
+    while let Some(line) = tokio::select! {
+        biased;
+        line = lines.recv() => line,
+        _ = token.cancelled() => { interrupted = true; None }
+    } {
         let Some(data) = line.strip_prefix("data: ") else { continue };
         if data == "[DONE]" { break }
         let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
@@ -812,7 +1141,7 @@ fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value]) -> Resu
             "input": serde_json::from_str::<Value>(tc["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}))}));
     }
     if lead { println!(); }
-    Ok(json!({"content": content, "usage": usage}))
+    Ok((json!({"content": content, "usage": usage}), interrupted))
 }
 
 // ---- tests -----------------------------------------------------------------
@@ -831,6 +1160,12 @@ mod tests {
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// Drive a coroutine to completion on its own little scheduler.
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().unwrap().block_on(f)
     }
 
     fn cfg(base: String, streaming: bool) -> Config {
@@ -887,6 +1222,34 @@ mod tests {
             }
         });
         (port, seen)
+    }
+
+    /// SSE server with two connections: `first` is served complete (with a
+    /// Content-Length, then closed); `stalled` is streamed and then the
+    /// connection is *held open* — an answer cut off mid-stream, the exact
+    /// moment Ctrl-C lands.
+    fn mock_stall(first: &'static str, stalled: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for (i, body) in [first, stalled].into_iter().enumerate() {
+                let Ok((mut s, _)) = listener.accept() else { return };
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf);
+                let head = if i == 0 {
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n".to_string()
+                };
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(body.as_bytes());
+                let _ = s.flush();
+                if i == 1 {
+                    std::thread::sleep(std::time::Duration::from_secs(10)); // stall: keep the stream open
+                }
+            }
+        });
+        port
     }
 
     #[test]
@@ -1146,7 +1509,8 @@ mod tests {
         let mut c = cfg(format!("http://127.0.0.1:{}", mock(events, 200, true)), true);
         c.protocol = Protocol::OpenAI;
         c.streaming = true;
-        let resp = call_api(&c, &[json!({"role": "user", "content": "hey"})], &[]).unwrap();
+        let (resp, cut) = block_on(call_api(&c, &[json!({"role": "user", "content": "hey"})], &[], &CancelToken::new())).unwrap();
+        assert!(!cut);
         assert_eq!(resp["content"][0], json!({"type": "thinking", "thinking": "think"}));
         assert_eq!(resp["content"][1], json!({"type": "text", "text": "hello"}));
         assert_eq!(resp["content"][2]["type"], json!("tool_use"));
@@ -1184,7 +1548,7 @@ mod tests {
     fn wire_paths_and_auth_headers_per_protocol() {
         // anthropic: /v1/messages with x-api-key + anthropic-version + bearer
         let (port, reqs) = mock_seq(vec![(200, r#"{"content":[],"usage":{}}"#.into())]);
-        call_api(&cfg(format!("http://127.0.0.1:{port}"), false), &[], &[]).unwrap();
+        block_on(call_api(&cfg(format!("http://127.0.0.1:{port}"), false), &[], &[], &CancelToken::new())).unwrap();
         let req = reqs.lock().unwrap()[0].to_lowercase();
         assert!(req.contains("post /v1/messages http/1.1"), "{req}");
         assert!(req.contains("x-api-key: test-key"), "{req}");
@@ -1192,13 +1556,13 @@ mod tests {
         assert!(req.contains("authorization: bearer test-key"), "{req}");
         // trailing slash in base_url must not double the path
         let (port, reqs) = mock_seq(vec![(200, r#"{"content":[],"usage":{}}"#.into())]);
-        call_api(&cfg(format!("http://127.0.0.1:{port}/"), false), &[], &[]).unwrap();
+        block_on(call_api(&cfg(format!("http://127.0.0.1:{port}/"), false), &[], &[], &CancelToken::new())).unwrap();
         assert!(reqs.lock().unwrap()[0].contains("POST /v1/messages HTTP/1.1"));
         // openai: /chat/completions with bearer only
         let (port, reqs) = mock_seq(vec![(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#.into())]);
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
         c.protocol = Protocol::OpenAI;
-        call_api(&c, &[json!({"role": "user", "content": "hi"})], &[]).unwrap();
+        block_on(call_api(&c, &[json!({"role": "user", "content": "hi"})], &[], &CancelToken::new())).unwrap();
         let req = reqs.lock().unwrap()[0].to_lowercase();
         assert!(req.contains("post /chat/completions http/1.1"), "{req}");
         assert!(req.contains("authorization: bearer test-key"), "{req}");
@@ -1210,10 +1574,11 @@ mod tests {
     #[test]
     fn anthropic_blocking_roundtrip_and_error() {
         let port = mock(r#"{"content":[{"type":"text","text":"hi from mock"}],"usage":{"input_tokens":7,"output_tokens":3}}"#, 200, false);
-        let resp = call_api(&cfg(format!("http://127.0.0.1:{port}"), false), &[], &[]).unwrap();
+        let (resp, cut) = block_on(call_api(&cfg(format!("http://127.0.0.1:{port}"), false), &[], &[], &CancelToken::new())).unwrap();
         assert_eq!(resp["content"][0]["text"], "hi from mock");
+        assert!(!cut);
         let port = mock(r#"{"error":{"message":"bad model"}}"#, 400, false);
-        let err = call_api(&cfg(format!("http://127.0.0.1:{port}"), false), &[], &[]).unwrap_err();
+        let err = block_on(call_api(&cfg(format!("http://127.0.0.1:{port}"), false), &[], &[], &CancelToken::new())).unwrap_err();
         assert!(err.to_string().contains("bad model"), "got: {err}");
     }
 
@@ -1222,7 +1587,7 @@ mod tests {
         let port = mock(r#"{"choices":[{"message":{"content":"mock says hi"}}],"usage":{"prompt_tokens":5,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":1}}}"#, 200, false);
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
         c.protocol = Protocol::OpenAI;
-        let resp = call_api(&c, &[json!({"role": "user", "content": "hey"})], &[]).unwrap();
+        let (resp, _) = block_on(call_api(&c, &[json!({"role": "user", "content": "hey"})], &[], &CancelToken::new())).unwrap();
         assert_eq!(resp["content"][0]["text"], "mock says hi");
         assert_eq!(resp["usage"]["cache_read_input_tokens"], json!(1));
     }
@@ -1245,7 +1610,8 @@ mod tests {
             r#"data: {"type":"message_stop"}"#, "\n\n");
         let mut c = cfg(format!("http://127.0.0.1:{}", mock(events, 200, true)), true);
         c.streaming = true;
-        let resp = call_api(&c, &[], &[]).unwrap();
+        let (resp, cut) = block_on(call_api(&c, &[], &[], &CancelToken::new())).unwrap();
+        assert!(!cut);
         assert_eq!(resp["content"][0]["thinking"], json!("step"));
         assert_eq!(resp["content"][1]["text"], json!("hello world"));
         assert_eq!(resp["content"][2]["input"]["command"], json!("ls"));
@@ -1258,7 +1624,7 @@ mod tests {
             r#"data: {"type":"error","error":{"type":"overloaded","message":"server overloaded"}}"#, "\n\n");
         let mut c = cfg(format!("http://127.0.0.1:{}", mock(events, 200, true)), true);
         c.streaming = true;
-        assert!(call_api(&c, &[], &[]).unwrap_err().to_string().contains("overloaded"));
+        assert!(block_on(call_api(&c, &[], &[], &CancelToken::new())).unwrap_err().to_string().contains("overloaded"));
     }
 
     // ---- agent loop ----
@@ -1269,7 +1635,7 @@ mod tests {
         let done = r#"{"content":[{"type":"text","text":"done"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
         let (port, reqs) = mock_seq(vec![(200, tool.into()), (200, done.into())]);
         let mut history = vec![json!({"role": "user", "content": "run echo"})];
-        agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history).unwrap();
+        block_on(agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &CancelToken::new())).unwrap();
         assert_eq!(history.len(), 4); // user + assistant(tool_use) + user(tool_result) + assistant(text)
         assert_eq!(history[1]["role"], json!("assistant"));
         assert_eq!(history[1]["content"][0]["id"], json!("t1")); // full turn echoed back, thinking intact
@@ -1289,13 +1655,152 @@ mod tests {
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
         c.max_turns = 1;
         let mut history = vec![json!({"role": "user", "content": "go"})];
-        agent_loop(&c, &mut history).unwrap(); // must return instead of spinning
+        block_on(agent_loop(&c, &mut history, &CancelToken::new())).unwrap(); // must return instead of spinning
         assert_eq!(history.len(), 3); // user + assistant(tool_use) + user(tool_result)
+    }
+
+    // ---- coroutine cancellation ----
+
+    #[test]
+    fn cancel_token_flips_and_wakes_a_suspended_coroutine() {
+        block_on(async {
+            let token = Arc::new(CancelToken::new());
+            assert!(!token.is_cancelled());
+            let t = token.clone();
+            tokio::task::spawn_blocking(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                t.cancel();
+            });
+            token.cancelled().await; // suspends until the other thread cancels
+            assert!(token.is_cancelled());
+            token.cancelled().await; // already cancelled: resolves immediately
+        });
+    }
+
+    #[test]
+    fn bash_coroutine_is_killed_by_cancellation() {
+        let cmd = if cfg!(windows) {
+            "echo started & ping -n 30 127.0.0.1 > nul"
+        } else {
+            "echo started; sleep 30"
+        };
+        let start = std::time::Instant::now();
+        let out = block_on(async {
+            let token = Arc::new(CancelToken::new());
+            let t = token.clone();
+            tokio::task::spawn_blocking(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                t.cancel();
+            });
+            run_bash(cmd, &token).await
+        });
+        assert!(out.contains("[interrupted by user]"), "got: {out}");
+        assert!(out.contains("started"), "partial output must survive: {out}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(10),
+            "a 30s command was cancelled; took {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn agent_loop_interrupted_mid_stream_keeps_history_valid() {
+        let tool = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#, "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"bash","input":{}}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"echo hi\"}"}}"#, "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
+            r#"data: {"type":"message_delta","usage":{"output_tokens":1}}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n");
+        // Second response streams one text delta, then stalls with the
+        // connection open — the exact moment Ctrl-C lands.
+        let stalled = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}"#, "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answ"}}"#, "\n\n");
+        let port = mock_stall(tool, stalled);
+        let mut history = vec![json!({"role": "user", "content": "go"})];
+        let err = block_on(async {
+            let token = Arc::new(CancelToken::new());
+            let t = token.clone();
+            tokio::task::spawn_blocking(move || {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                t.cancel();
+            });
+            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), true), &mut history, &token).await
+        }).unwrap_err();
+        assert!(matches!(err, Error::Interrupted), "got: {err}");
+        // user + assistant(tool_use) + user(tool_result) + assistant(partial text; tool_use dropped)
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[3]["role"], json!("assistant"));
+        assert_eq!(history[3]["content"][0]["type"], json!("text"));
+        assert_eq!(history[3]["content"][0]["text"], json!("partial answ"));
+        assert!(history[3]["content"].as_array().unwrap().iter().all(|b| b["type"] != "tool_use"));
+        // every tool_use still has its tool_result — the history stays sendable
+        let ids: Vec<&str> = history[1]["content"].as_array().unwrap().iter()
+            .filter(|b| b["type"] == "tool_use").map(|b| b["id"].as_str().unwrap()).collect();
+        let results: Vec<&str> = history[2]["content"].as_array().unwrap().iter()
+            .map(|b| b["tool_use_id"].as_str().unwrap()).collect();
+        assert!(ids.iter().all(|i| results.contains(i)));
+    }
+
+    #[test]
+    fn agent_loop_interrupted_mid_tool_finishes_pairing() {
+        let cmd = if cfg!(windows) { "ping -n 30 127.0.0.1 > nul" } else { "sleep 30" };
+        let tool = format!(
+            r#"{{"content":[{{"type":"tool_use","id":"t1","name":"bash","input":{{"command":"{cmd}"}}}}],"usage":{{"input_tokens":1,"output_tokens":1}}}}"#);
+        let (port, _) = mock_seq(vec![(200, tool)]);
+        let mut history = vec![json!({"role": "user", "content": "go"})];
+        let err = block_on(async {
+            let token = Arc::new(CancelToken::new());
+            let t = token.clone();
+            tokio::task::spawn_blocking(move || {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                t.cancel();
+            });
+            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &token).await
+        }).unwrap_err();
+        assert!(matches!(err, Error::Interrupted), "got: {err}");
+        assert_eq!(history.len(), 3); // user + assistant(tool_use) + user(tool_result)
+        let result = history[2]["content"][0]["content"].as_str().unwrap();
+        assert!(result.contains("[interrupted by user]"), "got: {result}");
+        assert_eq!(history[2]["content"][0]["tool_use_id"], json!("t1"));
+    }
+
+    /// Regression: a grandchild holding the pipes (backgrounded process,
+    /// daemon) must not be able to wedge the coroutine when the user
+    /// interrupts. Runs the coroutine on its own thread and cancels from
+    /// outside; a hang is reported by the timeout, not the test runner.
+    #[test]
+    fn bash_cancel_with_grandchild_holding_pipe() {
+        // sh exits immediately; the backgrounded sleep keeps stdout open.
+        let cmd = if cfg!(windows) {
+            "echo started & start /b ping -n 30 127.0.0.1 > nul"
+        } else {
+            "sleep 30 & echo started"
+        };
+        let token = Arc::new(CancelToken::new());
+        let t = token.clone();
+        let (tx, done) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all().build().unwrap();
+            let out = rt.block_on(run_bash(cmd, &t));
+            let _ = tx.send(out);
+        });
+        std::thread::sleep(Duration::from_millis(500)); // let the child exit
+        token.cancel();                                  // the user hits Ctrl-C
+        match done.recv_timeout(Duration::from_secs(5)) {
+            Ok(out) => {
+                assert!(out.contains("started"), "got: {out}");
+                assert!(out.contains("[interrupted by user]"), "got: {out}");
+            }
+            Err(_) => panic!("coroutine wedged: cancellation never reached run_bash — \
+                collect() must suspend, not block the scheduler thread"),
+        }
     }
 
     #[test]
     fn error_display() {
         assert_eq!(Error::Api(429, "limited".into()).to_string(), "api 429: limited");
         assert_eq!(Error::Msg("bad".into()).to_string(), "bad");
+        assert_eq!(Error::Interrupted.to_string(), "interrupted");
     }
 }
