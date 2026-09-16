@@ -23,7 +23,8 @@ export JINGWEI_MODEL=...
 export JINGWEI_PROTOCOL=anthropic    # or openai
 export JINGWEI_CACHE=auto            # or active (anthropic protocol only)
 export JINGWEI_THINKING=preserve     # or strip
-export NO_COLOR=1                    # disable colors (JINGWEI_NO_COLOR also works)
+export NO_COLOR=1                    # disable colors, both frontends (JINGWEI_NO_COLOR too)
+export JINGWEI_COLOR=always          # force colors on (e.g. through a pipe into a pager)
 ```
 
 Build:
@@ -62,26 +63,36 @@ jingwei --help    # full flag list
 ### REPL
 
 With no prompt, jingwei opens a REPL. Ctrl-C clears the current line, Ctrl-D
-exits; an API error is reported but doesn't kill the session. Input history is
-saved to `~/.jingwei_history` and reloaded on start. Each answer (including the
+exits; an API error is reported but doesn't kill the session. In the TUI,
+input history is saved to `~/.jingwei_history` and reloaded on start; the
+plain log (pipes, one-shots, `JINGWEI_NO_TUI=1`) has no editor, so it keeps
+your shell's own line editing and history instead. Each answer (including the
 final text turn of an agent run) stays in the conversation, so follow-ups keep
 context.
 
-The interactive UI is a TUI (ratatui + crossterm, alternate screen): a
-scrolling transcript above, the input row and a live status bar (spinner,
-elapsed, per-turn and session token usage, cache traffic) below. The editor
-is ours — grapheme-safe cursor, history recall (`~/.jingwei_history`), word
-deletes — no readline dependency. Scrolling is application state: the
-transcript follows new content until you scroll up, and returns to
-following when you reach the bottom. Pipes, one-shot runs, and
-`JINGWEI_NO_TUI=1` get the plain line-oriented log instead.
+The interactive UI is an inline TUI (crossterm, with ratatui only for the
+review overlay) that owns a small framed pane — separator rules above and
+below the input row, a live status bar underneath (spinner, elapsed,
+per-turn and session token usage, cache traffic) — at the bottom of the
+screen you already had. Everything above is the terminal's own scrollback:
+finished lines are appended to it, so the mouse wheel, text selection, and
+whatever was on screen before jingwei started keep working; there is no
+alternate screen and no mouse capture while the REPL runs. The editor is
+ours — grapheme-safe caret, **multi-line composing** (Ctrl-J breaks the
+line everywhere; Shift-Enter too, where the terminal speaks the kitty
+keyboard protocol), line-wise Home/End, history recall
+(`~/.jingwei_history`), word deletes — no readline dependency. Submitting
+clears the input line for the next task; Up recalls the last one. Pipes,
+one-shot runs, and `JINGWEI_NO_TUI=1` get the plain line-oriented log
+instead.
 
 Reasoning arrives folded: each thinking block lands as one dim marker line
 (`▸ thought #3 · 14 lines`) instead of a wall of text. **Ctrl-O unfolds
 everything** — thoughts and tool-output tails alike — into a scrollable
-review view; Ctrl-O again returns to the prompt, and what has been unfolded
-never refolds. There are no display switches: folding is simply how
-reasoning is shown, in the TUI and in the plain log alike.
+full-screen review (the one place an alternate screen is used, and only
+while it is open); Ctrl-O again returns to the prompt, and what has been
+unfolded never refolds. There are no display switches: folding is simply
+how reasoning is shown, in the TUI and in the plain log alike.
 
 ## Architecture
 
@@ -95,8 +106,14 @@ port (`src/display.rs`), and a frontend interprets them —
   Every UI rule (grapheme-safe editing, history recall, scroll clamping,
   follow-the-tail, the fold ratchet) is a unit-tested fact about pure
   functions; no terminal needed to test the UI.
-- **plain** (pipes, one-shot runs, `JINGWEI_NO_TUI=1`): a pure fold over
-  the same messages into a line-oriented log.
+- **plain** (`src/plain.rs`; pipes, one-shot runs, `JINGWEI_NO_TUI=1`):
+  a pure fold over the same messages into a line-oriented log, plus the
+  dumb line reader that drives it.
+
+The port module is only the contract: the `Msg` type (with its documented
+ordering), the usage shape it carries, and the vocabulary both frontends
+render with — the prompt, the thought marker, width measurement, the color
+gate (`NO_COLOR` honored everywhere; `JINGWEI_COLOR=always` forces it on).
 
 ## The three knobs people confuse
 
@@ -141,7 +158,7 @@ even 精卫 has a budget.
 ## Tests
 
 ```sh
-cargo test            # 24 unit tests + 1 REPL integration test
+cargo test            # 83 unit tests + 1 REPL integration test
 cargo clippy --all-targets
 ```
 

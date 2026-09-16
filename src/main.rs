@@ -8,13 +8,14 @@
 //      JINGWEI_CACHE, JINGWEI_THINKING, JINGWEI_NO_TUI, NO_COLOR
 
 mod display;
+mod plain;
 mod tui;
 
-use display::{disp, Msg, Sev};
+use display::{disp, Msg, Sev, Usage};
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, IsTerminal, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,141 +66,9 @@ impl From<ureq::Error> for Error {
 impl From<serde_json::Error> for Error { fn from(e: serde_json::Error) -> Self { Self::Json(e) } }
 impl From<io::Error> for Error { fn from(e: io::Error) -> Self { Self::Io(e) } }
 
-// ---- colors: backgrounds only for short, high-attention signals ------------
-
-const ERR_BG: (u8, u8, u8) = (198, 40, 40);
-
-fn color_on() -> bool {
-    env::var_os("NO_COLOR").is_none()
-        && env::var_os("JINGWEI_NO_COLOR").is_none()
-        && io::stdout().is_terminal()
-        && io::stderr().is_terminal()
-}
-
-fn paint(s: &str, bg: (u8, u8, u8), white: bool) -> String {
-    if color_on() {
-        format!("\x1b[{}m\x1b[48;2;{};{};{}m{s}\x1b[49m\x1b[39m", if white { 97 } else { 30 }, bg.0, bg.1, bg.2)
-    } else {
-        s.into()
-    }
-}
-
-// ---- ui: transcript + fixed pane (input row + status bar) ------------------
-//
-// The screen is a scrolling transcript with a pane pinned beneath it: a
-// separator rule, the input row (idle: the readline prompt; working: the
-// locked task), a second rule, and a status bar with live usage. The pane is
-// not glued to the physical bottom —
-// it is always the last thing printed, so the terminal's normal scrolling
-// carries old transcript into scrollback and the pane rides along. No scroll
-// regions, no absolute cursor addressing: one invariant does all the work —
-// after every Ui operation the cursor sits at the end of the bar row.
-//
-// Streaming text lands line-buffered (a partial line stays in `pend`) because
-// the cursor may only be moved when it is parked. Non-terminals (pipes,
-// tests, Windows) get plain pass-through that matches the classic behavior.
-
-/// Token usage of one API request — or session totals.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-struct Usage {
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write: u64,
-}
-
-impl Usage {
-    /// From an internal-shape usage object (Anthropic keys, or OpenAI mapped).
-    fn from_value(v: &Value) -> Self {
-        let g = |k: &str| v[k].as_u64().unwrap_or(0);
-        Self {
-            input: g("input_tokens"),
-            output: g("output_tokens"),
-            cache_read: g("cache_read_input_tokens"),
-            cache_write: g("cache_creation_input_tokens"),
-        }
-    }
-    /// Everything the model read this request: plain input plus cache traffic.
-    fn context_in(&self) -> u64 {
-        self.input + self.cache_read + self.cache_write
-    }
-    fn add(&mut self, o: &Usage) {
-        self.input += o.input;
-        self.output += o.output;
-        self.cache_read += o.cache_read;
-        self.cache_write += o.cache_write;
-    }
-    fn is_zero(&self) -> bool {
-        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
-    }
-}
-
-/// 26156 → "26.2k"; small counts stay exact.
-fn humanize(n: u64) -> String {
-    if n < 1000 { format!("{n}") } else { format!("{:.1}k", n as f64 / 1000.0) }
-}
-
-/// Rough display width: ASCII is 1 column, everything else (CJK) is 2.
-fn disp_width(s: &str) -> usize {
-    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
-}
-
-/// Cut to `max` display columns, marking the cut with an ellipsis.
-fn truncate_cols(s: &str, max: usize) -> String {
-    let mut out = String::new();
-    let mut w = 0;
-    for c in s.chars() {
-        let cw = if c.is_ascii() { 1 } else { 2 };
-        if w + cw > max.saturating_sub(2) {
-            out.push('…');
-            return out;
-        }
-        out.push(c);
-        w += cw;
-    }
-    out
-}
-
-/// The status bar's content. Pure — the spinner glyph and elapsed label are
-/// passed in already rendered so tests can pin them. Segments appear as
-/// their data arrives; when the row gets too wide, cache goes first, then
-/// the turn — session totals and the spinner never do.
-fn bar_text(working: Option<(&str, &str)>, turn: &Usage, total: &Usage) -> String {
-    let head: Vec<String> = working.map(|(g, e)| vec![format!("{g} {e}")]).unwrap_or_default();
-    let turn_seg = (!turn.is_zero())
-        .then(|| format!("turn in {} out {}", humanize(turn.context_in()), humanize(turn.output)));
-    let total_seg = (!total.is_zero())
-        .then(|| format!("total in {} out {}", humanize(total.context_in()), humanize(total.output)));
-    let assemble = |with_turn: bool| {
-        let mut segs = head.clone();
-        if with_turn { if let Some(t) = &turn_seg { segs.push(t.clone()) } }
-        if let Some(t) = &total_seg { segs.push(t.clone()) }
-        segs.join(" · ")
-    };
-    let mut out = assemble(true);
-    if disp_width(&out) > BAR_MAX && turn_seg.is_some() {
-        out = assemble(false);
-    }
-    let cache = if total.cache_write > 0 {
-        format!("cache {}+{}", humanize(total.cache_read), humanize(total.cache_write))
-    } else if total.cache_read > 0 {
-        format!("cache {}", humanize(total.cache_read))
-    } else {
-        String::new()
-    };
-    if !cache.is_empty() && disp_width(&out) + 3 + disp_width(&cache) <= BAR_MAX {
-        out = if out.is_empty() { cache } else { format!("{out} · {cache}") };
-    }
-    out
-}
-
-fn elapsed_str(d: Duration) -> String {
-    let s = d.as_secs();
-    if s < 60 { format!("{s}s") } else { format!("{}m{:02}s", s / 60, s % 60) }
-}
-
-/// The status bar never exceeds this width, so it fits one physical row.
-const BAR_MAX: usize = 76;
+// ---- colors --------------------------------------------------------------
+// (the gate, the palette, and the painter all live in display.rs — the
+// agent core below never touches a terminal)
 
 /// One-line summary of a tool call's arguments: the command, the path, …
 fn tool_summary(name: &str, input: &Value) -> String {
@@ -358,16 +227,13 @@ impl Drained {
             let chunk = if eof {
                 tokio::select! {
                     c = self.rx.recv() => c,
-                    _ = token.cancelled() => match tokio::time::timeout(PIPE_GRACE, self.rx.recv()).await {
-                        Ok(c) => c,
-                        Err(_) => None, // grace elapsed: abandon the rest
-                    },
+                    _ = token.cancelled() => {
+                        // salvage what lands within the grace, abandon the rest
+                        tokio::time::timeout(PIPE_GRACE, self.rx.recv()).await.unwrap_or_default()
+                    }
                 }
             } else {
-                match tokio::time::timeout(PIPE_GRACE, self.rx.recv()).await {
-                    Ok(c) => c,
-                    Err(_) => None,
-                }
+                tokio::time::timeout(PIPE_GRACE, self.rx.recv()).await.unwrap_or_default()
             };
             match chunk {
                 Some(c) => self.got.extend_from_slice(&c),
@@ -569,17 +435,26 @@ BEHAVIOR:
     --context-size <N>  trim history when estimated tokens exceed N (default 1000000)
     --cache <MODE>      auto (default, passive server cache) | active (Anthropic cache_control)
     --thinking <MODE>   preserve (default) | strip reasoning from sent history
+    -s, --stream        stream output token by token (default)
+    -S, --no-stream     wait for each turn to finish before printing
+    -h, --help          this help
 
 TUI (interactive, on a terminal):
-    Enter               submit the task · Up/Down recall input history
-    Ctrl-O              unfold every folded block (thoughts, tool tails);
-                        again returns to the REPL — what opened stays open
-    in the unfolded view: ↑↓/j/k, PgUp/PgDn, g/G scroll · q or Ctrl-O back
+    the transcript lives in the terminal's own scrollback — scroll with
+    the mouse wheel or the terminal's keys; what was on screen before
+    jingwei stays put, and the mouse is never captured
+    Enter               submit the task — the input line clears; Up
+                        recalls it from history
+    Ctrl-J / Shift-Enter  break the line — compose multi-line tasks
+                        (Shift-Enter needs a terminal with the kitty
+                        keyboard protocol; Ctrl-J works everywhere)
+    Up/Down             recall input history · Home/End line-wise
+    Ctrl-O              unfold every folded block (thoughts, tool tails)
+                        into a full-screen review; q or Ctrl-O returns to
+                        the REPL — what opened stays open
+    in the review view: ↑↓/j/k, PgUp/PgDn, g/G scroll
     Ctrl-C              interrupt the running task (twice: exit) · Ctrl-D quit
     JINGWEI_NO_TUI=1    log-style REPL instead of the TUI
-    -s, --stream        stream output (default) · -S, --no-stream to block
-    Ctrl-C              interrupt the running agent (press twice to exit at once)
-    -h, --help          this help
 
 EXAMPLES:
     jingwei --base-url https://api.minimax.cn/anthropic -m MiniMax-M3 \"task\"
@@ -612,7 +487,7 @@ fn main() {
         // interrupted by Ctrl-C — exit the way a shell command would
         Err(Error::Interrupted) => std::process::exit(130),
         Err(e) => {
-            eprintln!("{}", paint(&format!(" jingwei: {e} "), ERR_BG, true));
+            eprintln!("{}", display::paint(&format!(" jingwei: {e} "), display::ERR_BG, true));
             std::process::exit(1);
         }
     }
@@ -629,7 +504,7 @@ async fn run() -> Result<()> {
     let cfg = build_config(&args)?;
     if args.prompt.is_empty() {
         // A terminal gets the TUI; pipes, tests, and one-shots get the log.
-        return if tui::wanted() { tui::run(&cfg).await } else { display::plain_repl(&cfg).await };
+        return if tui::wanted() { tui::run(&cfg).await } else { plain::plain_repl(&cfg).await };
     }
     // One-shot: always the plain frontend — its output must stay in the
     // terminal after the process exits, and an alt-screen would take it.
@@ -662,7 +537,7 @@ async fn agent_turn(cfg: &Config, history: &mut Vec<Value>, token: &CancelToken)
     let res = tokio::select! {
         res = &mut agent => res,
         _ = tokio::signal::ctrl_c() => {
-            eprintln!("{}", paint(" interrupted again — exiting ", ERR_BG, true));
+            disp(Msg::Note { sev: Sev::Err, text: " interrupted again — exiting ".into() });
             std::process::exit(130);
         }
     };
@@ -1939,75 +1814,6 @@ mod tests {
         assert_eq!(Error::Api(429, "limited".into()).to_string(), "api 429: limited");
         assert_eq!(Error::Msg("bad".into()).to_string(), "bad");
         assert_eq!(Error::Interrupted.to_string(), "interrupted");
-    }
-
-    // ---- ui: status bar & pane protocol ----
-
-    #[test]
-    fn humanize_small_exact_rest_one_decimal_k() {
-        assert_eq!(humanize(0), "0");
-        assert_eq!(humanize(4), "4");
-        assert_eq!(humanize(999), "999");
-        assert_eq!(humanize(1000), "1.0k");
-        assert_eq!(humanize(26156), "26.2k");
-        assert_eq!(humanize(1_048_576), "1048.6k");
-    }
-
-    #[test]
-    fn bar_text_segments_appear_as_data_arrives() {
-        let z = Usage::default();
-        assert_eq!(bar_text(None, &z, &z), "");
-        let turn = Usage { input: 4600, output: 120, ..Usage::default() };
-        assert_eq!(bar_text(None, &turn, &z), "turn in 4.6k out 120");
-        assert_eq!(bar_text(Some(("⠋", "3s")), &turn, &z), "⠋ 3s · turn in 4.6k out 120");
-        let total = Usage { input: 26_156, output: 336, cache_read: 25_344, cache_write: 1188 };
-        assert_eq!(bar_text(None, &turn, &total),
-            "turn in 4.6k out 120 · total in 52.7k out 336 · cache 25.3k+1.2k");
-        // zero cache write: a single figure, no dangling +
-        let total2 = Usage { input: 1, output: 1, cache_read: 500, ..Usage::default() };
-        assert_eq!(bar_text(None, &z, &total2), "total in 501 out 1 · cache 500");
-    }
-
-    #[test]
-    fn bar_text_drops_turn_to_fit_and_reattaches_cache_when_room() {
-        let huge = Usage { input: 9_999_999, output: 9_999_999, cache_read: 9_999_999, cache_write: 9_999_999 };
-        let bar = bar_text(Some(("⠋", "999m59s")), &huge, &huge);
-        // all three segments don't fit; the turn is the one that goes…
-        assert!(!bar.contains("turn"), "turn is the segment that goes: {bar}");
-        assert!(bar.contains("total"), "session totals never drop: {bar}");
-        // …and with it gone, cache fits again
-        assert!(bar.contains("cache"), "{bar}");
-        assert!(disp_width(&bar) <= BAR_MAX, "bar must stay one physical row: {bar}");
-    }
-
-    #[test]
-    fn usage_maps_internal_shape_and_folds_totals() {
-        let v = json!({"input_tokens": 10, "output_tokens": 0,
-            "cache_read_input_tokens": 5, "cache_creation_input_tokens": 2});
-        let mut u = Usage::from_value(&v);
-        assert_eq!(u.context_in(), 17); // the model read all of it
-        u.output = 3;
-        let mut total = Usage::default();
-        total.add(&u);
-        total.add(&u);
-        assert_eq!((total.input, total.output, total.cache_read, total.cache_write), (20, 6, 10, 4));
-    }
-
-    #[test]
-    fn elapsed_str_minutes_and_seconds() {
-        assert_eq!(elapsed_str(Duration::from_secs(3)), "3s");
-        assert_eq!(elapsed_str(Duration::from_secs(59)), "59s");
-        assert_eq!(elapsed_str(Duration::from_secs(63)), "1m03s");
-    }
-
-    #[test]
-    #[test]
-    fn truncate_cols_respects_wide_chars() {
-        assert_eq!(truncate_cols("abc", 10), "abc");
-        assert_eq!(truncate_cols("精卫填海", 5), "精…");
-        let long = "x".repeat(80);
-        let t = truncate_cols(&long, 60);
-        assert!(t.ends_with('…') && t.chars().count() == 59, "cut to ~60 columns: {t}");
     }
 
 }

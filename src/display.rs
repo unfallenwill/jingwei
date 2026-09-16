@@ -1,14 +1,19 @@
 //! The display port: the agent core never touches a terminal. It emits
 //! [`Msg`]s through [`disp`], and a *frontend* interprets them — the plain
-//! frontend folds them into a log, the TUI folds them into application
-//! state. Both frontends are pure functions of the message stream, which is
-//! what makes the UI testable without a terminal.
+//! frontend (`crate::plain`) folds them into a log, the TUI (`crate::tui`)
+//! folds them into application state.
+//!
+//! This module is only the contract: the message type, the usage shape it
+//! carries, and the small vocabulary both frontends render with (the
+//! prompt, the thought marker, measurement). No frontend lives here — the
+//! default plain instance is constructed by `disp` on demand, nothing else.
 //!
 //! With no frontend installed, `disp` routes to a default plain instance —
 //! agent-core tests exercise the protocols without driving any UI.
 
-use crate::Usage;
-use std::io::IsTerminal;
+use serde_json::Value;
+use std::env;
+use std::io::{self, IsTerminal};
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -20,6 +25,20 @@ pub enum Sev {
 }
 
 /// Everything the agent core wants the human to see.
+///
+/// The protocol's ordering contract — frontends are free to rely on it:
+///
+/// ```text
+/// TaskBegin(text)
+///   ( Think.. ThinkEnd | Text.. | Tool | Note | Usage | OutTokens )*   one run
+///   Done                                                               fold turn usage into totals
+/// TaskEnd
+/// ```
+///
+/// `Usage` replaces the live turn's counters wholesale; `OutTokens` ticks
+/// the output count while text streams and is superseded by the next
+/// `Usage`. A run interrupted mid-flight still ends with `Done`/`TaskEnd`
+/// (whatever was reasoned is folded first), so frontends never dangle.
 #[derive(Clone, Debug)]
 pub enum Msg {
     /// A dim information line (the banner).
@@ -28,7 +47,9 @@ pub enum Msg {
     TaskBegin(String),
     /// The run finished (normally, or interrupted).
     TaskEnd,
-    /// Streamed answer text; may carry partial lines and newlines.
+    /// Streamed answer text; may carry partial lines and newlines. The
+    /// final chunk of a turn need not end in `\n` — frontends land it on
+    /// `Done`.
     Text(String),
     /// Streamed reasoning delta — folded away, never shown inline.
     Think(String),
@@ -46,12 +67,125 @@ pub enum Msg {
     Done,
 }
 
+/// Token usage of one API request — or session totals. Part of the [`Msg`]
+/// contract, so it lives with it.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Usage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl Usage {
+    /// From an internal-shape usage object (Anthropic keys, or OpenAI mapped).
+    pub fn from_value(v: &Value) -> Self {
+        let g = |k: &str| v[k].as_u64().unwrap_or(0);
+        Self {
+            input: g("input_tokens"),
+            output: g("output_tokens"),
+            cache_read: g("cache_read_input_tokens"),
+            cache_write: g("cache_creation_input_tokens"),
+        }
+    }
+    /// Everything the model read this request: plain input plus cache traffic.
+    pub fn context_in(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write
+    }
+    pub fn add(&mut self, o: &Usage) {
+        self.input += o.input;
+        self.output += o.output;
+        self.cache_read += o.cache_read;
+        self.cache_write += o.cache_write;
+    }
+    pub fn is_zero(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
+    }
+}
+
+// ---- shared display vocabulary ---------------------------------------------
+//
+// Both frontends render the same prompt, the same thought marker, and the
+// same severity colors. The strings live here, once, so the log and the TUI
+// cannot drift apart.
+
+/// The prompt's head and gutter; [`prompt_w`] is derived, never restated.
+pub const PROMPT_HEAD: &str = "jingwei";
+pub const PROMPT_GUTTER: &str = " ❯ ";
+
+/// Display columns the prompt occupies — computed from the strings above so
+/// editing the prompt cannot silently break alignment.
+pub fn prompt_w() -> usize {
+    disp_width(PROMPT_HEAD) + disp_width(PROMPT_GUTTER)
+}
+
+/// Backgrounds for short, high-attention signals. Warn is honey, Err is red.
+pub const WARN_BG: (u8, u8, u8) = (255, 220, 100);
+pub const ERR_BG: (u8, u8, u8) = (198, 40, 40);
+
+/// Paint a short, high-attention badge: a truecolor background with the
+/// text in white (or near-black). The only place raw ANSI escape codes are
+/// spelled out — the entry point's fatal errors use it before any frontend
+/// exists; everything else renders through a frontend.
+pub fn paint(s: &str, bg: (u8, u8, u8), white: bool) -> String {
+    if color_on() {
+        format!("\x1b[{}m\x1b[48;2;{};{};{}m{s}\x1b[49m\x1b[39m", if white { 97 } else { 30 }, bg.0, bg.1, bg.2)
+    } else {
+        s.into()
+    }
+}
+
+/// The one-line marker a folded (or unfolded) reasoning block shows, in
+/// both frontends: `▸ thought #3 · 14 lines`. The glyph is the fold's
+/// state — `▸` closed, `▾` open — so callers never string-surgery it.
+pub fn thought_marker(glyph: &str, n: usize, lines: usize) -> String {
+    format!("{glyph} thought #{n} · {lines} lines")
+}
+
+/// Should we color at all? Honors `NO_COLOR`/`JINGWEI_NO_COLOR`, requires a
+/// terminal, and `JINGWEI_COLOR=always|1|true` forces color on (useful when
+/// jingwei's output rides a pipe into a color-aware pager).
+pub fn color_on() -> bool {
+    if matches!(env::var("JINGWEI_COLOR").as_deref(), Ok("always" | "1" | "true")) {
+        return true;
+    }
+    env::var_os("NO_COLOR").is_none()
+        && env::var_os("JINGWEI_NO_COLOR").is_none()
+        && io::stdout().is_terminal()
+        && io::stderr().is_terminal()
+}
+
+/// Display width of a string, per Unicode (east-asian wide = 2, combining
+/// marks = 0). Both frontends measure with the same ruler.
+pub fn disp_width(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    s.width()
+}
+
+/// Cut to `max` display columns, marking the cut with an ellipsis. Walks
+/// graphemes so a combining mark is never severed from its base.
+pub fn truncate_cols(s: &str, max: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut out = String::new();
+    let mut w = 0;
+    for g in s.graphemes(true) {
+        let gw = disp_width(g).max(1);
+        if w + gw > max.saturating_sub(2) {
+            out.push('…');
+            return out;
+        }
+        out.push_str(g);
+        w += gw;
+    }
+    out
+}
+
 /// The installed frontend. TUI installs a channel; plain is the default.
 static FRONT: OnceLock<Front> = OnceLock::new();
 
 enum Front {
     Chan(UnboundedSender<Msg>),
-    Plain(Mutex<Plain>),
+    Plain(Mutex<crate::plain::Plain>),
 }
 
 /// Install the TUI frontend: messages flow to its event loop.
@@ -63,7 +197,7 @@ pub fn install_chan(tx: UnboundedSender<Msg>) {
 /// dropped TUI receiver (or no frontend at all) must never take the agent
 /// down — the sea does not care whether anyone is watching.
 pub fn disp(m: Msg) {
-    match FRONT.get_or_init(|| Front::Plain(Mutex::new(Plain::new()))) {
+    match FRONT.get_or_init(|| Front::Plain(Mutex::new(crate::plain::Plain::new()))) {
         Front::Chan(tx) => {
             let _ = tx.send(m);
         }
@@ -71,225 +205,57 @@ pub fn disp(m: Msg) {
             let mut p = p.lock().unwrap();
             for (stream, line) in p.feed(m) {
                 match stream {
-                    Stream::Out => println!("{line}"),
-                    Stream::Err => eprintln!("{line}"),
+                    crate::plain::Stream::Out => println!("{line}"),
+                    crate::plain::Stream::Err => eprintln!("{line}"),
                 }
             }
         }
     }
 }
-
-// ---- plain frontend ---------------------------------------------------------
-
-/// Where a rendered plain line goes.
-#[derive(PartialEq, Eq, Debug)]
-pub enum Stream {
-    Out,
-    Err,
-}
-
-/// How many lines of tool output the plain log echoes per call.
-const PLAIN_TOOL_LINES: usize = 20;
-
-/// The plain frontend as a *pure* fold: `feed` consumes one message and
-/// returns the finished lines it produced (stdout or stderr). Partial
-/// streamed text and partial thinking stay inside until a newline or end
-/// closes them — tests pin the exact output.
-#[derive(Default)]
-pub struct Plain {
-    text: String,
-    text_open: bool,
-    think: String,
-    thoughts: usize,
-    out: bool,
-}
-
-impl Plain {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Fold one message into zero or more finished lines.
-    pub fn feed(&mut self, m: Msg) -> Vec<(Stream, String)> {
-        let mut lines = vec![];
-        let emit = |s: Stream, l: String, v: &mut Vec<(Stream, String)>| v.push((s, l));
-        match m {
-            Msg::Banner(b) => emit(Stream::Out, b, &mut lines),
-            Msg::TaskBegin(t) => emit(Stream::Out, format!("jingwei ❯ {t}"), &mut lines),
-            Msg::TaskEnd => {
-                self.flush(&mut lines);
-                self.fold_think(&mut lines);
-            }
-            Msg::Text(t) => {
-                self.out = true;
-                self.text.push_str(&t);
-                self.flush(&mut lines);
-            }
-            Msg::Think(t) => self.think.push_str(&t),
-            Msg::ThinkEnd => self.fold_think(&mut lines),
-            Msg::Tool { name, summary, output } => {
-                self.flush(&mut lines);
-                emit(Stream::Out, format!("[{name}] {summary}"), &mut lines);
-                let all: Vec<&str> = output.lines().collect();
-                let shown = all.len().min(PLAIN_TOOL_LINES);
-                for l in &all[..shown] {
-                    emit(Stream::Out, format!("│ {l}"), &mut lines);
-                }
-                if all.len() > shown {
-                    emit(Stream::Out, format!("… +{} more lines", all.len() - shown), &mut lines);
-                }
-            }
-            Msg::Note { sev, text } => emit(match sev {
-                Sev::Warn | Sev::Err => Stream::Err,
-            }, text, &mut lines),
-            // usage lives in the TUI's status bar; the plain log has none
-            Msg::Usage(_) | Msg::OutTokens(_) | Msg::Done => {
-                if let Msg::Done = m {
-                    self.flush(&mut lines);
-                    self.fold_think(&mut lines);
-                }
-            }
-        }
-        lines
-    }
-
-    /// Land complete lines of streamed text; the partial tail stays buffered.
-    fn flush(&mut self, lines: &mut Vec<(Stream, String)>) {
-        while let Some(i) = self.text.find('\n') {
-            let line: String = self.text.drain(..=i).collect();
-            lines.push((Stream::Out, line.trim_end_matches('\n').to_string()));
-        }
-        self.text_open = !self.text.is_empty();
-    }
-
-    /// Fold accumulated reasoning into a marker line; interrupted thinking
-    /// still folds, so nothing reasoned is lost.
-    fn fold_think(&mut self, lines: &mut Vec<(Stream, String)>) {
-        if self.think.is_empty() {
-            return;
-        }
-        let text = std::mem::take(&mut self.think);
-        self.thoughts += 1;
-        let n = text.lines().count().max(1);
-        lines.push((Stream::Out, format!("▸ thought #{} · {} lines", self.thoughts, n)));
-    }
-
-    /// Terminate any open streamed line (plain streams are line-oriented).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn close(&mut self) -> Vec<(Stream, String)> {
-        let mut lines = vec![];
-        self.flush(&mut lines);
-        if self.text_open || !self.text.is_empty() {
-            let rest = std::mem::take(&mut self.text);
-            self.text_open = false;
-            lines.push((Stream::Out, rest));
-        }
-        self.fold_think(&mut lines);
-        lines
-    }
-}
-
-/// Drive the plain REPL: read lines, run the agent, print via the port.
-/// Used when stdout is not a terminal (pipes, one-shot runs) or when
-/// `JINGWEI_NO_TUI` asks for the log form.
-pub async fn plain_repl(cfg: &crate::Config) -> crate::Result<()> {
-    use crate::{agent_turn, CancelToken};
-    let tty = std::io::stdin().is_terminal();
-    println!("jingwei — 精卫填海，一石一石 · type a task, Ctrl-C interrupts, Ctrl-D rests");
-    println!("{} · {} · {}", cfg.protocol_label(), cfg.model, cfg.base_url);
-    let mut history: Vec<serde_json::Value> = vec![];
-    let stdin = std::io::stdin();
-    loop {
-        if tty {
-            print!("jingwei> ");
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-        }
-        let mut line = String::new();
-        match stdin.read_line(&mut line) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
-            // bad bytes: warn and carry on, the way the old readline did
-            Err(e) => {
-                disp(Msg::Note { sev: Sev::Warn, text: format!("warning: input ({e})") });
-                continue;
-            }
-        }
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-        history.push(serde_json::json!({"role": "user", "content": line}));
-        disp(Msg::TaskBegin(line));
-        let token = CancelToken::new();
-        match agent_turn(cfg, &mut history, &token).await {
-            Err(crate::Error::Interrupted) => {}
-            Err(e) => disp(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
-            Ok(()) => {}
-        }
-        disp(Msg::TaskEnd);
-    }
-    Ok(())
-}
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn run(msgs: Vec<Msg>) -> Vec<(Stream, String)> {
-        let mut p = Plain::new();
-        let mut out = vec![];
-        for m in msgs {
-            out.extend(p.feed(m));
-        }
-        out.extend(p.close());
-        out
+    #[test]
+    fn prompt_w_matches_the_strings_it_is_derived_from() {
+        assert_eq!(prompt_w(), disp_width(&format!("{PROMPT_HEAD}{PROMPT_GUTTER}")));
     }
 
     #[test]
-    fn plain_folds_streamed_text_and_thinking() {
-        let out = run(vec![
-            Msg::TaskBegin("count files".into()),
-            Msg::Think("step one\nstep two".into()),
-            Msg::ThinkEnd,
-            Msg::Text("there are 3".into()),
-            Msg::Text(" files\n".into()),
-            Msg::Done,
-            Msg::TaskEnd,
-        ]);
-        let texts: Vec<String> = out.iter().map(|(_, l)| l.clone()).collect();
-        assert_eq!(texts, vec![
-            "jingwei ❯ count files",
-            "▸ thought #1 · 2 lines",
-            "there are 3 files",
-        ]);
-        assert!(out.iter().all(|(s, _)| *s == Stream::Out), "no stderr in a clean run");
+    fn truncate_cols_respects_wide_chars() {
+        assert_eq!(truncate_cols("abc", 10), "abc");
+        assert_eq!(truncate_cols("精卫填海", 5), "精…");
+        let long = "x".repeat(80);
+        let t = truncate_cols(&long, 60);
+        assert!(t.ends_with('…') && t.chars().count() == 59, "cut to ~60 columns: {t}");
     }
 
     #[test]
-    fn plain_tool_echo_is_capped() {
-        let out = run(vec![Msg::Tool {
-            name: "bash".into(),
-            summary: "$ seq 1 30".into(),
-            output: (1..=30).map(|i| i.to_string()).collect::<Vec<_>>().join("\n"),
-        }]);
-        assert_eq!(out.len(), 1 + 20 + 1);
-        assert_eq!(out[0].1, "[bash] $ seq 1 30");
-        assert_eq!(out[1].1, "│ 1");
-        assert_eq!(out.last().unwrap().1, "… +10 more lines");
+    fn disp_width_counts_combining_marks_as_zero() {
+        // e + combining acute is ONE column, not three — the ruler the caret
+        // math relies on
+        assert_eq!(disp_width("e\u{301}"), 1);
+        assert_eq!(disp_width("精卫"), 4);
     }
 
     #[test]
-    fn interrupted_thinking_still_folds_on_done() {
-        let out = run(vec![Msg::Think("half a thought".into()), Msg::Done]);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].1, "▸ thought #1 · 1 lines");
+    fn truncate_cols_never_severs_a_grapheme() {
+        // cutting near "é" (e + U+0301) takes or leaves the whole grapheme — never the mark alone
+        assert_eq!(truncate_cols("ab\u{301}cd", 4), "ab\u{301}…");
+        assert_eq!(truncate_cols("ab\u{301}cd", 5), "ab\u{301}c…");
     }
 
     #[test]
-    fn notes_go_to_stderr() {
-        let out = run(vec![Msg::Note { sev: Sev::Warn, text: " trimmed history ".into() }]);
-        assert_eq!(out, vec![(Stream::Err, " trimmed history ".to_string())]);
+    fn usage_maps_internal_shape_and_folds_totals() {
+        let v = serde_json::json!({"input_tokens": 10, "output_tokens": 0,
+            "cache_read_input_tokens": 5, "cache_creation_input_tokens": 2});
+        let mut u = Usage::from_value(&v);
+        assert_eq!(u.context_in(), 17); // the model read all of it
+        u.output = 3;
+        let mut total = Usage::default();
+        total.add(&u);
+        total.add(&u);
+        assert_eq!((total.input, total.output, total.cache_read, total.cache_write), (20, 6, 10, 4));
     }
 }
