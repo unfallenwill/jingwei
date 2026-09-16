@@ -182,22 +182,25 @@ struct Stage {
 }
 
 impl Stage {
-    /// Anchor the pane at the cursor's row — the one cursor-position query
-    /// of the session, made before the keyboard reader exists. If the
-    /// anchor is too close to the bottom, scroll so the pane fits.
+    /// Anchor the pane at the bottom of the screen — where a REPL's input
+    /// belongs, and where the README always said it was. The one
+    /// cursor-position query of the session (made before the keyboard reader
+    /// exists) is not for the anchor but for safety: it tells us whether the
+    /// shell's own last lines would fall inside the pane, and if so we scroll
+    /// them up first, so nothing already on the screen is overwritten.
     fn new(height: u16) -> io::Result<Self> {
         let (w, h) = crossterm::terminal::size()?;
-        let (_, top) = crossterm::cursor::position()
+        let (_, cursor_row) = crossterm::cursor::position()
             .map_err(|e| io::Error::other(format!("cursor position: {e}")))?;
         let screen = h.max(1);
         let height = height.min(screen);
-        let mut me = Stage { frame: Vec::new(), top, height, width: w.max(8), screen };
-        if me.top + me.height > me.screen {
-            let s = me.top + me.height - me.screen;
+        let top = screen - height;
+        let me = Stage { frame: Vec::new(), top, height, width: w.max(8), screen };
+        if cursor_row > top {
+            let s = cursor_row - top;
             // before the first frame there is nothing of ours on screen,
             // so no intermediate state to hide — a direct write is fine
-            crossterm::execute!(io::stdout(), MoveTo(0, me.screen - 1), Print(scroll_bytes(s)))?;
-            me.top = me.screen - me.height;
+            crossterm::execute!(io::stdout(), MoveTo(0, screen - 1), Print(scroll_bytes(s)))?;
         }
         Ok(me)
     }
@@ -206,14 +209,15 @@ impl Stage {
     /// screen has just reflowed our rows (and our pane) on its own — an
     /// event we cannot undo and must not try to reason about, so a resize is
     /// never a scroll: the caller clears the screen and reprints the visible
-    /// tail from the top instead (see the event loop). This only records the
-    /// new geometry and puts the pen at the top; the flush after it lands the
-    /// tail there, the pane right below, exactly as a fresh screen would.
-    fn begin_resize(&mut self, w: u16, h: u16, pane_h: u16) {
+    /// tail instead (see the event loop). This only records the new geometry:
+    /// the pane goes to the bottom (`pane_h` rows), with `count` transcript
+    /// rows reprinted above it — nothing that already rode into the
+    /// scrollback is among them, and the blank above stays blank.
+    fn begin_resize(&mut self, w: u16, h: u16, pane_h: u16, count: u16) {
         self.width = w.max(8);
         self.screen = h.max(1);
         self.height = pane_h.clamp(1, self.screen);
-        self.top = 0;
+        self.top = self.screen.saturating_sub(self.height).saturating_sub(count);
     }
 
     /// Grow or shrink the pane. Growth scrolls the screen (old transcript
@@ -484,7 +488,7 @@ pub async fn run(cfg: &Config, convo: Convo, banners: Vec<String>) -> crate::Res
                     // scrollback must not be shown a second time.
                     let was_visible = stage.screen.saturating_sub(stage.height);
                     let count = was_visible.min(h.saturating_sub(p.lines.len() as u16));
-                    stage.begin_resize(w, h, p.lines.len() as u16);
+                    stage.begin_resize(w, h, p.lines.len() as u16, count);
                     view::transcript_tail(&app, w as usize, count as usize)
                 } else {
                     view::flush_lines(&app, w as usize, flushed)
@@ -1021,21 +1025,23 @@ mod tests {
         assert_eq!(flush_plan(20, 4, 24, 0), vec![(0, 20, 0)]);
     }
 
-    /// The invariant a resize reprint rests on: reprinting the visible tail
-    /// from the top (`top = 0`, `count` rows, pane below) never scrolls. That
-    /// is what makes the clear-and-reprint safe — no row is pushed into the
+    /// The invariant a resize reprint rests on: anchored so the pane sits at
+    /// the bottom with `count` rows above it (`top = screen - pane - count`),
+    /// the flush plan paints *in place* — it never scrolls. That is what
+    /// makes the clear-and-reprint safe: no row is pushed into the
     /// scrollback, so rows that already rode there are not shown twice.
     #[test]
     fn resize_reprint_plan_never_scrolls() {
         for screen in [3u16, 10, 24, 60] {
             for pane_h in 1..=screen {
                 for count in 0..=(screen - pane_h) {
-                    let plan = flush_plan(0, pane_h, screen, count as usize);
+                    let top = screen - pane_h - count;
+                    let plan = flush_plan(top, pane_h, screen, count as usize);
                     let scrolled: u16 = plan.iter().map(|(s, _, _)| *s).sum();
                     assert_eq!(scrolled, 0, "screen={screen} pane={pane_h} count={count}: {plan:?}");
-                    // and the pane lands right below the reprinted tail
-                    let end = plan.last().map(|(_, at, c)| at + *c as u16).unwrap_or(0);
-                    assert_eq!(end, count, "screen={screen} pane={pane_h} count={count}: {plan:?}");
+                    // and the pane's top after the reprint is where we anchored it
+                    let end = plan.last().map(|(_, at, c)| at + *c as u16).unwrap_or(top);
+                    assert_eq!(end, screen - pane_h, "screen={screen} pane={pane_h} count={count}");
                 }
             }
         }
