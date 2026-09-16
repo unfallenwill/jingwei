@@ -7,11 +7,14 @@
 //! the one full-screen view, on the alternate screen, that may scroll.
 //!
 //! Views never touch a terminal, a clock, or a random number; tests assert
-//! on the produced rows directly. Layout is two-faced by design ([`Lay`]):
-//! what is flushed into the scrollback can never be rewritten, so it
-//! truncates — every row exactly one physical row, rendered deterministically
-//! once — while the review overlay re-renders every frame and wraps, because
-//! a review that hides the end of the line reviews nothing.
+//! on the produced rows directly. Layout is three-faced by design ([`Lay`]):
+//! what is flushed into the scrollback wraps at the width it was flushed
+//! with and is then immutable — the wrap is baked, exactly like a shell's
+//! own output (a later resize cannot re-wrap it, only the next flush can) —
+//! the review overlay re-renders every frame and re-wraps at the live
+//! width, and the pane's live rows truncate to one physical row each,
+//! because they are previews, not record: a row that rewrites itself every
+//! frame owes the pane a predictable shape, not the whole line.
 //!
 //! Styling honors [`crate::display::color_on`]: with NO_COLOR the same
 //! structure renders without color, exactly like the plain frontend.
@@ -152,10 +155,20 @@ fn rule(w: usize) -> Line<'static> {
 /// blank padding holds the pane at its high-water mark
 /// ([`Status::pane_floor`](super::model::Status::pane_floor)), so the
 /// status bar keeps its row while folds swap tail rows for reserve.
+/// The reserve is rarely blank, though: when no block streams, the last
+/// folded thought lingers where it streamed ([`linger_tail`]) — so the
+/// pane that showed `◌ thought #33` live comes to rest on `▸ thought #33`
+/// and its tail, holding its height (and the bar's row at the screen's
+/// bottom) between think blocks, after the task ends, and into the next
+/// task until new reasoning arrives. A pane that never shrinks never
+/// leaves blank rows under the bar.
 pub fn pane(app: &App, w: u16, h: u16) -> Pane {
     let w = w.max(8) as usize;
     let mut lines: Vec<Line<'static>> = vec![];
-    think_tail(app, w, Lay::Flush, &mut lines);
+    if app.think_buf.is_empty() {
+        linger_tail(app, w, &mut lines);
+    }
+    think_tail(app, w, Lay::Pane, &mut lines);
     if !app.partial.is_empty() {
         lines.push(Line::from(truncate_cols(&app.partial, w)));
     }
@@ -259,24 +272,33 @@ fn line_window(line: &str, off: usize, avail: usize) -> (String, usize) {
     (format!("…{}", truncate_cols(&line[start..], avail.saturating_sub(1))), width + 1)
 }
 
-/// How a row may lay out its text. The same row renders under both:
-/// truncation is the scrollback's ruler — what is flushed is immutable, so
-/// it must be exactly one physical row, deterministically — while the
-/// review overlay re-renders every frame and owes the reader the whole
-/// line. One enum, because the two modes are one fact with two faces.
+/// How a row may lay out its text. The same row renders under all three:
+/// the pane's live rows truncate (they are rewritten every frame — previews
+/// keep the pane's geometry predictable), the transcript wraps at the width
+/// of its flush and is then baked (what lands in the scrollback is
+/// immutable, so it must carry the whole line at *that* width — the way a
+/// shell's own output is wrapped forever by the width it was printed at),
+/// and the review overlay wraps at the live width, re-wrapping as the
+/// terminal is resized. One enum, because the three modes are one fact with
+/// three faces.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lay {
-    /// Truncate with an ellipsis: one row, printed once, never rewritten.
+    /// Truncate with an ellipsis: the pane's live preview rows, one
+    /// physical row each, rewritten freely.
+    Pane,
+    /// Wrap, baked at the flush-time width: what is printed once and never
+    /// rewritten.
     Flush,
-    /// Wrap: reading beats row counts where rewriting is free.
+    /// Wrap, re-rendered every frame at the live width.
     Review,
 }
 
-/// Render transcript rows `from..` as they should land in the scrollback.
-/// The caller only ever advances `from` past rows already flushed, so each
-/// row is rendered exactly once, with the fold state it has right now —
-/// what the ratchet has opened by then prints open, later folds print as
-/// markers.
+/// Render transcript rows `from..` as they should land in the scrollback:
+/// wrapped at this width — the wrap is baked once, the way a shell's own
+/// output is. The caller only ever advances `from` past rows already
+/// flushed, so each row is rendered exactly once, with the fold state it
+/// has right now — what the ratchet has opened by then prints open, later
+/// folds print as markers.
 pub fn flush_lines(app: &App, w: usize, from: usize) -> Vec<Line<'static>> {
     let mut out = vec![];
     for row in &app.rows[from.min(app.rows.len())..] {
@@ -327,22 +349,19 @@ fn render_rows(app: &App, w: usize) -> Vec<Line<'static>> {
 fn row_lines(row: &Row, w: usize, out: &mut Vec<Line<'static>>, lay: Lay) {
     match row {
         // a multi-line task echoes as one row per line, the gutter
-        // aligning continuation lines under the prompt; under Review a
-        // wrapped chunk of the task aligns there too
+        // aligning continuation lines — and wrapped chunks — under the
+        // prompt; only the pane's locked one-row preview truncates
         Row::Task(t) => {
             let avail = w.saturating_sub(prompt_w());
             for (j, l) in t.split('\n').enumerate() {
-                match lay {
-                    Lay::Flush => {
-                        let (head, gutter) = task_spans(j == 0);
-                        out.push(Line::from(vec![head, gutter, Span::raw(truncate_cols(l, avail))]));
-                    }
-                    Lay::Review => {
-                        for (k, chunk) in wrap_cols(l, avail).into_iter().enumerate() {
-                            let (head, gutter) = task_spans(j == 0 && k == 0);
-                            out.push(Line::from(vec![head, gutter, Span::raw(chunk)]));
-                        }
-                    }
+                if lay == Lay::Pane {
+                    let (head, gutter) = task_spans(j == 0);
+                    out.push(Line::from(vec![head, gutter, Span::raw(truncate_cols(l, avail))]));
+                    continue;
+                }
+                for (k, chunk) in wrap_cols(l, avail).into_iter().enumerate() {
+                    let (head, gutter) = task_spans(j == 0 && k == 0);
+                    out.push(Line::from(vec![head, gutter, Span::raw(chunk)]));
                 }
             }
         }
@@ -355,7 +374,7 @@ fn row_lines(row: &Row, w: usize, out: &mut Vec<Line<'static>>, lay: Lay) {
             // the head carries the fold-state glyph, like a thought marker:
             // one left rail of ▸/▾ down the transcript, scan it to read
             // the whole fold tree's state
-            out.push(fold_head(head, fold.expanded, w));
+            fold_head(head, fold.expanded, w, out);
             tool_lines(fold, w, lay, out);
         }
         Row::Note(sev, text) => {
@@ -364,11 +383,12 @@ fn row_lines(row: &Row, w: usize, out: &mut Vec<Line<'static>>, lay: Lay) {
                 crate::display::Sev::Err => (ERR_BG, true),
             };
             let style = note_style(bg, err);
-            match lay {
-                Lay::Flush => out.push(Line::from(Span::styled(truncate_cols(text, w), style))),
-                Lay::Review => for chunk in wrap_cols(text, w) {
+            if lay == Lay::Pane {
+                out.push(Line::from(Span::styled(truncate_cols(text, w), style)));
+            } else {
+                for chunk in wrap_cols(text, w) {
                     out.push(Line::from(Span::styled(chunk, style)));
-                },
+                }
             }
         }
     }
@@ -384,14 +404,15 @@ fn task_spans(first: bool) -> (Span<'static>, Span<'static>) {
     }
 }
 
-/// A flat (unguttered) row's content: one truncated row when flushed, one
-/// row per wrapped chunk under review.
+/// A flat (unguttered) row's content: one wrapped row per chunk — the
+/// pane's preview cuts it to one row.
 fn flat(l: &str, w: usize, lay: Lay, out: &mut Vec<Line<'static>>, style: Style) {
-    match lay {
-        Lay::Flush => out.push(Line::from(Span::styled(truncate_cols(l, w), style))),
-        Lay::Review => for chunk in wrap_cols(l, w) {
-            out.push(Line::from(Span::styled(chunk, style)));
-        },
+    if lay == Lay::Pane {
+        out.push(Line::from(Span::styled(truncate_cols(l, w), style)));
+        return;
+    }
+    for chunk in wrap_cols(l, w) {
+        out.push(Line::from(Span::styled(chunk, style)));
     }
 }
 
@@ -444,24 +465,65 @@ fn tool_lines(f: &Fold, w: usize, lay: Lay, out: &mut Vec<Line<'static>>) {
     }
 }
 
-/// A fold's head line: the state glyph on the rail, the head text beside
-/// it. The glyph's style *is* the state — dim when there is more hidden,
-/// bold when the body is open below.
-fn fold_head(head: &str, expanded: bool, w: usize) -> Line<'static> {
+/// A fold's head lines: the state glyph on the rail, the head text beside
+/// it — wrapped, with continuation chunks indented to hang under the head
+/// text so a long command still reads as one call. The glyph's style *is*
+/// the state — dim when there is more hidden, bold when the body is open
+/// below.
+fn fold_head(head: &str, expanded: bool, w: usize, out: &mut Vec<Line<'static>>) {
     let glyph = if expanded { "▾" } else { "▸" };
     let gstyle = if expanded { head_style() } else { dim() };
-    Line::from(vec![
+    let avail = w.saturating_sub(2);
+    let mut chunks = wrap_cols(head, avail).into_iter();
+    let first = chunks.next().unwrap_or_default();
+    out.push(Line::from(vec![
         Span::styled(glyph, gstyle),
         Span::raw(" "),
-        Span::styled(truncate_cols(head, w.saturating_sub(2)), head_style()),
-    ])
+        Span::styled(first, head_style()),
+    ]));
+    for chunk in chunks {
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(chunk, head_style()),
+        ]));
+    }
+}
+
+/// The pane's resting tail: the last folded thought, lingering where its
+/// live tail streamed. The rows a think block held are the pane's reserve
+/// once it folds — and rather than padding them blank between blocks, the
+/// pane keeps showing that block's final state: `▸ thought #33 · 12 lines
+/// · 34s` over its last lines. What would be dead space is instead the
+/// newest reasoning — the immediate context of the answer above — and
+/// because the linger is exactly the live tail's shape, the pane holds its
+/// height (the bar its row) through folds, past the task's end, and into
+/// the next task until new thinking arrives. The folded glyph `▸` (not
+/// the live `◌`) and the frozen duration mark it as a record, not motion.
+/// It never lands in the scrollback: the transcript already carries the
+/// fold as a marker.
+fn linger_tail(app: &App, w: usize, out: &mut Vec<Line<'static>>) {
+    let Some(f) = app.rows.iter().rev().find_map(|r| match r {
+        Row::Thought(f) => Some(f),
+        _ => None,
+    }) else { return };
+    let n = f.lines();
+    let mut head = format!("▸ thought #{} · {n} line{}", f.n, if n == 1 { "" } else { "s" });
+    if let Some(d) = f.duration {
+        head.push_str(&format!(" · {}", elapsed_str(d)));
+    }
+    out.push(Line::from(Span::styled(truncate_cols(&head, w), dim())));
+    let all: Vec<&str> = f.body.lines().collect();
+    for l in all.iter().rev().take(THINK_TAIL_SHOWN).rev() {
+        guttered(l, w, Lay::Pane, thought_style(), out);
+    }
 }
 
 /// The live reasoning block: reasoning streams for seconds, and a frozen
 /// pane cannot tell "thinking" from "hung". So the pane (and the review
 /// overlay) show the block as it arrives — the number it will fold into,
 /// how long it has been running, and the tail that still moves. It never
-/// lands in the scrollback: ThinkEnd folds it once, with its final state.
+/// lands in the scrollback: ThinkEnd folds it once, with its final state,
+/// and [`linger_tail`] carries its tail from there.
 fn think_tail(app: &App, w: usize, lay: Lay, out: &mut Vec<Line<'static>>) {
     if app.think_buf.is_empty() {
         return;
@@ -479,21 +541,23 @@ fn think_tail(app: &App, w: usize, lay: Lay, out: &mut Vec<Line<'static>>) {
 }
 
 /// One body line of a fold: the shared gutter, then the content — the
-/// structure that survives a DIM-blind terminal. Under Review a wrapped
-/// chunk keeps hanging from the gutter, so the block stays a block.
+/// structure that survives a DIM-blind terminal. A wrapped chunk keeps
+/// hanging from the gutter, so the block stays a block; only the pane's
+/// live tail cuts the line to one row.
 fn guttered(l: &str, w: usize, lay: Lay, style: Style, out: &mut Vec<Line<'static>>) {
     let avail = w.saturating_sub(disp_width(FOLD_GUTTER));
-    match lay {
-        Lay::Flush => out.push(Line::from(vec![
+    if lay == Lay::Pane {
+        out.push(Line::from(vec![
             Span::styled(FOLD_GUTTER, gutter_style()),
             Span::styled(truncate_cols(l, avail), style),
-        ])),
-        Lay::Review => for chunk in wrap_cols(l, avail) {
-            out.push(Line::from(vec![
-                Span::styled(FOLD_GUTTER, gutter_style()),
-                Span::styled(chunk, style),
-            ]));
-        },
+        ]));
+        return;
+    }
+    for chunk in wrap_cols(l, avail) {
+        out.push(Line::from(vec![
+            Span::styled(FOLD_GUTTER, gutter_style()),
+            Span::styled(chunk, style),
+        ]));
     }
 }
 
@@ -668,23 +732,30 @@ mod tests {
         assert_eq!(streaming.len(), 8, "head + 3 tail rows + the 4-row frame: {streaming:?}");
         assert!(streaming[0].starts_with('◌'), "{streaming:?}");
 
-        // the fold swaps tail rows for blank padding: same height, the
-        // bar never moves — this is the fix for the blank line that used
-        // to open under the bar each time a thought folded
+        // the fold's tail lingers where it streamed: same height, the bar
+        // never moves — and the reserve is the finished block's own tail,
+        // not blank padding (the fix for the blank line that used to open
+        // under the bar each time a thought folded)
         update(&mut a, Ev::Msg(Msg::ThinkEnd));
         let folded = texts_of(&pane(&a, 80, 24).lines);
-        assert_eq!(folded.len(), 8, "padded to the floor: {folded:?}");
-        assert_eq!(&folded[..4], vec!["", "", "", ""], "blank reserve above the rule: {folded:?}");
+        assert_eq!(folded.len(), 8, "the linger holds the floor: {folded:?}");
+        assert!(folded[0].starts_with("▸ thought #1 · 4 lines"), "folded head, not the live ◌: {folded:?}");
+        assert_eq!(&folded[1..4], vec!["│ l2", "│ l3", "│ l4"], "the tail lingers on the gutter: {folded:?}");
         assert!(folded[4].starts_with("─────"), "the frame follows: {folded:?}");
 
-        // idle keeps the padded pane (the bar keeps its row at the
-        // bottom); the next task starts tight again
+        // idle keeps the linger too: the bar keeps its row at the bottom
+        // of the screen — no blank rows open under it when the task ends
         update(&mut a, Ev::Msg(Msg::TaskEnd));
-        assert_eq!(pane(&a, 80, 24).lines.len(), 8, "idle keeps the reserve");
+        let idle = texts_of(&pane(&a, 80, 24).lines);
+        assert_eq!(idle.len(), 8, "idle keeps the linger: {idle:?}");
+        assert!(idle[0].starts_with("▸ thought #1"), "the last thought rests in the pane: {idle:?}");
+        assert!(idle[5].starts_with("jingwei ❯"), "the idle prompt follows it: {idle:?}");
+        // and the next task starts at the same height — the linger holds
+        // the pane until new thinking arrives, so the bar never walks and
+        // nothing blank ever opens below it
         update(&mut a, Ev::Msg(Msg::TaskBegin("next".into())));
-        assert_eq!(pane(&a, 80, 24).lines.len(), 4, "each task starts tight");
+        assert_eq!(pane(&a, 80, 24).lines.len(), 8, "the pane does not shrink at TaskBegin");
     }
-
     #[test]
     fn browse_hint_rides_the_ledgers_tail() {
         let mut a = App::new();
@@ -892,39 +963,57 @@ mod tests {
     }
 
     #[test]
-    fn flushed_lines_truncate_rather_than_wrap() {
+    fn flushed_lines_wrap_within_the_width() {
         let mut a = App::new();
         update(&mut a, Ev::Msg(Msg::Text(format!("{}\n", "x".repeat(200)))));
-        for l in flush_lines(&a, 40, 0) {
-            let t = l.spans.iter().map(|s| s.content.clone()).collect::<String>();
-            assert!(disp_width(&t) <= 40);
+        let texts = texts_of(&flush_lines(&a, 40, 0));
+        assert!(texts.len() >= 5, "a 200-column line wraps into w=40 rows: {texts:?}");
+        for t in &texts {
+            assert!(disp_width(t) <= 40, "no chunk overflows its row: {texts:?}");
         }
+        assert_eq!(texts.concat(), "x".repeat(200), "nothing is ellipsized away: {texts:?}");
     }
 
     #[test]
-    fn review_wraps_what_flush_must_truncate() {
+    fn long_lines_wrap_whole_in_flush_and_review() {
         let long = format!("{} {}", "word".repeat(30), "精卫填海");
         let mut a = App::new();
         update(&mut a, Ev::Msg(Msg::Think(format!("{long}\n"))));
         update(&mut a, Ev::Msg(Msg::ThinkEnd));
         update(&mut a, Ev::Msg(Msg::Text(format!("{long}\n"))));
+        update(&mut a, Ev::Msg(Msg::Tool {
+            name: "bash".into(), summary: "$ cat long.txt".into(), output: long.clone(),
+        }));
 
-        // flush: one physical row, cut with an ellipsis — the scrollback's ruler
+        // flush: the wrap is baked at the flush-time width — the whole
+        // line lands, chunked; answer rows stand alone, body chunks hang
+        // from the fold's gutter, so the block still reads as a block.
+        // (Fold *markers* stay one row by design: a marker is a summary,
+        // the fold is the record.)
         let flushed = texts_of(&flush_lines(&a, 40, 0));
-        assert!(flushed.iter().any(|t| t.starts_with("word") && t.ends_with('…')), "{flushed:?}");
-        assert_eq!(flushed.len(), a.rows.len(), "one row each, still");
+        assert!(flushed.iter().all(|t| disp_width(t) <= 40), "{flushed:?}");
+        let answer = flushed.iter()
+            .filter(|t| !t.starts_with("│ ") && !t.contains("thought #")
+                && !t.starts_with("▸") && !t.starts_with("▾") && !t.is_empty())
+            .cloned().collect::<String>();
+        assert_eq!(answer, long, "the answer wraps whole: {flushed:?}");
+        let body = flushed.iter()
+            .filter_map(|t| t.strip_prefix("│ "))
+            .collect::<String>();
+        assert_eq!(body, long, "the folded tool tail wraps whole on the gutter: {flushed:?}");
+        assert!(flushed.len() > a.rows.len(), "a long row is now more than one physical row: {flushed:?}");
 
-        // review: the whole line is readable, every chunk fits, wrapped
-        // body chunks stay on the fold's gutter
+        // review: the same ruler at the live width, re-wrapping per frame
         update(&mut a, key(KeyCode::Char('o'), KeyModifiers::CONTROL));
         let texts = browse(&a, 40, 30).texts();
         assert!(texts.iter().all(|t| disp_width(t) <= 40), "{texts:?}");
         let rejoined = texts.iter()
             .filter_map(|t| t.strip_prefix("│ "))
             .collect::<String>();
-        assert_eq!(rejoined, long, "the body wraps whole: {texts:?}");
+        assert_eq!(rejoined, format!("{long}{long}"), "thought and tool bodies wrap whole: {texts:?}");
         let answer = texts.iter()
-            .filter(|t| !t.starts_with("│ ") && !t.contains("thought #") && !t.is_empty() && !t.contains("browse:"))
+            .filter(|t| !t.starts_with("│ ") && !t.contains("thought #")
+                && !t.starts_with("▸") && !t.starts_with("▾") && !t.is_empty() && !t.contains("browse:"))
             .cloned().collect::<String>();
         assert_eq!(answer, long, "the answer wraps whole: {texts:?}");
         assert!(!texts[..texts.len() - 1].iter().any(|t| t.ends_with('…')),

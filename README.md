@@ -81,9 +81,12 @@ below the input row, a live status bar underneath — at the bottom of the
 screen you already had. The bar is the session's ledger, flush right
 (model, effort tier, cache hit rate, `ctx used/--context-size` — checked
 occasionally, shed in that reverse order as the pane narrows). While a
-task runs the pane only ever grows — the live think tail's room stays
-reserved as blank padding when a block folds, so the status bar never
-walks between rows. Everything
+task runs the pane only ever grows — and when a reasoning block folds,
+its tail *lingers* where it streamed (`▸ thought #33 · 12 lines · 34s`
+over its last lines, the folded glyph marking record rather than motion),
+so the status bar never walks between rows, nothing blank opens under the
+bar when a task ends, and the pane holds its height into the next task
+until new thinking arrives. Everything
 above is the terminal's own scrollback:
 finished lines are appended to it, so the mouse wheel, text selection, and
 whatever was on screen before jingwei started keep working; there is no
@@ -105,11 +108,13 @@ Cargo.toml … +13`) instead of a wall of text. **Ctrl-O unfolds everything**
 review (the one place an alternate screen is used, and only while it is
 open); Ctrl-O again returns to the prompt, and what has been unfolded never
 refolds. Folded bodies hang from a `│` gutter — structure, not color, so
-the hierarchy survives NO_COLOR and DIM-blind terminals — and the review
-mode wraps where the scrollback truncates: what is flushed is immutable and
-renders once, what is reviewed re-renders every frame and owes the reader
-the whole line. There are no display switches: folding is simply how
-reasoning is shown, in the TUI and in the plain log alike.
+the hierarchy survives NO_COLOR and DIM-blind terminals. Long lines wrap:
+the scrollback wraps at the width each row was flushed with (the wrap is
+baked, the way a shell's own output is), and the review overlay re-wraps
+at the live width as the terminal is resized. Only the pane's live rows —
+the streaming tail, the status bar — stay one physical row each. There are
+no display switches: folding is simply how reasoning is shown, in the TUI
+and in the plain log alike.
 
 ### Sessions
 
