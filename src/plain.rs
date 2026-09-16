@@ -121,7 +121,7 @@ impl Plain {
 pub async fn plain_repl(cfg: &crate::Config) -> crate::Result<()> {
     use crate::{agent_turn, CancelToken};
     let tty = std::io::stdin().is_terminal();
-    disp(Msg::Banner("jingwei — 精卫填海，一石一石 · type a task, Ctrl-C interrupts, Ctrl-D rests".into()));
+    display::disp(Msg::Banner("jingwei — 精卫填海，一石一石 · type a task, /exit or Ctrl-D rests, Ctrl-C interrupts".into()));
     disp(Msg::Banner(format!("{} · {} · {}", cfg.protocol_label(), cfg.model, cfg.base_url)));
     let mut history: Vec<serde_json::Value> = vec![];
     let stdin = std::io::stdin();
@@ -143,6 +143,12 @@ pub async fn plain_repl(cfg: &crate::Config) -> crate::Result<()> {
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;
+        }
+        // `/exit` leaves the log REPL too — the same word the TUI speaks,
+        // checked at the same place in the flow: after the trim, before
+        // the line becomes a task
+        if display::is_exit(&line) {
+            break;
         }
         history.push(serde_json::json!({"role": "user", "content": line}));
         disp(Msg::TaskBegin(line));

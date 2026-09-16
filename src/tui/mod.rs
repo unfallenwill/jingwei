@@ -305,7 +305,7 @@ pub async fn run(cfg: &Config) -> crate::Result<()> {
         "jingwei — 精卫填海，一石一石 · {} · {} · {}",
         cfg.protocol_label(), cfg.model, cfg.base_url)));
     display::disp(Msg::Banner(
-        "type a task · Ctrl-J / Shift-Enter breaks the line · Ctrl-O unfolds · Ctrl-C interrupts (twice exits) · Ctrl-D rests".into()));
+        "type a task · Ctrl-J / Shift-Enter breaks the line · Ctrl-O unfolds · Ctrl-C interrupts (twice exits) · /exit or Ctrl-D rests".into()));
 
     let mut app = App::new();
     app.input.history = load_history();

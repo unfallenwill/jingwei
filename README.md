@@ -62,8 +62,9 @@ jingwei --help    # full flag list
 
 ### REPL
 
-With no prompt, jingwei opens a REPL. Ctrl-C clears the current line, Ctrl-D
-exits; an API error is reported but doesn't kill the session. In the TUI,
+With no prompt, jingwei opens a REPL. `/exit` quits; Ctrl-C clears the
+current line, Ctrl-D exits; an API error is reported but doesn't kill the
+session. In the TUI,
 input history is saved to `~/.jingwei_history` and reloaded on start; the
 plain log (pipes, one-shots, `JINGWEI_NO_TUI=1`) has no editor, so it keeps
 your shell's own line editing and history instead. Each answer (including the
@@ -165,7 +166,7 @@ even 精卫 has a budget.
 ## Tests
 
 ```sh
-cargo test            # 83 unit tests + 1 REPL integration test
+cargo test            # 95 unit tests + 2 REPL integration tests
 cargo clippy --all-targets
 ```
 

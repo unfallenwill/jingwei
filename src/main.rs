@@ -453,7 +453,8 @@ TUI (interactive, on a terminal):
                         into a full-screen review; q or Ctrl-O returns to
                         the REPL — what opened stays open
     in the review view: ↑↓/j/k, PgUp/PgDn, g/G scroll
-    Ctrl-C              interrupt the running task (twice: exit) · Ctrl-D quit
+    Ctrl-C              interrupt the running task (twice: exit) · /exit
+                        or Ctrl-D quit
     JINGWEI_NO_TUI=1    log-style REPL instead of the TUI
 
 EXAMPLES:

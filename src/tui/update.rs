@@ -141,6 +141,13 @@ fn input_mode(app: &mut App, k: KeyEvent) -> Action {
             if line.is_empty() {
                 return Action::None;
             }
+            // `/exit` is a command, not a task: it submits nothing and
+            // recalls nothing — the line clears and the REPL quits
+            if crate::display::is_exit(&line) {
+                input_clear(app);
+                app.quit = true;
+                return Action::None;
+            }
             app.input.history.push(line.clone());
             app.input.hist_pos = app.input.history.len();
             app.input.draft = None;
@@ -472,6 +479,28 @@ mod tests {
         assert!(!a.quit);
         drive(&mut a, vec![key(KeyCode::Char('d'), KeyModifiers::CONTROL)]); // empty: quit
         assert!(a.quit);
+    }
+
+    #[test]
+    fn slash_exit_quits_without_submitting_or_recall() {
+        let mut a = App::new();
+        type_str(&mut a, "/exit");
+        let acts = drive(&mut a, vec![key(KeyCode::Enter, KeyModifiers::NONE)]);
+        assert_eq!(acts, vec![Action::None], "a command submits no task");
+        assert!(a.quit);
+        assert_eq!(a.input.text, "", "the line clears on the way out");
+        assert!(a.input.history.is_empty(), "commands are not tasks to recall");
+        // surrounded by whitespace it is still the command
+        let mut b = App::new();
+        type_str(&mut b, " /exit ");
+        drive(&mut b, vec![key(KeyCode::Enter, KeyModifiers::NONE)]);
+        assert!(b.quit, "trimmed to the command word");
+        // a task that merely mentions /exit is a task
+        let mut c = App::new();
+        type_str(&mut c, "run /exit in bash");
+        let acts = drive(&mut c, vec![key(KeyCode::Enter, KeyModifiers::NONE)]);
+        assert_eq!(acts, vec![Action::Submit("run /exit in bash".into())]);
+        assert!(!c.quit);
     }
 
     // ---- the fold ratchet (Ctrl-O) ----

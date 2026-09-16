@@ -162,6 +162,18 @@ pub fn elapsed_str(d: Duration) -> String {
     if s < 60 { format!("{s}s") } else { format!("{}m{:02}s", s / 60, s % 60) }
 }
 
+/// The one REPL command both frontends speak: `/exit` leaves the session.
+/// One spelling, defined once — the TUI's editor and the plain reader
+/// agree on exactly this word, so the command works wherever a prompt is.
+pub const EXIT_COMMAND: &str = "/exit";
+
+/// Does a submitted line ask to leave? Both frontends trim before they
+/// look, so a trailing space is not a typo — but a task that merely
+/// *mentions* the word is still a task.
+pub fn is_exit(line: &str) -> bool {
+    line.trim() == EXIT_COMMAND
+}
+
 /// Should we color at all? Honors `NO_COLOR`/`JINGWEI_NO_COLOR`, requires a
 /// terminal, and `JINGWEI_COLOR=always|1|true` forces color on (useful when
 /// jingwei's output rides a pipe into a color-aware pager).
@@ -273,6 +285,15 @@ mod tests {
         assert_eq!(elapsed_str(Duration::from_secs(3)), "3s");
         assert_eq!(elapsed_str(Duration::from_secs(59)), "59s");
         assert_eq!(elapsed_str(Duration::from_secs(63)), "1m03s");
+    }
+
+    #[test]
+    fn is_exit_matches_the_one_word_not_its_mentions() {
+        assert!(is_exit("/exit"));
+        assert!(is_exit("  /exit  "), "the trim both frontends apply counts");
+        assert!(!is_exit("/exit now"), "an argument makes it a task");
+        assert!(!is_exit("run /exit in a shell"), "mentioning the word is not asking");
+        assert!(!is_exit(""));
     }
 
     #[test]
