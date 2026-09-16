@@ -154,20 +154,12 @@ fn rule(w: usize) -> Line<'static> {
 /// per line being composed — and within a task the count only ever grows:
 /// blank padding holds the pane at its high-water mark
 /// ([`Status::pane_floor`](super::model::Status::pane_floor)), so the
-/// status bar keeps its row while folds swap tail rows for reserve.
-/// The reserve is rarely blank, though: when no block streams, the last
-/// folded thought lingers where it streamed ([`linger_tail`]) — so the
-/// pane that showed `◌ thought #33` live comes to rest on `▸ thought #33`
-/// and its tail, holding its height (and the bar's row at the screen's
-/// bottom) between think blocks, after the task ends, and into the next
-/// task until new reasoning arrives. A pane that never shrinks never
-/// leaves blank rows under the bar.
+/// status bar keeps its row while folds swap tail rows for reserve. The
+/// reserve is blank: only a live, streaming block is ever drawn above the
+/// input.
 pub fn pane(app: &App, w: u16, h: u16) -> Pane {
     let w = w.max(8) as usize;
     let mut lines: Vec<Line<'static>> = vec![];
-    if app.think_buf.is_empty() {
-        linger_tail(app, w, &mut lines);
-    }
     think_tail(app, w, Lay::Pane, &mut lines);
     if !app.partial.is_empty() {
         lines.push(Line::from(truncate_cols(&app.partial, w)));
@@ -489,41 +481,12 @@ fn fold_head(head: &str, expanded: bool, w: usize, out: &mut Vec<Line<'static>>)
     }
 }
 
-/// The pane's resting tail: the last folded thought, lingering where its
-/// live tail streamed. The rows a think block held are the pane's reserve
-/// once it folds — and rather than padding them blank between blocks, the
-/// pane keeps showing that block's final state: `▸ thought #33 · 12 lines
-/// · 34s` over its last lines. What would be dead space is instead the
-/// newest reasoning — the immediate context of the answer above — and
-/// because the linger is exactly the live tail's shape, the pane holds its
-/// height (the bar its row) through folds, past the task's end, and into
-/// the next task until new thinking arrives. The folded glyph `▸` (not
-/// the live `◌`) and the frozen duration mark it as a record, not motion.
-/// It never lands in the scrollback: the transcript already carries the
-/// fold as a marker.
-fn linger_tail(app: &App, w: usize, out: &mut Vec<Line<'static>>) {
-    let Some(f) = app.rows.iter().rev().find_map(|r| match r {
-        Row::Thought(f) => Some(f),
-        _ => None,
-    }) else { return };
-    let n = f.lines();
-    let mut head = format!("▸ thought #{} · {n} line{}", f.n, if n == 1 { "" } else { "s" });
-    if let Some(d) = f.duration {
-        head.push_str(&format!(" · {}", elapsed_str(d)));
-    }
-    out.push(Line::from(Span::styled(truncate_cols(&head, w), dim())));
-    let all: Vec<&str> = f.body.lines().collect();
-    for l in all.iter().rev().take(THINK_TAIL_SHOWN).rev() {
-        guttered(l, w, Lay::Pane, thought_style(), out);
-    }
-}
-
 /// The live reasoning block: reasoning streams for seconds, and a frozen
 /// pane cannot tell "thinking" from "hung". So the pane (and the review
 /// overlay) show the block as it arrives — the number it will fold into,
 /// how long it has been running, and the tail that still moves. It never
 /// lands in the scrollback: ThinkEnd folds it once, with its final state,
-/// and [`linger_tail`] carries its tail from there.
+/// into the transcript; the pane then falls back to blank reserve.
 fn think_tail(app: &App, w: usize, lay: Lay, out: &mut Vec<Line<'static>>) {
     if app.think_buf.is_empty() {
         return;
@@ -732,29 +695,27 @@ mod tests {
         assert_eq!(streaming.len(), 8, "head + 3 tail rows + the 4-row frame: {streaming:?}");
         assert!(streaming[0].starts_with('◌'), "{streaming:?}");
 
-        // the fold's tail lingers where it streamed: same height, the bar
-        // never moves — and the reserve is the finished block's own tail,
-        // not blank padding (the fix for the blank line that used to open
-        // under the bar each time a thought folded)
+        // the fold's tail is gone: the pane holds its height with blank
+        // reserve — the bar keeps its row, and nothing keeps streaming
+        // above the input once the thought has folded into the transcript
         update(&mut a, Ev::Msg(Msg::ThinkEnd));
         let folded = texts_of(&pane(&a, 80, 24).lines);
-        assert_eq!(folded.len(), 8, "the linger holds the floor: {folded:?}");
-        assert!(folded[0].starts_with("▸ thought #1 · 4 lines"), "folded head, not the live ◌: {folded:?}");
-        assert_eq!(&folded[1..4], vec!["│ l2", "│ l3", "│ l4"], "the tail lingers on the gutter: {folded:?}");
+        assert_eq!(folded.len(), 8, "the blank reserve holds the floor: {folded:?}");
+        assert!(folded[..4].iter().all(|t| t.is_empty()), "the reserve is blank, not the folded thought: {folded:?}");
         assert!(folded[4].starts_with("─────"), "the frame follows: {folded:?}");
 
-        // idle keeps the linger too: the bar keeps its row at the bottom
+        // idle keeps the reserve: the bar keeps its row at the bottom
         // of the screen — no blank rows open under it when the task ends
         update(&mut a, Ev::Msg(Msg::TaskEnd));
         let idle = texts_of(&pane(&a, 80, 24).lines);
-        assert_eq!(idle.len(), 8, "idle keeps the linger: {idle:?}");
-        assert!(idle[0].starts_with("▸ thought #1"), "the last thought rests in the pane: {idle:?}");
+        assert_eq!(idle.len(), 8, "idle keeps the reserve: {idle:?}");
+        assert!(idle[..4].iter().all(|t| t.is_empty()), "still blank when idle: {idle:?}");
         assert!(idle[5].starts_with("jingwei ❯"), "the idle prompt follows it: {idle:?}");
-        // and the next task starts at the same height — the linger holds
-        // the pane until new thinking arrives, so the bar never walks and
-        // nothing blank ever opens below it
+        // the next task starts tight: the floor resets, so the pane
+        // collapses to its bare frame until the new task's thinking
+        // streams and raises the reserve again
         update(&mut a, Ev::Msg(Msg::TaskBegin("next".into())));
-        assert_eq!(pane(&a, 80, 24).lines.len(), 8, "the pane does not shrink at TaskBegin");
+        assert_eq!(pane(&a, 80, 24).lines.len(), 4, "a new task starts tight");
     }
     #[test]
     fn browse_hint_rides_the_ledgers_tail() {
