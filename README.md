@@ -9,7 +9,7 @@ one command, one edit at a time — until the sea is land.
 **No built-in providers.** You bring an endpoint and pick the wire protocol;
 jingwei speaks both Anthropic Messages and OpenAI Chat Completions.
 
-Single Rust file, three dependencies (`ureq`, `serde_json`, `rustyline`).
+Model/view/update TUI on ratatui + crossterm; agent core speaks the wire.
 Cross-platform (Linux / macOS / Windows). Release binary ~2 MB.
 
 ## Setup
@@ -23,7 +23,6 @@ export JINGWEI_MODEL=...
 export JINGWEI_PROTOCOL=anthropic    # or openai
 export JINGWEI_CACHE=auto            # or active (anthropic protocol only)
 export JINGWEI_THINKING=preserve     # or strip
-export JINGWEI_SHOW_THINKING=1       # print thinking blocks
 export NO_COLOR=1                    # disable colors (JINGWEI_NO_COLOR also works)
 ```
 
@@ -68,11 +67,36 @@ saved to `~/.jingwei_history` and reloaded on start. Each answer (including the
 final text turn of an agent run) stays in the conversation, so follow-ups keep
 context.
 
-The input row sits in a small pane at the foot of the scrolling transcript —
-separator rules above and below it (sized to the terminal, following resizes),
-a status bar (spinner, elapsed, per-turn and session token usage, cache
-traffic) beneath — and the prompt rides with readline, so history recall and
-reverse search redraw it instead of erasing it.
+The interactive UI is a TUI (ratatui + crossterm, alternate screen): a
+scrolling transcript above, the input row and a live status bar (spinner,
+elapsed, per-turn and session token usage, cache traffic) below. The editor
+is ours — grapheme-safe cursor, history recall (`~/.jingwei_history`), word
+deletes — no readline dependency. Scrolling is application state: the
+transcript follows new content until you scroll up, and returns to
+following when you reach the bottom. Pipes, one-shot runs, and
+`JINGWEI_NO_TUI=1` get the plain line-oriented log instead.
+
+Reasoning arrives folded: each thinking block lands as one dim marker line
+(`▸ thought #3 · 14 lines`) instead of a wall of text. **Ctrl-O unfolds
+everything** — thoughts and tool-output tails alike — into a scrollable
+review view; Ctrl-O again returns to the prompt, and what has been unfolded
+never refolds. There are no display switches: folding is simply how
+reasoning is shown, in the TUI and in the plain log alike.
+
+## Architecture
+
+The agent core never touches a terminal: it emits `Msg`s through a display
+port (`src/display.rs`), and a frontend interprets them —
+
+- **TUI** (`src/tui/`, on a terminal): an Elm-style single state tree.
+  `model.rs` is plain data (no clocks, no I/O), `update.rs` is a pure
+  event→state function, `view.rs` is a pure state→screen function, and
+  `mod.rs` is the only impure shell — raw mode, the event loop, the blit.
+  Every UI rule (grapheme-safe editing, history recall, scroll clamping,
+  follow-the-tail, the fold ratchet) is a unit-tested fact about pure
+  functions; no terminal needed to test the UI.
+- **plain** (pipes, one-shot runs, `JINGWEI_NO_TUI=1`): a pure fold over
+  the same messages into a line-oriented log.
 
 ## The three knobs people confuse
 

@@ -5,26 +5,26 @@
 // providers; you bring the endpoint, key, and model.
 //
 // Env: JINGWEI_API_KEY, JINGWEI_BASE_URL, JINGWEI_MODEL, JINGWEI_PROTOCOL,
-//      JINGWEI_CACHE, JINGWEI_THINKING, JINGWEI_SHOW_THINKING, NO_COLOR
+//      JINGWEI_CACHE, JINGWEI_THINKING, JINGWEI_NO_TUI, NO_COLOR
 
+mod display;
+mod tui;
+
+use display::{disp, Msg, Sev};
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 
 const MAX_TOOL_OUTPUT: usize = 50_000;
 const DEFAULT_MAX_TOKENS: u32 = 131_072;
 const DEFAULT_CONTEXT_SIZE: u64 = 1_000_000;
 const DEFAULT_MAX_TURNS: u32 = 60;
-/// How many lines of tool output are echoed to the terminal per call.
-const MAX_TOOL_DISPLAY_LINES: usize = 20;
-
 type Result<T> = std::result::Result<T, Error>;
 
 // ---- error -----------------------------------------------------------------
@@ -67,9 +67,7 @@ impl From<io::Error> for Error { fn from(e: io::Error) -> Self { Self::Io(e) } }
 
 // ---- colors: backgrounds only for short, high-attention signals ------------
 
-const WARN_BG: (u8, u8, u8) = (255, 220, 100);
 const ERR_BG: (u8, u8, u8) = (198, 40, 40);
-const BANNER_BG: (u8, u8, u8) = (26, 115, 232);
 
 fn color_on() -> bool {
     env::var_os("NO_COLOR").is_none()
@@ -200,365 +198,8 @@ fn elapsed_str(d: Duration) -> String {
     if s < 60 { format!("{s}s") } else { format!("{}m{:02}s", s / 60, s % 60) }
 }
 
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/// Pane rows must fit one physical line each — the protocol only ever moves
-/// the cursor within the pane, so a wrapped pane row would desync it.
+/// The status bar never exceeds this width, so it fits one physical row.
 const BAR_MAX: usize = 76;
-const TASK_MAX: usize = 60;
-
-#[derive(PartialEq, Clone, Copy)]
-enum Style { Plain, Dim, Head }
-
-enum PaneState {
-    Idle,
-    Working { task: String, started: Instant, spin: usize },
-}
-
-enum Sink {
-    Stdout,
-    /// Test captures: pane-protocol assertions without a terminal.
-    #[cfg_attr(not(test), allow(dead_code))]
-    Buf(Vec<u8>),
-}
-
-struct Ui {
-    /// Layout on (both streams are terminals); plain pass-through off.
-    pane: bool,
-    color: bool,
-    state: PaneState,
-    /// The latest request's usage (persists after it finishes, for display).
-    turn: Usage,
-    /// Session totals: every completed request, folded in as they finish.
-    total: Usage,
-    /// Partial streamed line, held back so the cursor stays parked.
-    pend: String,
-    pend_dim: bool,
-    /// Plain mode: which stream has an unterminated streamed line.
-    open_out: bool,
-    open_err: bool,
-    sink: Sink,
-}
-
-static UI: OnceLock<Mutex<Ui>> = OnceLock::new();
-
-/// Run `f` against the process-wide Ui. Sync only — never hold it across an
-/// await; every method parks the cursor before returning.
-fn ui<R>(f: impl FnOnce(&mut Ui) -> R) -> R {
-    f(&mut UI.get_or_init(|| Mutex::new(Ui::stdout())).lock().unwrap())
-}
-
-impl Ui {
-    fn stdout() -> Self {
-        let pane = io::stdout().is_terminal() && io::stderr().is_terminal();
-        Self {
-            pane,
-            color: color_on(),
-            state: PaneState::Idle,
-            turn: Usage::default(),
-            total: Usage::default(),
-            pend: String::new(),
-            pend_dim: false,
-            open_out: false,
-            open_err: false,
-            sink: Sink::Stdout,
-        }
-    }
-
-    fn raw(&mut self, s: &str) {
-        match &mut self.sink {
-            Sink::Stdout => {
-                let mut o = io::stdout();
-                let _ = o.write_all(s.as_bytes());
-                let _ = o.flush();
-            }
-            Sink::Buf(b) => b.extend_from_slice(s.as_bytes()),
-        }
-    }
-
-    fn styled(&self, line: &str, style: Style) -> String {
-        if !self.color {
-            line.into()
-        } else {
-            match style {
-                Style::Plain => line.into(),
-                Style::Dim => format!("\x1b[2m{line}\x1b[22m"),
-                Style::Head => format!("\x1b[1;33m{line}\x1b[0m"),
-            }
-        }
-    }
-
-    fn bar_line(&self) -> String {
-        let bar = match &self.state {
-            PaneState::Working { started, spin, .. } => {
-                let glyph = SPINNER[spin % SPINNER.len()];
-                bar_text(Some((glyph, &elapsed_str(started.elapsed()))), &self.turn, &self.total)
-            }
-            PaneState::Idle => bar_text(None, &self.turn, &self.total),
-        };
-        let bar = truncate_cols(&bar, BAR_MAX);
-        if self.color && !bar.is_empty() { format!("\x1b[2m{bar}\x1b[22m") } else { bar }
-    }
-
-    /// Redraw the bar in place. Requires the parked cursor (on the bar row).
-    fn refresh_bar(&mut self) {
-        if !self.pane { return }
-        self.raw("\r\x1b[K");
-        self.raw(&self.bar_line());
-    }
-
-    /// Draw the whole pane — rule, input row, rule, bar — starting at the
-    /// cursor row, col 0. Each row is homed and cleared before it is drawn:
-    /// the pane is re-rendered over the *previous* pane's rows, and a short
-    /// row (the locked task, the bar) would otherwise keep whatever the old
-    /// longer row left there — a half rule riding beside the task, stale bar
-    /// text beside the prompt.
-    fn render_pane(&mut self) {
-        let input = match &self.state {
-            PaneState::Working { task, .. } => self.styled(&format!("{}{task}", prompt_str()), Style::Dim),
-            PaneState::Idle => String::new(),
-        };
-        let rule = self.styled(&rule_str(), Style::Dim);
-        let bar = self.bar_line();
-        self.raw(&rule);
-        self.raw("\r\n\x1b[K");
-        self.raw(&input);
-        self.raw("\r\n\x1b[K");
-        self.raw(&rule);
-        self.raw("\r\n\x1b[K");
-        self.raw(&bar);
-    }
-
-    /// One finished transcript line. Pane protocol: clear the pane's top row
-    /// (the rule above the input), print the line, re-render the pane beneath
-    /// — the screen scrolls only when the terminal itself runs out of rows,
-    /// which is what keeps scrollback intact. Parks the cursor at the end of
-    /// the bar row.
-    fn transcript_line(&mut self, line: &str, style: Style) {
-        if !self.pane {
-            let s = self.styled(line, style);
-            println!("{s}");
-            return;
-        }
-        self.raw("\x1b[3A\r\x1b[K"); // clear the rule above the input row
-        let s = self.styled(line, style);
-        self.land_line(&s);
-        self.render_pane();
-    }
-
-    /// Transcript a line from an unknown cursor position: never moves up
-    /// (that could erase transcript content), just anchors the pane here.
-    fn fresh_line(&mut self, line: &str, style: Style) {
-        if !self.pane {
-            self.transcript_line(line, style);
-            return;
-        }
-        self.raw("\r\x1b[K");
-        let s = self.styled(line, style);
-        self.land_line(&s);
-        self.render_pane();
-    }
-
-    /// Print one transcript line at the cursor row (col 0, already cleared),
-    /// leaving the cursor at col 0 of the row below for render_pane. A line
-    /// wide enough to wrap rides over the pane's own rows — which still hold
-    /// the previous render (a locked task, rule dashes, the bar) — so each
-    /// row the tail will reach is wiped first; beyond the pane the line's
-    /// newlines scroll the screen, and scrolling supplies blank rows by
-    /// itself. The wipe never steps below the bar row, so it cannot clamp
-    /// against the screen bottom and desync the return move.
-    fn land_line(&mut self, s: &str) {
-        let wraps = (disp_width(s) / term_cols()).min(3);
-        for _ in 0..wraps {
-            self.raw("\x1b[B\r\x1b[K"); // wipe a pane row the tail covers
-        }
-        if wraps > 0 { self.raw(&format!("\x1b[{wraps}A")); }
-        self.raw(s);
-        self.raw("\r\n");
-    }
-
-    /// A warning scrolls with the transcript, not in the pane. Plain mode
-    /// keeps it on stderr like the classic behavior.
-    fn warn(&mut self, msg: &str) {
-        if !self.pane {
-            eprintln!("{}", paint(msg, WARN_BG, false));
-            return;
-        }
-        self.transcript_line(&paint(msg, WARN_BG, false), Style::Plain);
-    }
-
-    /// Same, for an uncertain cursor position (readline errors).
-    fn warn_fresh(&mut self, msg: &str) {
-        if !self.pane {
-            eprintln!("{}", paint(msg, WARN_BG, false));
-            return;
-        }
-        self.fresh_line(&paint(msg, WARN_BG, false), Style::Plain);
-    }
-
-    fn error(&mut self, msg: &str) {
-        if !self.pane {
-            eprintln!("{}", paint(msg, ERR_BG, true));
-            return;
-        }
-        self.transcript_line(&paint(msg, ERR_BG, true), Style::Plain);
-    }
-
-    /// Streamed text deltas. Pane mode buffers the partial line so the
-    /// cursor stays parked; complete lines land in the transcript.
-    fn stream_text(&mut self, t: &str) {
-        if !self.pane {
-            print!("{t}");
-            let _ = io::stdout().flush();
-            self.open_out = true;
-            return;
-        }
-        if self.pend_dim && !self.pend.is_empty() { self.flush_pend(); } // style switch
-        self.pend_dim = false;
-        self.pend.push_str(t);
-        self.flush_complete_lines();
-    }
-
-    fn stream_thinking(&mut self, t: &str) {
-        if !self.pane {
-            if self.color { eprint!("\x1b[2m{t}\x1b[22m") } else { eprint!("{t}") }
-            let _ = io::stderr().flush();
-            self.open_err = true;
-            return;
-        }
-        if !self.pend_dim && !self.pend.is_empty() { self.flush_pend(); } // style switch
-        self.pend_dim = true;
-        self.pend.push_str(t);
-        self.flush_complete_lines();
-    }
-
-    fn flush_complete_lines(&mut self) {
-        while let Some(i) = self.pend.find('\n') {
-            let line: String = self.pend.drain(..=i).collect();
-            let style = if self.pend_dim { Style::Dim } else { Style::Plain };
-            self.transcript_line(line.trim_end_matches('\n'), style);
-        }
-    }
-
-    fn flush_pend(&mut self) {
-        if self.pend.is_empty() { return }
-        let line = std::mem::take(&mut self.pend);
-        let style = if self.pend_dim { Style::Dim } else { Style::Plain };
-        self.transcript_line(&line, style);
-    }
-
-    /// Close the streamed line: land any partial text; plain mode terminates
-    /// the line on whichever stream was left open.
-    fn stream_close(&mut self) {
-        if !self.pane {
-            if self.open_err { eprintln!(); self.open_err = false }
-            if self.open_out { println!(); self.open_out = false }
-            return;
-        }
-        self.flush_pend();
-    }
-
-    /// A request's usage arrived (message_start / usage chunk / blocking
-    /// response): it becomes the live turn, and the bar jumps immediately.
-    fn bump_usage(&mut self, v: &Value) {
-        self.turn = Usage::from_value(v);
-        self.refresh_bar();
-    }
-
-    /// Streaming output count (message_delta): ticks up while text flows.
-    fn bump_output(&mut self, n: u64) {
-        self.turn.output = n;
-        self.refresh_bar();
-    }
-
-    /// The request finished: fold the turn into session totals.
-    fn finish_request(&mut self) {
-        self.total.add(&self.turn);
-        self.refresh_bar();
-    }
-
-    fn begin_task(&mut self, task: &str) {
-        self.state = PaneState::Working {
-            task: truncate_cols(task, TASK_MAX),
-            started: Instant::now(),
-            spin: 0,
-        };
-    }
-
-    fn end_task(&mut self) {
-        self.state = PaneState::Idle;
-    }
-
-    /// Spinner heartbeat, driven by a 120ms ticker while a task runs.
-    fn tick(&mut self) {
-        if !self.pane { return }
-        let spin = match &mut self.state {
-            PaneState::Working { spin, .. } => spin,
-            PaneState::Idle => return,
-        };
-        *spin = (*spin + 1) % SPINNER.len();
-        self.refresh_bar();
-    }
-
-    /// Draw the idle pane — rule, input row, rule, bar — leaving the cursor
-    /// on the input row for readline, which owns it from here on. `prompt`:
-    /// paint the prompt into the row ourselves (needed only when stdin is a
-    /// pipe, where readline echoes nothing); otherwise readline arrives with
-    /// the prompt as its own readline prompt, so its redraws (history recall,
-    /// reverse search) keep it instead of erasing it. `parked`: the cursor is
-    /// on the bar row (normal cycle); otherwise draw at the cursor row
-    /// (recovery after readline errors).
-    fn paint_idle(&mut self, parked: bool, prompt: bool) {
-        if !self.pane {
-            if prompt {
-                print!("{}", prompt_str());
-                let _ = io::stdout().flush();
-            }
-            return;
-        }
-        let rule = self.styled(&rule_str(), Style::Dim);
-        if parked { self.raw("\x1b[3A") } // bar row → rule above the input
-        self.raw("\r\x1b[K");
-        self.raw(&rule);                  // top rule
-        self.raw("\x1b[1B\r\x1b[K");      // onto the input row
-        if prompt { self.raw(prompt_str()) }
-        self.raw("\x1b7");                // remember the editing position
-        self.raw("\x1b[1B\r\x1b[K");
-        self.raw(&rule);                  // bottom rule
-        self.raw("\x1b[1B\r\x1b[K");      // onto the bar row
-        self.raw(&self.bar_line());
-        self.raw("\x1b8");                // back to the input row
-    }
-
-    /// Re-anchor the pane after readline returns. The editing path (a tty
-    /// stdin) ends with a newline that steps off the input row onto the
-    /// bottom rule — one row above the bar; the direct paths (a piped stdin,
-    /// or an unsupported terminal) move the cursor not at all, leaving it on
-    /// the input row — two rows above the bar. Either way the bar is redrawn
-    /// and the cursor parked at its end, the position every other pane
-    /// operation assumes.
-    fn land_after_readline(&mut self, down: usize) {
-        if !self.pane { return }
-        self.raw(&format!("\x1b[{down}B"));
-        self.refresh_bar();
-    }
-
-    fn tool_lines(&mut self, name: &str, input: &Value, output: &str) {
-        for (i, line) in tool_call_lines(name, input, output).into_iter().enumerate() {
-            if !self.pane {
-                if !self.color {
-                    eprintln!("  {line}");
-                } else if i == 0 {
-                    eprintln!("  \x1b[1;33m{line}\x1b[0m");
-                } else {
-                    eprintln!("  \x1b[2m{line}\x1b[22m");
-                }
-            } else {
-                let style = if i == 0 { Style::Head } else { Style::Dim };
-                self.transcript_line(&format!("  {line}"), style);
-            }
-        }
-    }
-}
 
 /// One-line summary of a tool call's arguments: the command, the path, …
 fn tool_summary(name: &str, input: &Value) -> String {
@@ -573,22 +214,10 @@ fn tool_summary(name: &str, input: &Value) -> String {
     }
 }
 
-/// Lines describing a tool call — header (name + argument summary), then up to
-/// MAX_TOOL_DISPLAY_LINES lines of output, then a "+N more" marker.
-fn tool_call_lines(name: &str, input: &Value, output: &str) -> Vec<String> {
-    let mut lines = vec![format!("[{name}] {}", tool_summary(name, input))];
-    let all: Vec<&str> = output.lines().collect();
-    let shown = all.len().min(MAX_TOOL_DISPLAY_LINES);
-    lines.extend(all[..shown].iter().map(|l| format!("│ {l}")));
-    if all.len() > shown {
-        lines.push(format!("… +{} more lines", all.len() - shown));
-    }
-    lines
-}
-
-/// Echo a tool call to the transcript so the human sees what the agent is doing.
+/// Echo a tool call through the display port: the frontends decide how
+/// much of the output tail to show (and how to fold the rest).
 fn print_tool_call(name: &str, input: &Value, output: &str) {
-    ui(|u| u.tool_lines(name, input, output));
+    disp(Msg::Tool { name: name.into(), summary: tool_summary(name, input), output: output.into() });
 }
 
 // ---- tools -----------------------------------------------------------------
@@ -821,6 +450,7 @@ enum CacheMode { Auto, Active }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Thinking { Preserve, Strip }
 
+#[derive(Clone)]
 struct Config {
     api_key: String,
     base_url: String,
@@ -832,7 +462,6 @@ struct Config {
     context_size: u64,
     max_turns: u32,
     streaming: bool,
-    show_thinking: bool,
 }
 
 #[derive(Default)]
@@ -915,7 +544,6 @@ fn build_config(args: &Args) -> Result<Config> {
         context_size: args.context_size.unwrap_or(DEFAULT_CONTEXT_SIZE),
         max_turns,
         streaming: args.streaming,
-        show_thinking: env::var("JINGWEI_SHOW_THINKING").is_ok(),
     })
 }
 
@@ -941,6 +569,14 @@ BEHAVIOR:
     --context-size <N>  trim history when estimated tokens exceed N (default 1000000)
     --cache <MODE>      auto (default, passive server cache) | active (Anthropic cache_control)
     --thinking <MODE>   preserve (default) | strip reasoning from sent history
+
+TUI (interactive, on a terminal):
+    Enter               submit the task · Up/Down recall input history
+    Ctrl-O              unfold every folded block (thoughts, tool tails);
+                        again returns to the REPL — what opened stays open
+    in the unfolded view: ↑↓/j/k, PgUp/PgDn, g/G scroll · q or Ctrl-O back
+    Ctrl-C              interrupt the running task (twice: exit) · Ctrl-D quit
+    JINGWEI_NO_TUI=1    log-style REPL instead of the TUI
     -s, --stream        stream output (default) · -S, --no-stream to block
     Ctrl-C              interrupt the running agent (press twice to exit at once)
     -h, --help          this help
@@ -991,80 +627,19 @@ const SYSTEM: &str = "You are jingwei (精卫), a coding agent with these tools:
 async fn run() -> Result<()> {
     let args = parse_from(env::args().skip(1))?;
     let cfg = build_config(&args)?;
-    if args.prompt.is_empty() { repl(&cfg).await } else {
-        let prompt = args.prompt.join(" ");
-        // Anchor the pane at the cursor (never move up: the rows above hold
-        // the shell's own prompt line), then every later line is parked.
-        ui(|u| { u.begin_task(&prompt); if u.pane { u.fresh_line("", Style::Plain); } });
-        let mut history = vec![json!({"role": "user", "content": prompt})];
-        let res = agent_turn(&cfg, &mut history).await;
-        // The final bar render is the run's summary — totals stay on screen.
-        ui(|u| { u.end_task(); u.refresh_bar(); });
-        res
+    if args.prompt.is_empty() {
+        // A terminal gets the TUI; pipes, tests, and one-shots get the log.
+        return if tui::wanted() { tui::run(&cfg).await } else { display::plain_repl(&cfg).await };
     }
-}
-
-async fn repl(cfg: &Config) -> Result<()> {
-    let mut history: Vec<Value> = vec![];
-    let mut rl = rustyline::DefaultEditor::new().map_err(|e| Error::Msg(format!("readline init: {e}")))?;
-    if let Some(dir) = home_dir() { let _ = rl.load_history(&dir.join(".jingwei_history")); }
-    ui(|u| {
-        // The first line anchors the pane here (fresh_line never moves up, so
-        // the shell prompt above survives); the rest are then parked.
-        u.fresh_line(&paint(" 精卫 ", BANNER_BG, true), Style::Plain);
-        u.transcript_line("\x1b[1mjingwei\x1b[0m — 精卫填海，一石一石 · type a task, Ctrl-C interrupts, Ctrl-D rests", Style::Plain);
-        u.transcript_line(&format!("\x1b[2m{} · {} · {}{}\x1b[22m", cfg.protocol_label(), cfg.model, cfg.base_url,
-            if cfg.show_thinking { " · thinking on" } else { "" }), Style::Plain);
-    });
-    // The prompt travels WITH readline whenever readline draws it itself (a
-    // tty stdin, or an unsupported terminal, where it prints the prompt and
-    // reads direct) — then its redraws (history recall, reverse search, line
-    // wraps) keep the prompt on the row instead of erasing it. Only a
-    // supported terminal reading from a pipe draws nothing, so there the
-    // prompt is painted into the input row and readline is handed "".
-    let stdin_tty = io::stdin().is_terminal();
-    let rl_owns_prompt = stdin_tty || dumb_term();
-    let rl_prompt = if rl_owns_prompt { prompt_str() } else { "" };
-    // Rows from the cursor down to the bar row when readline returns: the
-    // editing path's closing newline steps over the bottom rule (1); the
-    // direct paths leave the cursor on the input row (2).
-    let park = if stdin_tty && !dumb_term() { 1 } else { 2 };
-    loop {
-        ui(|u| u.paint_idle(true, !rl_owns_prompt));
-        let line = match rl.readline(rl_prompt) {
-            Ok(l) => { ui(|u| u.land_after_readline(park)); l }
-            // The half-typed line stays where readline left it; land, then
-            // anchor a fresh pane below it for the next prompt.
-            Err(rustyline::error::ReadlineError::Interrupted) => {
-                ui(|u| { u.land_after_readline(park); u.fresh_line("", Style::Plain); });
-                continue;
-            }
-            Err(rustyline::error::ReadlineError::Eof) => break,
-            Err(e) => {
-                ui(|u| { u.land_after_readline(park); u.warn_fresh(&format!("warning: readline ({e})")); });
-                continue;
-            }
-        };
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        let _ = rl.add_history_entry(line);
-        history.push(json!({"role": "user", "content": line}));
-        // The task is echoed into the transcript (the pane's input row only
-        // holds the *current* task) and locked into the pane.
-        ui(|u| u.begin_task(line));
-        ui(|u| u.transcript_line(&format!("{}{line}", prompt_str()), Style::Plain));
-        // The agent runs as an interruptible coroutine: Ctrl-C during the run
-        // cancels it (reported by `agent_turn` itself) while the history —
-        // and this prompt — survive for the next task.
-        match agent_turn(cfg, &mut history).await {
-            Err(Error::Interrupted) => {}
-            Err(e) => ui(|u| u.error(&format!(" error: {e} "))),
-            Ok(()) => {}
-        }
-        ui(|u| { u.end_task(); u.transcript_line("", Style::Plain); });
-    }
-    if let Some(dir) = home_dir() { let _ = rl.save_history(&dir.join(".jingwei_history")); }
-    Ok(())
+    // One-shot: always the plain frontend — its output must stay in the
+    // terminal after the process exits, and an alt-screen would take it.
+    let prompt = args.prompt.join(" ");
+    disp(Msg::TaskBegin(prompt.clone()));
+    let mut history = vec![json!({"role": "user", "content": prompt})];
+    let token = CancelToken::new();
+    let res = agent_turn(&cfg, &mut history, &token).await;
+    disp(Msg::TaskEnd);
+    res
 }
 
 /// Drive one agent run as an interruptible coroutine.
@@ -1075,18 +650,13 @@ async fn repl(cfg: &Config) -> Result<()> {
 /// REPL prompt comes back with everything the agent already carried still in
 /// place. A second Ctrl-C while it is unwinding exits immediately, for when
 /// even graceful is too slow.
-async fn agent_turn(cfg: &Config, history: &mut Vec<Value>) -> Result<()> {
-    let token = CancelToken::new();
-    // Spinner & elapsed clock for the pane's status bar. A cheap no-op when
-    // there is no pane or no task running.
-    let ticker = tokio::spawn(async {
-        let mut iv = tokio::time::interval(Duration::from_millis(120));
-        loop { iv.tick().await; ui(|u| u.tick()); }
-    });
-    let agent = agent_loop(cfg, history, &token);
+async fn agent_turn(cfg: &Config, history: &mut Vec<Value>, token: &CancelToken) -> Result<()> {
+    let agent = agent_loop(cfg, history, token);
     tokio::pin!(agent);
     tokio::select! {
-        res = &mut agent => { ticker.abort(); return res }
+        res = &mut agent => return res,
+        // The plain frontend has no key loop of its own, so Ctrl-C arrives
+        // as a signal here; the TUI cancels through its key handler instead.
         _ = tokio::signal::ctrl_c() => token.cancel(),
     }
     let res = tokio::select! {
@@ -1096,9 +666,8 @@ async fn agent_turn(cfg: &Config, history: &mut Vec<Value>) -> Result<()> {
             std::process::exit(130);
         }
     };
-    ticker.abort();
     if let Err(Error::Interrupted) = &res {
-        ui(|u| u.warn(" interrupted — stopped at a safe point; history kept "));
+        disp(Msg::Note { sev: Sev::Warn, text: " interrupted — stopped at a safe point; history kept ".into() });
     }
     res
 }
@@ -1112,70 +681,6 @@ impl Config {
 fn home_dir() -> Option<PathBuf> {
     env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
 }
-
-fn prompt_str() -> &'static str {
-    if color_on() { "\x1b[1;38;5;75mjingwei\x1b[0m\x1b[38;5;240m ❯\x1b[0m " } else { "jingwei> " }
-}
-
-/// The separator rules framing the input row, spanning the terminal's full
-/// width so the pane reads as a box however wide the window is. A dash is
-/// one column in the default (narrow) rendering of box-drawing characters;
-/// the rare terminals that render them wide (emacs and friends) get a halved
-/// rule so the row can never wrap and desync the pane.
-fn rule_str() -> String {
-    let per_dash = if dumb_term() { 2 } else { 1 };
-    "─".repeat(term_cols() / per_dash)
-}
-
-/// The terminal's width in columns — 80 when it can't be asked. No new
-/// dependencies for this: the ioctl (Unix) / console call (Windows) is
-/// declared by hand; both are cheap, so the rules even follow resizes.
-fn term_cols() -> usize {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        #[repr(C)]
-        #[derive(Default)]
-        struct Winsize { row: u16, col: u16, xpixel: u16, ypixel: u16 }
-        extern "C" { fn ioctl(fd: i32, request: usize, ...) -> i32; }
-        // TIOCGWINSZ: 0x5413 on Linux/Android, 0x40087468 on the BSDs/macOS.
-        const TIOCGWINSZ: usize =
-            if cfg!(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd",
-                        target_os = "openbsd", target_os = "dragonfly")) { 0x4008_7468 } else { 0x5413 };
-        let mut ws = Winsize::default();
-        let ok = unsafe { ioctl(io::stdout().as_raw_fd(), TIOCGWINSZ, &mut ws) };
-        if ok == 0 && ws.col > 0 { ws.col as usize } else { 80 }
-    }
-    #[cfg(windows)]
-    {
-        #[repr(C)]
-        struct Coord { x: i16, y: i16 }
-        #[repr(C)]
-        struct SmallRect { left: i16, top: i16, right: i16, bottom: i16 }
-        #[repr(C)]
-        struct ConsoleInfo { size: Coord, cursor: Coord, attrs: u16, window: SmallRect, max: Coord }
-        extern "system" {
-            fn GetStdHandle(which: u32) -> *mut core::ffi::c_void;
-            fn GetConsoleScreenBufferInfo(console: *mut core::ffi::c_void, info: *mut ConsoleInfo) -> i32;
-        }
-        const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5; // (DWORD)-11
-        let mut info = unsafe { std::mem::zeroed::<ConsoleInfo>() };
-        let console = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-        let ok = !console.is_null() && unsafe { GetConsoleScreenBufferInfo(console, &mut info) } != 0;
-        if ok { (info.window.right - info.window.left + 1).max(1) as usize } else { 80 }
-    }
-}
-
-/// rustyline's notion of an unsupported terminal: there it prints the prompt
-/// itself and reads direct (no editing, no redraws). Mirrored so the REPL
-/// knows who owns drawing the prompt.
-fn dumb_term() -> bool {
-    match env::var("TERM") {
-        Ok(t) => ["dumb", "cons25", "emacs"].iter().any(|u| t.eq_ignore_ascii_case(u)),
-        Err(_) => false,
-    }
-}
-
 
 // ---- coroutine & cancellation ----------------------------------------------
 //
@@ -1242,7 +747,7 @@ async fn agent_loop(cfg: &Config, history: &mut Vec<Value>, token: &CancelToken)
     for turn in 0..cfg.max_turns {
         if token.is_cancelled() { return Err(Error::Interrupted); }
         if fit_context(history, cfg.context_size) {
-            ui(|u| u.warn(" trimmed history to fit --context-size "));
+            disp(Msg::Note { sev: Sev::Warn, text: " trimmed history to fit --context-size ".into() });
         }
         let (resp, interrupted) = call_api(cfg, history, &schemas, token).await?;
         let content = resp["content"].as_array().cloned().unwrap_or_default();
@@ -1286,7 +791,7 @@ async fn agent_loop(cfg: &Config, history: &mut Vec<Value>, token: &CancelToken)
         if stopped { return Err(Error::Interrupted); }
 
         if turn + 1 == cfg.max_turns {
-            ui(|u| u.warn(&format!(" warning: hit --max-turns={}, stopping ", cfg.max_turns)));
+            disp(Msg::Note { sev: Sev::Warn, text: format!(" warning: hit --max-turns={}, stopping ", cfg.max_turns) });
         }
     }
     Ok(())
@@ -1373,22 +878,19 @@ async fn call_api(cfg: &Config, history: &[Value], schemas: &[Value], token: &Ca
         if let Some(blocks) = v["content"].as_array() {
             for block in blocks {
                 match block["type"].as_str() {
-                    Some("text") => ui(|u| {
-                        u.transcript_line("", Style::Plain);
-                        u.stream_text(block["text"].as_str().unwrap_or(""));
-                        u.stream_close();
-                    }),
-                    Some("thinking") if cfg.show_thinking => ui(|u| {
-                        u.stream_thinking(block["thinking"].as_str().unwrap_or(""));
-                        u.stream_close();
-                    }),
+                    Some("text") => disp(Msg::Text(format!("\n{}", block["text"].as_str().unwrap_or("")))),
+                    Some("thinking") => {
+                        disp(Msg::Think(block["thinking"].as_str().unwrap_or("").into()));
+                        disp(Msg::ThinkEnd);
+                    }
                     _ => {}
                 }
             }
         }
         // Streaming paths report usage event-by-event themselves; blocking
         // responses get the whole picture at once.
-        ui(|u| { u.bump_usage(&v["usage"]); u.finish_request(); });
+        disp(Msg::Usage(Usage::from_value(&v["usage"])));
+        disp(Msg::Done);
     }
     Ok((v, interrupted))
 }
@@ -1532,7 +1034,7 @@ async fn anthropic_streaming(cfg: &Config, messages: &[Value], schemas: &[Value]
         match v["type"].as_str() {
             Some("message_start") => {
                 merge_usage(&mut usage, v["message"]["usage"].as_object());
-                ui(|u| u.bump_usage(&v["message"]["usage"])); // the bar jumps at stream start
+                disp(Msg::Usage(Usage::from_value(&v["message"]["usage"]))); // the bar jumps at stream start
             }
             Some("content_block_start") => {
                 let i = v["index"].as_u64().unwrap_or(0) as usize;
@@ -1545,13 +1047,13 @@ async fn anthropic_streaming(cfg: &Config, messages: &[Value], schemas: &[Value]
                 match (block["type"].as_str(), d["type"].as_str()) {
                     (Some("text"), Some("text_delta")) => {
                         if let Some(t) = d["text"].as_str() {
-                            ui(|u| u.stream_text(t)); // a pending thinking line closes itself
+                            disp(Msg::Text(t.into()));
                             append_str_field(block, "text", t);
                         }
                     }
                     (Some("thinking"), Some("thinking_delta")) => {
                         if let Some(t) = d["thinking"].as_str() {
-                            if cfg.show_thinking { ui(|u| u.stream_thinking(t)); }
+                            disp(Msg::Think(t.into()));
                             append_str_field(block, "thinking", t);
                         }
                     }
@@ -1566,6 +1068,10 @@ async fn anthropic_streaming(cfg: &Config, messages: &[Value], schemas: &[Value]
             }
             Some("content_block_stop") => {
                 if let Some(block) = content.get_mut(v["index"].as_u64().unwrap_or(0) as usize) {
+                    // a thinking block closing is the fold point: its marker lands now
+                    if block["type"] == "thinking" {
+                        disp(Msg::ThinkEnd);
+                    }
                     if let Some(s) = block["input_json_str"].as_str() {
                         block["input"] = serde_json::from_str(s).unwrap_or(Value::Null);
                         if let Some(o) = block.as_object_mut() { o.remove("input_json_str"); }
@@ -1575,7 +1081,7 @@ async fn anthropic_streaming(cfg: &Config, messages: &[Value], schemas: &[Value]
             Some("message_delta") => {
                 merge_usage(&mut usage, v["usage"].as_object());
                 if let Some(n) = v["usage"]["output_tokens"].as_u64() {
-                    ui(|u| u.bump_output(n)); // output count ticks while text flows
+                    disp(Msg::OutTokens(n)); // output count ticks while text flows
                 }
             }
             Some("message_stop") => break,
@@ -1583,7 +1089,7 @@ async fn anthropic_streaming(cfg: &Config, messages: &[Value], schemas: &[Value]
             _ => {}
         }
     }
-    ui(|u| { u.stream_close(); u.finish_request(); });
+    disp(Msg::Done);
     content.retain(|v| !v.is_null());
     Ok((json!({"content": content, "usage": usage}), interrupted))
 }
@@ -1677,6 +1183,7 @@ async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], t
     let key = cfg.api_key.clone();
     let resp = blocking(token, move || post(&key, url, body, false)).await?;
     let (mut text, mut reasoning, mut tool_calls) = (String::new(), String::new(), vec![]);
+    let mut think_open = false;
     let mut usage = empty_usage();
     let mut interrupted = false;
     let mut lines = sse_channel(resp);
@@ -1694,20 +1201,34 @@ async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], t
             usage["input_tokens"] = v["usage"]["prompt_tokens"].clone();
             usage["output_tokens"] = v["usage"]["completion_tokens"].clone();
             usage["cache_read_input_tokens"] = v["usage"]["prompt_tokens_details"]["cached_tokens"].clone();
-            ui(|u| u.bump_usage(&json!({
-                "input_tokens": v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-                "output_tokens": v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-                "cache_read_input_tokens": v["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
-                "cache_creation_input_tokens": 0 })));
+            disp(Msg::Usage(Usage {
+                input: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+                output: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+                cache_read: v["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
+                cache_write: 0,
+            }));
         }
         let Some(delta) = v["choices"][0]["delta"].as_object() else { continue };
         let delta = Value::Object(delta.clone());
-        if let Some(t) = delta["content"].as_str().filter(|t| !t.is_empty()) {
-            ui(|u| u.stream_text(t));
+        // The OpenAI wire has no block boundary around reasoning; the first
+        // delta that isn't reasoning (or the stream's end) closes it — that
+        // is the fold point.
+        let has_text = delta["content"].as_str().is_some_and(|t| !t.is_empty());
+        let has_reason = delta["reasoning_content"].as_str().is_some_and(|r| !r.is_empty());
+        let has_tool = !delta["tool_calls"].is_null();
+        if think_open && (has_text || has_tool) {
+            think_open = false;
+            disp(Msg::ThinkEnd);
+        }
+        if has_text {
+            let t = delta["content"].as_str().unwrap();
+            disp(Msg::Text(t.into()));
             text.push_str(t);
         }
-        if let Some(r) = delta["reasoning_content"].as_str().filter(|r| !r.is_empty()) {
-            if cfg.show_thinking { ui(|u| u.stream_thinking(r)); }
+        if has_reason {
+            let r = delta["reasoning_content"].as_str().unwrap();
+            disp(Msg::Think(r.into()));
+            think_open = true;
             reasoning.push_str(r);
         }
         for tc in delta["tool_calls"].as_array().into_iter().flatten() {
@@ -1722,7 +1243,7 @@ async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], t
             }
         }
     }
-    ui(|u| { u.stream_close(); u.finish_request(); });
+    disp(Msg::Done);
     let mut content = vec![];
     if !reasoning.is_empty() { content.push(json!({"type": "thinking", "thinking": reasoning})); }
     if !text.is_empty() { content.push(json!({"type": "text", "text": text})); }
@@ -1761,7 +1282,7 @@ mod tests {
         Config {
             api_key: "test-key".into(), base_url: base, model: "test-model".into(),
             protocol: Protocol::Anthropic, cache: CacheMode::Auto, thinking: Thinking::Preserve,
-            max_tokens: 1024, context_size: DEFAULT_CONTEXT_SIZE, max_turns: DEFAULT_MAX_TURNS, streaming, show_thinking: false,
+            max_tokens: 1024, context_size: DEFAULT_CONTEXT_SIZE, max_turns: DEFAULT_MAX_TURNS, streaming,
         }
     }
 
@@ -1857,25 +1378,6 @@ mod tests {
         assert!(t.starts_with('x'));
         assert!(t.contains(&format!("…[truncated, {} bytes total]", big.len())), "got: {t}");
         assert!(t.split('…').next().unwrap().len() <= MAX_TOOL_OUTPUT, "kept prefix must fit the cap");
-    }
-
-    #[test]
-    fn tool_call_display_shows_input_and_caps_output() {
-        // header echoes the arguments, body echoes the output
-        let lines = tool_call_lines("bash", &json!({"command": "echo hi"}), "exit=0\nhi");
-        assert_eq!(lines[0], "[bash] $ echo hi");
-        assert!(lines.contains(&"│ exit=0".to_string()));
-        assert!(lines.contains(&"│ hi".to_string()));
-        // per-tool summaries
-        assert_eq!(tool_call_lines("write_file",
-            &json!({"path": "a.txt", "content": "hello"}), "ok: wrote 5 bytes to a.txt")[0],
-            "[write_file] a.txt (5 bytes)");
-        assert_eq!(tool_call_lines("read_file", &json!({"path": "b.txt"}), "x")[0], "[read_file] b.txt");
-        // long output is capped with a marker
-        let big: String = (0..MAX_TOOL_DISPLAY_LINES + 5).map(|i| format!("line{i}\n")).collect();
-        let lines = tool_call_lines("bash", &json!({"command": "cat big"}), &big);
-        assert_eq!(lines.len(), MAX_TOOL_DISPLAY_LINES + 2);
-        assert_eq!(lines.last().unwrap(), "… +5 more lines");
     }
 
     #[test]
@@ -2441,31 +1943,6 @@ mod tests {
 
     // ---- ui: status bar & pane protocol ----
 
-    fn ui_buf() -> Ui {
-        Ui {
-            pane: true,
-            color: false,
-            state: PaneState::Idle,
-            turn: Usage::default(),
-            total: Usage::default(),
-            pend: String::new(),
-            pend_dim: false,
-            open_out: false,
-            open_err: false,
-            sink: Sink::Buf(Vec::new()),
-        }
-    }
-
-    /// Drain the captured pane output (test sinks only).
-    fn drain(u: &mut Ui) -> String {
-        let mut s = String::new();
-        if let Sink::Buf(b) = &mut u.sink {
-            s = String::from_utf8_lossy(b).into_owned();
-            b.clear();
-        }
-        s
-    }
-
     #[test]
     fn humanize_small_exact_rest_one_decimal_k() {
         assert_eq!(humanize(0), "0");
@@ -2524,6 +2001,7 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn truncate_cols_respects_wide_chars() {
         assert_eq!(truncate_cols("abc", 10), "abc");
         assert_eq!(truncate_cols("精卫填海", 5), "精…");
@@ -2532,131 +2010,4 @@ mod tests {
         assert!(t.ends_with('…') && t.chars().count() == 59, "cut to ~60 columns: {t}");
     }
 
-    #[test]
-    fn pane_transcript_clears_top_rule_and_parks_on_bar() {
-        let mut u = ui_buf();
-        u.transcript_line("hello", Style::Plain);
-        // clear the rule above the input row, print the line, then the pane
-        // (rule, empty input row, rule, empty bar) with each row homed and
-        // cleared — no stale dashes beside a shorter row — and the cursor
-        // parked at the bar's end, no trailing newline.
-        let rule = rule_str();
-        assert_eq!(drain(&mut u),
-            format!("\x1b[3A\r\x1b[Khello\r\n{rule}\r\n\x1b[K\r\n\x1b[K{rule}\r\n\x1b[K"));
-    }
-
-    #[test]
-    fn pane_renders_over_a_previous_pane_without_leftovers() {
-        let mut u = ui_buf();
-        let rule = rule_str();
-        // a working pane with a long locked task …
-        u.begin_task("a task long enough to leave columns behind");
-        u.transcript_line("A", Style::Plain);
-        let _ = drain(&mut u);
-        // … then a short one re-renders the same rows: the row under a rule
-        // must be cleared before the task lands, or the previous pane's
-        // longer rule keeps its dashes beside the new, shorter row
-        u.begin_task("hi");
-        u.transcript_line("B", Style::Plain);
-        let out = drain(&mut u);
-        assert!(out.contains(&format!("{rule}\r\n\x1b[Kjingwei> hi")),
-            "the task row is drawn onto a cleared row: {out:?}");
-    }
-
-    #[test]
-    fn pane_wipes_rows_a_wrapped_line_rides_over() {
-        let mut u = ui_buf();
-        // a line wider than the terminal wraps onto the rows below — the
-        // pane's own rows — which must be wiped before the tail lands there
-        let wide = "x".repeat(200); // 200 cols → 2 extra rows at 80
-        u.transcript_line(&wide, Style::Plain);
-        let out = drain(&mut u);
-        assert!(out.contains("\x1b[B\r\x1b[K\x1b[B\r\x1b[K\x1b[2A"), "rows below wiped, cursor returned: {out:?}");
-        assert!(out.contains(&wide), "the whole line still lands: {out:?}");
-    }
-
-    #[test]
-    fn pane_shows_locked_task_and_live_bar_while_working() {
-        let mut u = ui_buf();
-        u.begin_task("refactor me");
-        u.transcript_line("A", Style::Plain);
-        let rule = rule_str();
-        assert_eq!(drain(&mut u),
-            format!("\x1b[3A\r\x1b[KA\r\n{rule}\r\n\x1b[Kjingwei> refactor me\r\n\x1b[K{rule}\r\n\x1b[K⠋ 0s"));
-        // message_start: the turn jumps onto the bar, in place
-        u.bump_usage(&json!({"input_tokens": 100, "output_tokens": 0}));
-        assert_eq!(drain(&mut u), "\r\x1b[K⠋ 0s · turn in 100 out 0");
-        // spinner advances in place on the same row
-        u.tick();
-        u.tick();
-        assert!(drain(&mut u).starts_with("\r\x1b[K⠙"), "spinner frame 2");
-        // request done: totals fold in, the turn stays on display
-        u.finish_request();
-        let out = drain(&mut u);
-        assert!(out.contains("turn in 100") && out.contains("total in 100"), "{out}");
-        // run ends: the bar drops the spinner segment
-        u.end_task();
-        u.refresh_bar();
-        assert_eq!(drain(&mut u), "\r\x1b[Kturn in 100 out 0 · total in 100 out 0");
-    }
-
-    #[test]
-    fn pane_streams_line_buffered_text() {
-        let mut u = ui_buf();
-        u.stream_text("hel");
-        assert_eq!(drain(&mut u), "", "a partial line stays in the buffer");
-        u.stream_text("lo\nwor");
-        let out = drain(&mut u);
-        assert!(out.contains("hello\r\n") && !out.contains("wor"), "{out:?}");
-        u.stream_close();
-        assert!(drain(&mut u).contains("wor"), "close lands the partial line");
-        // style switch (thinking → text) flushes the pending line first
-        u.stream_thinking("th");
-        u.stream_text("an");
-        let out = drain(&mut u);
-        assert!(out.contains("th\r\n") && !out.contains("an"), "thinking lands, text buffers: {out:?}");
-    }
-
-    #[test]
-    fn pane_paint_idle_frames_input_and_returns_cursor_to_it() {
-        let mut u = ui_buf();
-        let rule = rule_str();
-        // readline draws the prompt itself: the input row is left empty for it
-        u.paint_idle(true, false);
-        assert_eq!(
-            drain(&mut u),
-            format!("\x1b[3A\r\x1b[K{rule}\x1b[1B\r\x1b[K\x1b7\x1b[1B\r\x1b[K{rule}\x1b[1B\r\x1b[K\x1b8")
-        );
-        // piped stdin: the prompt is painted into the row for readline("")
-        u.paint_idle(true, true);
-        assert_eq!(
-            drain(&mut u),
-            format!("\x1b[3A\r\x1b[K{rule}\x1b[1B\r\x1b[Kjingwei> \x1b7\x1b[1B\r\x1b[K{rule}\x1b[1B\r\x1b[K\x1b8")
-        );
-        u.paint_idle(false, true); // recovery path: no move up
-        assert_eq!(
-            drain(&mut u),
-            format!("\r\x1b[K{rule}\x1b[1B\r\x1b[Kjingwei> \x1b7\x1b[1B\r\x1b[K{rule}\x1b[1B\r\x1b[K\x1b8")
-        );
-    }
-
-    #[test]
-    fn pane_lands_after_readline_and_parks_on_bar() {
-        let mut u = ui_buf();
-        u.land_after_readline(1); // tty path: newline stepped onto the bottom rule
-        assert_eq!(drain(&mut u), "\x1b[1B\r\x1b[K");
-        u.land_after_readline(2); // direct path: cursor still on the input row
-        assert_eq!(drain(&mut u), "\x1b[2B\r\x1b[K");
-    }
-
-    #[test]
-    fn plain_mode_passes_through_and_never_touches_the_pane() {
-        let mut u = ui_buf();
-        u.pane = false;
-        u.paint_idle(true, false); // nothing: readline owns the prompt
-        u.stream_text("x"); // goes to the real stdout (captured by the harness)
-        u.transcript_line("hi", Style::Plain);
-        u.warn("watch out");
-        assert!(drain(&mut u).is_empty(), "plain mode bypasses the pane sink");
-    }
 }

@@ -28,7 +28,10 @@ fn repl_survives_invalid_utf8_then_eof() {
     let stderr = String::from_utf8_lossy(&out.stderr);
 
     assert!(out.status.success(), "non-zero exit {:?}\nstderr: {stderr}", out.status);
-    assert!(stderr.contains("readline"), "no readline warning; stderr: {stderr}");
+    assert!(
+        stderr.contains("warning: input"),
+        "invalid UTF-8 should warn, not crash; stderr: {stderr}"
+    );
     assert!(
         stderr.contains("Connection refused") || stderr.contains("Connection Failed"),
         "expected network error on second line; stderr: {stderr}"

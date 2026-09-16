@@ -9,12 +9,15 @@ repository = "https://github.com/unfallenwill/jingwei"
 [dependencies]
 ureq = { version = "2", default-features = false, features = ["json", "tls", "gzip"] }
 serde_json = "1"
-rustyline = "14"
 # The coroutine runtime: the agent is an async fn (a suspensible, resumable,
 # cancellable computation) and tokio schedules it. `signal` powers Ctrl-C
 # interruption; blocking IO (ureq, file tools) rides the blocking pool so
 # every await stays a real suspension point.
 tokio = { version = "1", features = ["rt", "sync", "time", "signal", "macros"] }
+ratatui = "0.30.2"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
 
 # Tiny release binary, good for distributing cross-platform.
 [profile.release]
