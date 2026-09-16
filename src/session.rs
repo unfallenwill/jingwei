@@ -873,7 +873,7 @@ mod tests {
             json!({"role": "assistant", "content": [
                 {"type": "thinking", "thinking": "考虑\n多行推理 é\u{301}"},
                 {"type": "tool_use", "id": "t1", "name": "bash", "input": {
-                    "command": "printf 'a\\b'", "n": -12, "f": 3.14,
+                    "command": "printf 'a\\b'", "n": -12, "f": 2.5,
                     "big": 9007199254740993i64,
                     "nested": {"k": [1, 2, {"z": null}]}}},
                 {"type": "text", "text": "done"}]}),

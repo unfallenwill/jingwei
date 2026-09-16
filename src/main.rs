@@ -314,7 +314,22 @@ async fn run_tool(name: &str, input: &Value, token: &CancelToken) -> String {
 // ---- config ----------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Protocol { Anthropic, OpenAI }
+/// The wire protocol spoken to the endpoint — the provider port's only
+/// vocabulary word. Three speak the same internal history: anthropic
+/// (content blocks, tool_use/result pairs), openai (tool_calls, reasoning
+/// by convention unechoed), and deepseek — the OpenAI wire shape plus a
+/// thinking toggle and an echo rule of its own.
+enum Protocol { Anthropic, OpenAI, DeepSeek }
+
+impl Protocol {
+    /// The endpoint a protocol names for itself when the user names none —
+    /// the one case where the wire belongs to the vendor outright. A
+    /// vendor that lives at one address says so here; the rest stay None
+    /// and the composition root keeps requiring --base-url.
+    fn default_base(self) -> Option<&'static str> {
+        match self { Self::DeepSeek => Some("https://api.deepseek.com"), _ => None }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CacheMode { Auto, Active }
@@ -467,30 +482,35 @@ fn build_config(args: &Args) -> Result<Config> {
         .or_else(|| env::var(var).ok())
         .ok_or_else(|| Error::Msg(format!("missing {what} (or env {var})")));
     let protocol = enum_of(&args.protocol, "JINGWEI_PROTOCOL", "protocol",
-        &[("anthropic", Protocol::Anthropic), ("openai", Protocol::OpenAI)])?;
+        &[("anthropic", Protocol::Anthropic), ("openai", Protocol::OpenAI), ("deepseek", Protocol::DeepSeek)])?;
     let cache = enum_of(&args.cache, "JINGWEI_CACHE", "cache",
         &[("auto", CacheMode::Auto), ("active", CacheMode::Active)])?;
     let thinking = enum_of(&args.thinking, "JINGWEI_THINKING", "thinking",
         &[("preserve", Thinking::Preserve), ("strip", Thinking::Strip)])?;
     let effort = opt_enum_of(&args.effort, "JINGWEI_EFFORT", "effort",
         &[("low", Effort::Low), ("medium", Effort::Medium), ("high", Effort::High), ("max", Effort::Max)])?;
-    if cache == CacheMode::Active && protocol != Protocol::Anthropic {
-        return Err(Error::Msg("--cache active needs --protocol anthropic (it is Anthropic's cache_control scheme)".into()));
-    }
-    // Interleaved thinking is a wire requirement: with thinking enabled the
-    // Anthropic API rejects history whose earlier thinking blocks were
-    // stripped. (The OpenAI wire has no such continuity rule — reasoning
-    // is conventionally *not* echoed back there.)
-    if effort.is_some() && thinking == Thinking::Strip && protocol == Protocol::Anthropic {
-        return Err(Error::Msg("--effort needs --thinking preserve on the anthropic protocol (enabled thinking requires the history's thinking blocks)".into()));
+    // Wire rules live with their wires: each adapter owns what it can
+    // serve, and the composition root only asks.
+    match protocol {
+        Protocol::Anthropic => anthropic_accepts(cache, thinking, effort)?,
+        Protocol::OpenAI => openai_accepts(cache, thinking, effort)?,
+        Protocol::DeepSeek => deepseek_accepts(cache, thinking, effort)?,
     }
     let max_turns = args.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
     if max_turns == 0 {
         return Err(Error::Msg("--max-turns must be at least 1".into()));
     }
+    // A protocol may name its own endpoint — the one case where the wire
+    // belongs to the vendor outright. The user's word (flag, then env)
+    // still wins: everything else keeps requiring --base-url, the user
+    // pointing at someone's deployment of a wire.
+    let base_url = args.base_url.clone()
+        .or_else(|| env::var("JINGWEI_BASE_URL").ok())
+        .or_else(|| protocol.default_base().map(str::to_owned))
+        .ok_or_else(|| Error::Msg("missing --base-url (or env JINGWEI_BASE_URL)".into()))?;
     Ok(Config {
         api_key: req(&args.api_key, "JINGWEI_API_KEY", "--api-key")?,
-        base_url: req(&args.base_url, "JINGWEI_BASE_URL", "--base-url")?,
+        base_url,
         model: req(&args.model, "JINGWEI_MODEL", "-m/--model")?,
         protocol, cache, thinking, effort,
         max_tokens: args.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
@@ -512,9 +532,11 @@ USAGE:
 CONNECTION:
     --base-url <URL>    endpoint base (JINGWEI_BASE_URL)
                         anthropic: POST {base}/v1/messages · openai: POST {base}/chat/completions
+                        deepseek: POST {base}/chat/completions — base defaults to
+                        https://api.deepseek.com (the vendor's own endpoint)
     --api-key <KEY>     API key (JINGWEI_API_KEY)
     -m, --model <NAME>  model name (JINGWEI_MODEL)
-    --protocol <P>      anthropic (default) | openai
+    --protocol <P>      anthropic (default) | openai | deepseek
 
 BEHAVIOR:
     --max-tokens <N>    max output tokens per turn (default 131072)
@@ -529,6 +551,8 @@ BEHAVIOR:
                         if the endpoint knows it) · anthropic wire: thinking
                         budget_tokens (low 1024 · medium 8k · high 32k ·
                         max = max-tokens minus a floor for the reply)
+                        deepseek wire: reasoning_effort (the wire maps medium
+                        to high; low/high/max are its own words)
     -s, --stream        stream output token by token (default)
     -S, --no-stream     wait for each turn to finish before printing
     -h, --help          this help
@@ -730,7 +754,7 @@ async fn agent_turn(cfg: &Config, history: &mut Vec<Value>, token: &CancelToken)
 
 impl Config {
     fn protocol_label(&self) -> &'static str {
-        match self.protocol { Protocol::Anthropic => "anthropic", Protocol::OpenAI => "openai" }
+        match self.protocol { Protocol::Anthropic => "anthropic", Protocol::OpenAI => "openai", Protocol::DeepSeek => "deepseek" }
     }
 
     /// The banner's identity tail: protocol · model [· effort] · base url.
@@ -938,34 +962,36 @@ fn drop_result_and_pair(history: &mut Vec<Value>, mi: usize, bi: usize) {
 
 // ---- api: shared dispatch --------------------------------------------------
 
+/// The provider port's one dispatch: one entry per wire, and nothing else.
+/// Whether a wire streams or blocks, how it spells its fields, which rules
+/// its history must obey — all of that is the adapter's own machinery,
+/// invisible here. The core hands over the IR and gets the IR back.
 async fn call_api(cfg: &Config, history: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
-    let messages = if cfg.thinking == Thinking::Strip { strip_thinking(history) } else { history.to_vec() };
-    let (v, interrupted) = match (cfg.protocol, cfg.streaming) {
-        (Protocol::Anthropic, false) => anthropic_blocking(cfg, &messages, schemas, token).await?,
-        (Protocol::Anthropic, true) => anthropic_streaming(cfg, &messages, schemas, token).await?,
-        (Protocol::OpenAI, false) => openai_blocking(cfg, &messages, schemas, token).await?,
-        (Protocol::OpenAI, true) => openai_streaming(cfg, &messages, schemas, token).await?,
-    };
-    // Blocking paths don't print inline — emit text/thinking now.
-    if !cfg.streaming {
-        if let Some(blocks) = v["content"].as_array() {
-            for block in blocks {
-                match block["type"].as_str() {
-                    Some("text") => disp(Msg::Text(format!("\n{}", block["text"].as_str().unwrap_or("")))),
-                    Some("thinking") => {
-                        disp(Msg::Think(block["thinking"].as_str().unwrap_or("").into()));
-                        disp(Msg::ThinkEnd);
-                    }
-                    _ => {}
+    match cfg.protocol {
+        Protocol::Anthropic => anthropic_turn(cfg, history, schemas, token).await,
+        Protocol::OpenAI => openai_turn(cfg, history, schemas, token).await,
+        Protocol::DeepSeek => deepseek_turn(cfg, history, schemas, token).await,
+    }
+}
+
+/// A blocking turn's events, shown once at the end — the same port the
+/// streaming paths speak event-by-event as content arrives. Called by the
+/// blocking paths only; a blocking socket cannot show anything sooner.
+fn show_turn(v: &Value) {
+    if let Some(blocks) = v["content"].as_array() {
+        for block in blocks {
+            match block["type"].as_str() {
+                Some("text") => disp(Msg::Text(format!("\n{}", block["text"].as_str().unwrap_or("")))),
+                Some("thinking") => {
+                    disp(Msg::Think(block["thinking"].as_str().unwrap_or("").into()));
+                    disp(Msg::ThinkEnd);
                 }
+                _ => {}
             }
         }
-        // Streaming paths report usage event-by-event themselves; blocking
-        // responses get the whole picture at once.
-        disp(Msg::Usage(Usage::from_value(&v["usage"])));
-        disp(Msg::Done);
     }
-    Ok((v, interrupted))
+    disp(Msg::Usage(Usage::from_value(&v["usage"])));
+    disp(Msg::Done);
 }
 
 fn strip_thinking(messages: &[Value]) -> Vec<Value> {
@@ -1056,6 +1082,29 @@ fn append_str_field(block: &mut Value, key: &str, tail: &str) {
 
 // ---- api: anthropic wire ---------------------------------------------------
 
+/// Policy the anthropic wire cannot serve — its own rules, kept where its
+/// translation lives. (`--cache active` is this wire's feature, so it is
+/// served here and rejected by the others, in their own words.)
+fn anthropic_accepts(_cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
+    if effort.is_some() && thinking == Thinking::Strip {
+        return Err(Error::Msg("--effort needs --thinking preserve on the anthropic protocol (enabled thinking requires the history's thinking blocks)".into()));
+    }
+    Ok(())
+}
+
+/// The anthropic adapter's one entry into the provider port. Strip is a
+/// wire rule wearing a policy flag: this wire carries thinking blocks in
+/// its history verbatim, so stripping them is this adapter's job, never
+/// the core's.
+async fn anthropic_turn(cfg: &Config, history: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+    let messages = if cfg.thinking == Thinking::Strip { strip_thinking(history) } else { history.to_vec() };
+    if cfg.streaming {
+        anthropic_streaming(cfg, &messages, schemas, token).await
+    } else {
+        anthropic_blocking(cfg, &messages, schemas, token).await
+    }
+}
+
 fn anthropic_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: bool) -> Value {
     let active = cfg.cache == CacheMode::Active;
     let system = if active {
@@ -1085,6 +1134,7 @@ async fn anthropic_blocking(cfg: &Config, messages: &[Value], schemas: &[Value],
         if let Some(err) = v.get("error") { return Err(Error::Msg(err.to_string())); }
         Ok(v)
     }).await?;
+    show_turn(&v);
     Ok((v, token.is_cancelled()))
 }
 
@@ -1170,10 +1220,28 @@ async fn anthropic_streaming(cfg: &Config, messages: &[Value], schemas: &[Value]
     Ok((json!({"content": content, "usage": usage}), interrupted))
 }
 
-// ---- api: openai wire ------------------------------------------------------
+// ---- api: the chat-completions wire family --------------------------------
+//
+// OpenAI's Chat Completions is less a vendor than a *dialect*: several
+// providers speak its request/response/SSE shapes and differ only in the
+// field vocabularies layered on top (thinking toggles, effort spellings,
+// usage ledgers). This section is that shared dialect — and deliberately
+// nameless: no vendor appears here, so no vendor's details can leak into
+// another's. The vendors (openai, deepseek, …) are thin sections below,
+// each owning its body extras, its usage translation, and its rules.
 
-/// Internal (Anthropic-style) history → OpenAI Chat Completions messages.
-fn to_openai_messages(system: &str, history: &[Value], cfg: &Config) -> Vec<Value> {
+/// Where this family posts. Every speaker of the dialect agrees on the
+/// path; only the host varies.
+fn chat_url(cfg: &Config) -> String {
+    format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'))
+}
+
+/// Internal history → the dialect's messages. Reasoning rides assistant
+/// turns as `reasoning_content` when the policy preserves it — whether the
+/// endpoint *requires* that echo (deepseek with tools), merely accepts it,
+/// or ignores it (openai) is a vendor fact, and the dialect serves the
+/// strictest reading: echo unless told to strip.
+fn chat_messages(system: &str, history: &[Value], cfg: &Config) -> Vec<Value> {
     let mut out = vec![json!({"role": "system", "content": system})];
     for msg in history {
         match msg["role"].as_str() {
@@ -1212,46 +1280,33 @@ fn to_openai_messages(system: &str, history: &[Value], cfg: &Config) -> Vec<Valu
     out
 }
 
-fn openai_tools(schemas: &[Value]) -> Value {
+/// Internal tool schemas → the dialect's tool list.
+fn chat_tools(schemas: &[Value]) -> Value {
     json!(schemas.iter().map(|t| json!({"type": "function", "function": {
         "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}})).collect::<Vec<_>>())
 }
 
-/// The OpenAI request body; `stream` adds the usage-bearing stream options.
-/// Effort, when set, is the wire's own word — the endpoint decides its
-/// vocabulary.
-fn openai_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: bool) -> Value {
-    let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
-        "messages": to_openai_messages(SYSTEM, messages, cfg), "tools": openai_tools(schemas)});
-    if stream {
-        body["stream"] = json!(true);
-        body["stream_options"] = json!({"include_usage": true});
-    }
-    if let Some(e) = cfg.effort {
-        body["reasoning_effort"] = json!(e.label());
-    }
-    body
+/// One blocking call on the dialect: post, surface the wire's error,
+/// translate through the vendor, show the turn once. The blocking/streaming
+/// split is the family's machinery — a vendor hands over a body and its
+/// response translator, nothing else.
+async fn chat_blocking(cfg: &Config, body: Value, to_internal: fn(&Value) -> Value, token: &CancelToken) -> Result<(Value, bool)> {
+    let url = chat_url(cfg);
+    let key = cfg.api_key.clone();
+    let v = blocking(token, move || -> Result<Value> {
+        let v: Value = post(&key, url, body, false)?.into_json()?;
+        if let Some(err) = v.get("error") { return Err(Error::Msg(err.to_string())); }
+        Ok(v)
+    }).await?;
+    let v = to_internal(&v);
+    show_turn(&v);
+    Ok((v, token.is_cancelled()))
 }
 
-/// OpenAI usage → internal shape + display usage, in one place so both
-/// consumers stay identical. Normalizes a wire asymmetry: OpenAI's
-/// `prompt_tokens` *includes* `cached_tokens`, while Anthropic's
-/// `input_tokens` excludes cache traffic — so `input` here becomes
-/// "non-cached input", and `context_in()` (input + cache read + write)
-/// reads true on both wires.
-fn openai_usage(u: &Value) -> (Value, Usage) {
-    let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
-    let cached = u["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
-    let fresh = prompt.saturating_sub(cached);
-    (
-        json!({"input_tokens": fresh, "output_tokens": u["completion_tokens"],
-            "cache_read_input_tokens": cached, "cache_creation_input_tokens": 0}),
-        Usage { input: fresh, output: u["completion_tokens"].as_u64().unwrap_or(0), cache_read: cached, cache_write: 0 },
-    )
-}
-
-/// OpenAI response → internal {content, usage} shape.
-fn openai_to_internal(v: &Value) -> Value {
+/// A response in this dialect → internal {content, usage}: the message walk
+/// is the dialect's own, the ledger is the one thing vendors spell
+/// differently, so it arrives as a function.
+fn chat_to_internal(v: &Value, usage_of: fn(&Value) -> (Value, Usage)) -> Value {
     let msg = &v["choices"][0]["message"];
     let mut content = vec![];
     if let Some(r) = msg["reasoning_content"].as_str().filter(|r| !r.is_empty()) {
@@ -1264,25 +1319,15 @@ fn openai_to_internal(v: &Value) -> Value {
         content.push(json!({"type": "tool_use", "id": tc["id"], "name": tc["function"]["name"],
             "input": serde_json::from_str::<Value>(tc["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}))}));
     }
-    let (usage, _) = openai_usage(&v["usage"]);
+    let (usage, _) = usage_of(&v["usage"]);
     json!({"content": content, "usage": usage})
 }
 
-async fn openai_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let body = openai_body(cfg, messages, schemas, false);
-    let key = cfg.api_key.clone();
-    let v = blocking(token, move || -> Result<Value> {
-        let v: Value = post(&key, url, body, false)?.into_json()?;
-        if let Some(err) = v.get("error") { return Err(Error::Msg(err.to_string())); }
-        Ok(v)
-    }).await?;
-    Ok((openai_to_internal(&v), token.is_cancelled()))
-}
-
-async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let body = openai_body(cfg, messages, schemas, true);
+/// One streaming call on the dialect: SSE deltas assembled into internal
+/// blocks, events shown as they arrive. `usage_of` is the vendor's ledger
+/// translation — the field families cannot agree on.
+async fn chat_streaming(cfg: &Config, body: Value, usage_of: fn(&Value) -> (Value, Usage), token: &CancelToken) -> Result<(Value, bool)> {
+    let url = chat_url(cfg);
     let key = cfg.api_key.clone();
     let resp = blocking(token, move || post(&key, url, body, false)).await?;
     let (mut text, mut reasoning, mut tool_calls) = (String::new(), String::new(), vec![]);
@@ -1301,13 +1346,13 @@ async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], t
         if data == "[DONE]" { break }
         let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
         if v["usage"].is_object() {
-            let (internal, shown) = openai_usage(&v["usage"]);
+            let (internal, shown) = usage_of(&v["usage"]);
             usage = internal;
             disp(Msg::Usage(shown));
         }
         let Some(delta) = v["choices"][0]["delta"].as_object() else { continue };
         let delta = Value::Object(delta.clone());
-        // The OpenAI wire has no block boundary around reasoning; the first
+        // The dialect has no block boundary around reasoning; the first
         // delta that isn't reasoning (or the stream's end) closes it — that
         // is the fold point.
         let has_text = delta["content"].as_str().is_some_and(|t| !t.is_empty());
@@ -1349,6 +1394,156 @@ async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], t
             "input": serde_json::from_str::<Value>(tc["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}))}));
     }
     Ok((json!({"content": content, "usage": usage}), interrupted))
+}
+
+// ---- api: openai vendor ----------------------------------------------------
+
+/// Policy the openai wire cannot serve. Its cache is passive (nothing to
+/// mark) and its reasoning has no echo rule (nothing to keep) — the one
+/// thing it rejects is a breakpoint scheme it has no field for.
+fn openai_accepts(cache: CacheMode, _thinking: Thinking, _effort: Option<Effort>) -> Result<()> {
+    if cache == CacheMode::Active {
+        return Err(Error::Msg("--cache active needs --protocol anthropic (it is Anthropic's cache_control scheme; this wire has no breakpoints)".into()));
+    }
+    Ok(())
+}
+
+/// The openai vendor's one entry into the provider port.
+async fn openai_turn(cfg: &Config, history: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+    if cfg.streaming {
+        openai_streaming(cfg, history, schemas, token).await
+    } else {
+        openai_blocking(cfg, history, schemas, token).await
+    }
+}
+
+/// The openai request body; `stream` adds the usage-bearing stream options.
+/// Effort, when set, is the wire's own word — the endpoint decides its
+/// vocabulary.
+fn openai_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: bool) -> Value {
+    let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
+        "messages": chat_messages(SYSTEM, messages, cfg), "tools": chat_tools(schemas)});
+    if stream {
+        body["stream"] = json!(true);
+        body["stream_options"] = json!({"include_usage": true});
+    }
+    if let Some(e) = cfg.effort {
+        body["reasoning_effort"] = json!(e.label());
+    }
+    body
+}
+
+/// OpenAI usage → internal shape + display usage, in one place so both
+/// consumers stay identical. Normalizes a wire asymmetry: OpenAI's
+/// `prompt_tokens` *includes* `cached_tokens`, while the internal ledger's
+/// `input_tokens` excludes cache traffic — so `input` here becomes
+/// "non-cached input", and `context_in()` (input + cache read + write)
+/// reads true on the wire.
+fn openai_usage(u: &Value) -> (Value, Usage) {
+    let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
+    let cached = u["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
+    let fresh = prompt.saturating_sub(cached);
+    (
+        json!({"input_tokens": fresh, "output_tokens": u["completion_tokens"],
+            "cache_read_input_tokens": cached, "cache_creation_input_tokens": 0}),
+        Usage { input: fresh, output: u["completion_tokens"].as_u64().unwrap_or(0), cache_read: cached, cache_write: 0 },
+    )
+}
+
+/// OpenAI response → internal {content, usage}: the dialect's walk, this
+/// vendor's ledger.
+fn openai_to_internal(v: &Value) -> Value {
+    chat_to_internal(v, openai_usage)
+}
+
+async fn openai_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+    chat_blocking(cfg, openai_body(cfg, messages, schemas, false), openai_to_internal, token).await
+}
+
+async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+    chat_streaming(cfg, openai_body(cfg, messages, schemas, true), openai_usage, token).await
+}
+
+// ---- api: deepseek vendor --------------------------------------------------
+//
+// The DeepSeek API speaks the chat-completions dialect with a vocabulary
+// of its own on top: a `thinking` toggle, an effort spelling, and a disk
+// cache that is always on and reports itself in `usage`. All of it stays
+// here — the core asks nothing, the family knows nothing.
+
+/// Policy the deepseek wire cannot serve, in its own words. Its disk cache
+/// needs no breakpoints (there is no field for one, and none is needed);
+/// and its reasoning carries an echo rule — with tools present, every past
+/// turn's `reasoning_content` must ride the next request — so effort, the
+/// knob that turns thinking up, cannot pair with strip, the flag that
+/// would erase what must be echoed.
+fn deepseek_accepts(cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
+    if cache == CacheMode::Active {
+        return Err(Error::Msg("--cache active needs --protocol anthropic (deepseek's disk cache is always on — nothing to request)".into()));
+    }
+    if effort.is_some() && thinking == Thinking::Strip {
+        return Err(Error::Msg("--effort needs --thinking preserve on the deepseek protocol (with tools present, the wire requires every past turn's reasoning_content back)".into()));
+    }
+    Ok(())
+}
+
+/// The deepseek vendor's one entry into the provider port.
+async fn deepseek_turn(cfg: &Config, history: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+    if cfg.streaming {
+        deepseek_streaming(cfg, history, schemas, token).await
+    } else {
+        deepseek_blocking(cfg, history, schemas, token).await
+    }
+}
+
+/// The deepseek request body: the dialect's shape plus the `thinking`
+/// toggle. On this wire `--thinking strip` is not an erasure but the
+/// toggle off — `disabled` makes the model generate no reasoning at all,
+/// which is the only honest strip on a wire whose echo rule (tools ⇒
+/// reasoning back) a stripped history would break on the second request.
+/// Effort rides `reasoning_effort` verbatim: low/high/max are the wire's
+/// own words, and it maps medium→high itself for compatibility.
+fn deepseek_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: bool) -> Value {
+    let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
+        "thinking": {"type": if cfg.thinking == Thinking::Strip { "disabled" } else { "enabled" }},
+        "messages": chat_messages(SYSTEM, messages, cfg), "tools": chat_tools(schemas)});
+    if stream {
+        body["stream"] = json!(true);
+        body["stream_options"] = json!({"include_usage": true});
+    }
+    if let Some(e) = cfg.effort {
+        body["reasoning_effort"] = json!(e.label());
+    }
+    body
+}
+
+/// DeepSeek usage → internal shape + display. The IR contract ("input is
+/// non-cached input") is the core's; the spelling is the vendor's: this
+/// ledger splits its disk cache natively, hit + miss = prompt, and both
+/// halves are reported on every request.
+fn deepseek_usage(u: &Value) -> (Value, Usage) {
+    let cached = u["prompt_cache_hit_tokens"].as_u64().unwrap_or(0);
+    let fresh = u["prompt_cache_miss_tokens"].as_u64()
+        .unwrap_or_else(|| u["prompt_tokens"].as_u64().unwrap_or(0).saturating_sub(cached));
+    (
+        json!({"input_tokens": fresh, "output_tokens": u["completion_tokens"],
+            "cache_read_input_tokens": cached, "cache_creation_input_tokens": 0}),
+        Usage { input: fresh, output: u["completion_tokens"].as_u64().unwrap_or(0), cache_read: cached, cache_write: 0 },
+    )
+}
+
+/// DeepSeek response → internal {content, usage}: the dialect's walk, this
+/// vendor's ledger.
+fn deepseek_to_internal(v: &Value) -> Value {
+    chat_to_internal(v, deepseek_usage)
+}
+
+async fn deepseek_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+    chat_blocking(cfg, deepseek_body(cfg, messages, schemas, false), deepseek_to_internal, token).await
+}
+
+async fn deepseek_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+    chat_streaming(cfg, deepseek_body(cfg, messages, schemas, true), deepseek_usage, token).await
 }
 
 // ---- tests -----------------------------------------------------------------
@@ -1705,7 +1900,7 @@ mod tests {
             json!({"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "t1", "content": "exit=0"}]}),
         ];
-        let msgs = to_openai_messages("sys", &history, &cfg("https://x".into(), false));
+        let msgs = chat_messages("sys", &history, &cfg("https://x".into(), false));
         assert_eq!(msgs[0], json!({"role": "system", "content": "sys"}));
         assert_eq!(msgs[2]["reasoning_content"], json!("reason away"));
         assert_eq!(msgs[2]["tool_calls"][0]["function"]["arguments"], json!({"command": "ls"}).to_string());
@@ -1714,7 +1909,7 @@ mod tests {
         // strip mode drops reasoning
         let mut cfg = cfg("https://x".into(), false);
         cfg.thinking = Thinking::Strip;
-        let msgs = to_openai_messages("sys", &history, &cfg);
+        let msgs = chat_messages("sys", &history, &cfg);
         assert!(msgs[2].get("reasoning_content").is_none());
     }
 
@@ -1722,18 +1917,18 @@ mod tests {
     fn openai_conversion_assistant_shapes_and_tool_schemas() {
         // text-only assistant keeps a plain string content
         let history = vec![json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})];
-        let msgs = to_openai_messages("sys", &history, &cfg("https://x".into(), false));
+        let msgs = chat_messages("sys", &history, &cfg("https://x".into(), false));
         assert_eq!(msgs[1]["content"], json!("hi"));
         assert!(msgs[1].get("tool_calls").is_none());
         // text-less assistant sends null content, not ""
         let history = vec![json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "bash", "input": {}}]})];
-        let msgs = to_openai_messages("sys", &history, &cfg("https://x".into(), false));
+        let msgs = chat_messages("sys", &history, &cfg("https://x".into(), false));
         assert_eq!(msgs[1]["content"], Value::Null);
         assert!(msgs[1]["tool_calls"].is_array());
         // internal tool schema → OpenAI function spec
         let schemas = vec![json!({"name": "bash", "description": "run", "input_schema":
             {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}})];
-        let t = openai_tools(&schemas);
+        let t = chat_tools(&schemas);
         assert_eq!(t[0]["type"], json!("function"));
         assert_eq!(t[0]["function"]["name"], json!("bash"));
         assert_eq!(t[0]["function"]["description"], json!("run"));
@@ -1901,6 +2096,126 @@ mod tests {
         let (resp, _) = block_on(call_api(&c, &[json!({"role": "user", "content": "hey"})], &[], &CancelToken::new())).unwrap();
         assert_eq!(resp["content"][0]["text"], "mock says hi");
         assert_eq!(resp["usage"]["cache_read_input_tokens"], json!(1));
+    }
+
+    // ---- deepseek vendor ----
+
+    #[test]
+    fn deepseek_body_carries_the_toggle_and_the_effort_word() {
+        let mut c = cfg("https://x".into(), true);
+        c.protocol = Protocol::DeepSeek;
+        // preserve + effort: thinking on, the wire's own word verbatim
+        // (medium arrives as "medium" — the wire maps it to high itself)
+        c.effort = Some(Effort::Max);
+        let b = deepseek_body(&c, &[], &[], false);
+        assert_eq!(b["thinking"], json!({"type": "enabled"}));
+        assert_eq!(b["reasoning_effort"], json!("max"));
+        assert!(b.get("stream_options").is_none(), "blocking asks for no stream options");
+        // strip: the toggle off — this wire's only honest strip
+        c.thinking = Thinking::Strip;
+        c.effort = None;
+        let b = deepseek_body(&c, &[], &[], true);
+        assert_eq!(b["thinking"], json!({"type": "disabled"}));
+        assert!(b.get("reasoning_effort").is_none());
+        assert_eq!(b["stream_options"]["include_usage"], json!(true));
+        // reasoning echo: the dialect's strictest reading serves this wire's
+        // rule (tools ⇒ every past turn's reasoning_content back)
+        c.thinking = Thinking::Preserve;
+        let history = vec![json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "step one"},
+            {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}}]})];
+        let msgs = chat_messages(SYSTEM, &history, &c);
+        assert_eq!(msgs[1]["reasoning_content"], json!("step one"));
+        assert_eq!(msgs[1]["tool_calls"][0]["id"], json!("t1"));
+    }
+
+    #[test]
+    fn deepseek_rules_live_with_the_vendor() {
+        let ok = |cache, thinking, effort| deepseek_accepts(cache, thinking, effort).is_ok();
+        assert!(ok(CacheMode::Auto, Thinking::Preserve, Some(Effort::High)));
+        assert!(!ok(CacheMode::Active, Thinking::Preserve, None), "the disk cache is always on — no breakpoints to request");
+        assert!(!ok(CacheMode::Auto, Thinking::Strip, Some(Effort::Low)), "effort cannot pair with strip");
+        assert!(ok(CacheMode::Auto, Thinking::Strip, None), "strip alone is the toggle off");
+        // the vendor names its own endpoint; the wires stay unnamed
+        assert_eq!(Protocol::DeepSeek.default_base(), Some("https://api.deepseek.com"));
+        assert_eq!(Protocol::OpenAI.default_base(), None);
+        assert_eq!(Protocol::Anthropic.default_base(), None);
+    }
+
+    #[test]
+    fn deepseek_default_base_and_policy_ride_build_config() {
+        std::env::remove_var("JINGWEI_BASE_URL");
+        std::env::remove_var("JINGWEI_EFFORT");
+        std::env::remove_var("JINGWEI_THINKING");
+        let args = Args { protocol: Some("deepseek".into()), api_key: Some("k".into()),
+            model: Some("deepseek-flash".into()), ..Default::default() };
+        let c = match build_config(&args) {
+            Ok(c) => c,
+            Err(e) => panic!("deepseek names its own endpoint: {e}"),
+        };
+        assert_eq!(c.base_url, "https://api.deepseek.com");
+        assert_eq!(c.protocol_label(), "deepseek");
+        let strip_effort = Args { thinking: Some("strip".into()), effort: Some("high".into()), ..args };
+        let err = match build_config(&strip_effort) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("strip + effort must be rejected on this wire"),
+        };
+        assert!(err.contains("reasoning_content"), "vendor words for a vendor rule; got: {err}");
+    }
+
+    #[test]
+    fn deepseek_usage_reads_the_disk_cache_ledger() {
+        let (ir, shown) = deepseek_usage(&json!({"prompt_tokens": 210, "prompt_cache_hit_tokens": 128,
+            "prompt_cache_miss_tokens": 82, "completion_tokens": 14}));
+        assert_eq!(ir, json!({"input_tokens": 82, "output_tokens": 14,
+            "cache_read_input_tokens": 128, "cache_creation_input_tokens": 0}));
+        assert_eq!((shown.input, shown.cache_read), (82, 128));
+        // no native split, no cache read claimed — the hit rate stays honest
+        let (ir, _) = deepseek_usage(&json!({"prompt_tokens": 30, "completion_tokens": 5}));
+        assert_eq!(ir["input_tokens"], json!(30));
+        assert_eq!(ir["cache_read_input_tokens"], json!(0));
+    }
+
+    #[test]
+    fn deepseek_blocking_roundtrip_and_error() {
+        let port = mock(r#"{"choices":[{"message":{"content":"北京","reasoning_content":"thinking hard"}}],"usage":{"prompt_tokens":38,"prompt_cache_hit_tokens":12,"prompt_cache_miss_tokens":26,"completion_tokens":4}}"#, 200, false);
+        let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
+        c.protocol = Protocol::DeepSeek;
+        let (resp, _) = block_on(call_api(&c, &[json!({"role": "user", "content": "capital?"})], &[], &CancelToken::new())).unwrap();
+        assert_eq!(resp["content"][0]["thinking"], json!("thinking hard"));
+        assert_eq!(resp["content"][1]["text"], json!("北京"));
+        assert_eq!(resp["usage"]["input_tokens"], json!(26));
+        assert_eq!(resp["usage"]["cache_read_input_tokens"], json!(12));
+        let port = mock(r#"{"error":{"message":"The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek-bogus."}}"#, 400, false);
+        let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
+        c.protocol = Protocol::DeepSeek;
+        let err = block_on(call_api(&c, &[json!({"role": "user", "content": "hi"})], &[], &CancelToken::new())).unwrap_err();
+        assert!(err.to_string().contains("deepseek-bogus"), "the wire's error body, verbatim; got: {err}");
+    }
+
+    #[test]
+    fn deepseek_streaming_assembles_deltas() {
+        // shapes taken from the live wire: reasoning deltas (no boundary —
+        // the first non-reasoning delta folds), a tool_call split across
+        // chunks (id+name first, arguments after), usage riding the last
+        // content chunk, [DONE] to close
+        let events = concat!(
+            r#"data: {"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#, "\n\n",
+            r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"The user wants"},"finish_reason":null}]}"#, "\n\n",
+            r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":" the date."},"finish_reason":null}]}"#, "\n\n",
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_00_x","type":"function","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}"#, "\n\n",
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"date\"}"}}]},"finish_reason":null}]}"#, "\n\n",
+            r#"data: {"choices":[{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":275,"completion_tokens":37,"prompt_cache_hit_tokens":128,"prompt_cache_miss_tokens":147}}"#, "\n\n",
+            r#"data: [DONE]"#, "\n\n");
+        let mut c = cfg(format!("http://127.0.0.1:{}", mock(events, 200, true)), true);
+        c.protocol = Protocol::DeepSeek;
+        c.streaming = true;
+        let (resp, cut) = block_on(call_api(&c, &[], &[], &CancelToken::new())).unwrap();
+        assert!(!cut);
+        assert_eq!(resp["content"][0]["thinking"], json!("The user wants the date."));
+        assert_eq!(resp["content"][1]["input"]["command"], json!("date"));
+        assert_eq!(resp["usage"]["input_tokens"], json!(147));
+        assert_eq!(resp["usage"]["cache_read_input_tokens"], json!(128));
     }
 
     #[test]
