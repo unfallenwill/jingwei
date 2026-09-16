@@ -1089,10 +1089,53 @@ fn prompt_str() -> &'static str {
     if color_on() { "\x1b[1;38;5;75mjingwei\x1b[0m\x1b[38;5;240m ❯\x1b[0m " } else { "jingwei> " }
 }
 
-/// The separator rules framing the input row, as wide as the bar may grow.
-/// disp_width counts each box-drawing dash as two columns.
+/// The separator rules framing the input row, spanning the terminal's full
+/// width so the pane reads as a box however wide the window is. A dash is
+/// one column in the default (narrow) rendering of box-drawing characters;
+/// the rare terminals that render them wide (emacs and friends) get a halved
+/// rule so the row can never wrap and desync the pane.
 fn rule_str() -> String {
-    "─".repeat(BAR_MAX / 2)
+    let per_dash = if dumb_term() { 2 } else { 1 };
+    "─".repeat(term_cols() / per_dash)
+}
+
+/// The terminal's width in columns — 80 when it can't be asked. No new
+/// dependencies for this: the ioctl (Unix) / console call (Windows) is
+/// declared by hand; both are cheap, so the rules even follow resizes.
+fn term_cols() -> usize {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        #[repr(C)]
+        #[derive(Default)]
+        struct Winsize { row: u16, col: u16, xpixel: u16, ypixel: u16 }
+        extern "C" { fn ioctl(fd: i32, request: usize, ...) -> i32; }
+        // TIOCGWINSZ: 0x5413 on Linux/Android, 0x40087468 on the BSDs/macOS.
+        const TIOCGWINSZ: usize =
+            if cfg!(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd",
+                        target_os = "openbsd", target_os = "dragonfly")) { 0x4008_7468 } else { 0x5413 };
+        let mut ws = Winsize::default();
+        let ok = unsafe { ioctl(io::stdout().as_raw_fd(), TIOCGWINSZ, &mut ws) };
+        if ok == 0 && ws.col > 0 { ws.col as usize } else { 80 }
+    }
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct Coord { x: i16, y: i16 }
+        #[repr(C)]
+        struct SmallRect { left: i16, top: i16, right: i16, bottom: i16 }
+        #[repr(C)]
+        struct ConsoleInfo { size: Coord, cursor: Coord, attrs: u16, window: SmallRect, max: Coord }
+        extern "system" {
+            fn GetStdHandle(which: u32) -> *mut core::ffi::c_void;
+            fn GetConsoleScreenBufferInfo(console: *mut core::ffi::c_void, info: *mut ConsoleInfo) -> i32;
+        }
+        const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5; // (DWORD)-11
+        let mut info = unsafe { std::mem::zeroed::<ConsoleInfo>() };
+        let console = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        let ok = !console.is_null() && unsafe { GetConsoleScreenBufferInfo(console, &mut info) } != 0;
+        if ok { (info.window.right - info.window.left + 1).max(1) as usize } else { 80 }
+    }
 }
 
 /// rustyline's notion of an unsupported terminal: there it prints the prompt

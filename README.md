@@ -69,9 +69,10 @@ final text turn of an agent run) stays in the conversation, so follow-ups keep
 context.
 
 The input row sits in a small pane at the foot of the scrolling transcript —
-separator rules above and below it, a status bar (spinner, elapsed, per-turn
-and session token usage, cache traffic) beneath — and the prompt rides with
-readline, so history recall and reverse search redraw it instead of erasing it.
+separator rules above and below it (sized to the terminal, following resizes),
+a status bar (spinner, elapsed, per-turn and session token usage, cache
+traffic) beneath — and the prompt rides with readline, so history recall and
+reverse search redraw it instead of erasing it.
 
 ## The three knobs people confuse
 
