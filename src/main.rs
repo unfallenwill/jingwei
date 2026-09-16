@@ -88,9 +88,10 @@ fn paint(s: &str, bg: (u8, u8, u8), white: bool) -> String {
 
 // ---- ui: transcript + fixed pane (input row + status bar) ------------------
 //
-// The screen is a scrolling transcript with a two-row pane pinned beneath it:
-// the input row (idle: the rustyline prompt; working: the locked task) and a
-// status bar with live usage. The pane is not glued to the physical bottom —
+// The screen is a scrolling transcript with a pane pinned beneath it: a
+// separator rule, the input row (idle: the readline prompt; working: the
+// locked task), a second rule, and a status bar with live usage. The pane is
+// not glued to the physical bottom —
 // it is always the last thing printed, so the terminal's normal scrolling
 // carries old transcript into scrollback and the pane rides along. No scroll
 // regions, no absolute cursor addressing: one invariant does all the work —
@@ -305,27 +306,30 @@ impl Ui {
         self.raw(&self.bar_line());
     }
 
-    /// Draw the whole pane (input row + bar) starting at the cursor row, col 0.
+    /// Draw the whole pane — rule, input row, rule, bar — starting at the
+    /// cursor row, col 0.
     fn render_pane(&mut self) {
         let input = match &self.state {
             PaneState::Working { task, .. } => self.styled(&format!("{}{task}", prompt_str()), Style::Dim),
             PaneState::Idle => String::new(),
         };
+        let rule = self.styled(&rule_str(), Style::Dim);
         let bar = self.bar_line();
-        self.raw(&format!("{input}\n{bar}"));
+        self.raw(&format!("{rule}\n{input}\n{rule}\n{bar}"));
     }
 
-    /// One finished transcript line. Pane protocol: clear the old input row,
-    /// print the line, re-render the pane beneath — the screen scrolls only
-    /// when the terminal itself runs out of rows, which is what keeps
-    /// scrollback intact. Parks the cursor at the end of the bar row.
+    /// One finished transcript line. Pane protocol: clear the pane's top row
+    /// (the rule above the input), print the line, re-render the pane beneath
+    /// — the screen scrolls only when the terminal itself runs out of rows,
+    /// which is what keeps scrollback intact. Parks the cursor at the end of
+    /// the bar row.
     fn transcript_line(&mut self, line: &str, style: Style) {
         if !self.pane {
             let s = self.styled(line, style);
             println!("{s}");
             return;
         }
-        self.raw("\x1b[1A\r\x1b[K"); // clear the input row
+        self.raw("\x1b[3A\r\x1b[K"); // clear the rule above the input row
         let s = self.styled(line, style);
         self.raw(&format!("{s}\n"));
         self.render_pane();
@@ -467,23 +471,47 @@ impl Ui {
         self.refresh_bar();
     }
 
-    /// Draw the idle prompt row with the bar beneath it, leaving the cursor
-    /// just after the prompt for readline (which owns that row from here on).
-    /// `parked`: the cursor is on the bar row (normal cycle); otherwise draw
-    /// at the cursor row (recovery after readline errors).
-    fn paint_idle(&mut self, parked: bool) {
+    /// Draw the idle pane — rule, input row, rule, bar — leaving the cursor
+    /// on the input row for readline, which owns it from here on. `prompt`:
+    /// paint the prompt into the row ourselves (needed only when stdin is a
+    /// pipe, where readline echoes nothing); otherwise readline arrives with
+    /// the prompt as its own readline prompt, so its redraws (history recall,
+    /// reverse search) keep it instead of erasing it. `parked`: the cursor is
+    /// on the bar row (normal cycle); otherwise draw at the cursor row
+    /// (recovery after readline errors).
+    fn paint_idle(&mut self, parked: bool, prompt: bool) {
         if !self.pane {
-            print!("{}", prompt_str());
-            let _ = io::stdout().flush();
+            if prompt {
+                print!("{}", prompt_str());
+                let _ = io::stdout().flush();
+            }
             return;
         }
-        if parked { self.raw("\x1b[1A") }
+        let rule = self.styled(&rule_str(), Style::Dim);
+        if parked { self.raw("\x1b[3A") } // bar row → rule above the input
         self.raw("\r\x1b[K");
-        self.raw(prompt_str());
-        self.raw("\x1b7");           // remember the editing position
-        self.raw("\x1b[1B\r\x1b[K"); // step onto the bar row
+        self.raw(&rule);                  // top rule
+        self.raw("\x1b[1B\r\x1b[K");      // onto the input row
+        if prompt { self.raw(prompt_str()) }
+        self.raw("\x1b7");                // remember the editing position
+        self.raw("\x1b[1B\r\x1b[K");
+        self.raw(&rule);                  // bottom rule
+        self.raw("\x1b[1B\r\x1b[K");      // onto the bar row
         self.raw(&self.bar_line());
-        self.raw("\x1b8");           // back to just after the prompt
+        self.raw("\x1b8");                // back to the input row
+    }
+
+    /// Re-anchor the pane after readline returns. The editing path (a tty
+    /// stdin) ends with a newline that steps off the input row onto the
+    /// bottom rule — one row above the bar; the direct paths (a piped stdin,
+    /// or an unsupported terminal) move the cursor not at all, leaving it on
+    /// the input row — two rows above the bar. Either way the bar is redrawn
+    /// and the cursor parked at its end, the position every other pane
+    /// operation assumes.
+    fn land_after_readline(&mut self, down: usize) {
+        if !self.pane { return }
+        self.raw(&format!("\x1b[{down}B"));
+        self.refresh_bar();
     }
 
     fn tool_lines(&mut self, name: &str, input: &Value, output: &str) {
@@ -937,7 +965,9 @@ async fn run() -> Result<()> {
     let cfg = build_config(&args)?;
     if args.prompt.is_empty() { repl(&cfg).await } else {
         let prompt = args.prompt.join(" ");
-        ui(|u| { u.begin_task(&prompt); if u.pane { u.transcript_line("", Style::Plain); } });
+        // Anchor the pane at the cursor (never move up: the rows above hold
+        // the shell's own prompt line), then every later line is parked.
+        ui(|u| { u.begin_task(&prompt); if u.pane { u.fresh_line("", Style::Plain); } });
         let mut history = vec![json!({"role": "user", "content": prompt})];
         let res = agent_turn(&cfg, &mut history).await;
         // The final bar render is the run's summary — totals stay on screen.
@@ -951,23 +981,41 @@ async fn repl(cfg: &Config) -> Result<()> {
     let mut rl = rustyline::DefaultEditor::new().map_err(|e| Error::Msg(format!("readline init: {e}")))?;
     if let Some(dir) = home_dir() { let _ = rl.load_history(&dir.join(".jingwei_history")); }
     ui(|u| {
-        u.transcript_line(&paint(" 精卫 ", BANNER_BG, true), Style::Plain);
+        // The first line anchors the pane here (fresh_line never moves up, so
+        // the shell prompt above survives); the rest are then parked.
+        u.fresh_line(&paint(" 精卫 ", BANNER_BG, true), Style::Plain);
         u.transcript_line("\x1b[1mjingwei\x1b[0m — 精卫填海，一石一石 · type a task, Ctrl-C interrupts, Ctrl-D rests", Style::Plain);
         u.transcript_line(&format!("\x1b[2m{} · {} · {}{}\x1b[22m", cfg.protocol_label(), cfg.model, cfg.base_url,
             if cfg.show_thinking { " · thinking on" } else { "" }), Style::Plain);
     });
+    // The prompt travels WITH readline whenever readline draws it itself (a
+    // tty stdin, or an unsupported terminal, where it prints the prompt and
+    // reads direct) — then its redraws (history recall, reverse search, line
+    // wraps) keep the prompt on the row instead of erasing it. Only a
+    // supported terminal reading from a pipe draws nothing, so there the
+    // prompt is painted into the input row and readline is handed "".
+    let stdin_tty = io::stdin().is_terminal();
+    let rl_owns_prompt = stdin_tty || dumb_term();
+    let rl_prompt = if rl_owns_prompt { prompt_str() } else { "" };
+    // Rows from the cursor down to the bar row when readline returns: the
+    // editing path's closing newline steps over the bottom rule (1); the
+    // direct paths leave the cursor on the input row (2).
+    let park = if stdin_tty && !dumb_term() { 1 } else { 2 };
     loop {
-        ui(|u| u.paint_idle(true));
-        let line = match rl.readline("") {
-            Ok(l) => l,
-            // Cursor position after an interrupt is rustyline's business;
-            // re-anchor the pane from wherever it landed.
+        ui(|u| u.paint_idle(true, !rl_owns_prompt));
+        let line = match rl.readline(rl_prompt) {
+            Ok(l) => { ui(|u| u.land_after_readline(park)); l }
+            // The half-typed line stays where readline left it; land, then
+            // anchor a fresh pane below it for the next prompt.
             Err(rustyline::error::ReadlineError::Interrupted) => {
-                ui(|u| u.fresh_line("", Style::Plain));
+                ui(|u| { u.land_after_readline(park); u.fresh_line("", Style::Plain); });
                 continue;
             }
             Err(rustyline::error::ReadlineError::Eof) => break,
-            Err(e) => { ui(|u| u.warn_fresh(&format!("warning: readline ({e})"))); continue; }
+            Err(e) => {
+                ui(|u| { u.land_after_readline(park); u.warn_fresh(&format!("warning: readline ({e})")); });
+                continue;
+            }
         };
         let line = line.trim();
         if line.is_empty() { continue; }
@@ -1039,6 +1087,22 @@ fn home_dir() -> Option<PathBuf> {
 
 fn prompt_str() -> &'static str {
     if color_on() { "\x1b[1;38;5;75mjingwei\x1b[0m\x1b[38;5;240m ❯\x1b[0m " } else { "jingwei> " }
+}
+
+/// The separator rules framing the input row, as wide as the bar may grow.
+/// disp_width counts each box-drawing dash as two columns.
+fn rule_str() -> String {
+    "─".repeat(BAR_MAX / 2)
+}
+
+/// rustyline's notion of an unsupported terminal: there it prints the prompt
+/// itself and reads direct (no editing, no redraws). Mirrored so the REPL
+/// knows who owns drawing the prompt.
+fn dumb_term() -> bool {
+    match env::var("TERM") {
+        Ok(t) => ["dumb", "cons25", "emacs"].iter().any(|u| t.eq_ignore_ascii_case(u)),
+        Err(_) => false,
+    }
 }
 
 
@@ -2398,12 +2462,14 @@ mod tests {
     }
 
     #[test]
-    fn pane_transcript_clears_input_row_and_parks_on_bar() {
+    fn pane_transcript_clears_top_rule_and_parks_on_bar() {
         let mut u = ui_buf();
         u.transcript_line("hello", Style::Plain);
-        // clear the input row, print the line, then the pane (empty input row,
-        // empty bar) with the cursor parked at the bar's end — no newline.
-        assert_eq!(drain(&mut u), "\x1b[1A\r\x1b[Khello\n\n");
+        // clear the rule above the input row, print the line, then the pane
+        // (rule, empty input row, rule, empty bar) with the cursor parked at
+        // the bar's end — no newline.
+        let rule = rule_str();
+        assert_eq!(drain(&mut u), format!("\x1b[3A\r\x1b[Khello\n{rule}\n\n{rule}\n"));
     }
 
     #[test]
@@ -2411,7 +2477,8 @@ mod tests {
         let mut u = ui_buf();
         u.begin_task("refactor me");
         u.transcript_line("A", Style::Plain);
-        assert_eq!(drain(&mut u), "\x1b[1A\r\x1b[KA\njingwei> refactor me\n⠋ 0s");
+        let rule = rule_str();
+        assert_eq!(drain(&mut u), format!("\x1b[3A\r\x1b[KA\n{rule}\njingwei> refactor me\n{rule}\n⠋ 0s"));
         // message_start: the turn jumps onto the bar, in place
         u.bump_usage(&json!({"input_tokens": 100, "output_tokens": 0}));
         assert_eq!(drain(&mut u), "\r\x1b[K⠋ 0s · turn in 100 out 0");
@@ -2447,18 +2514,42 @@ mod tests {
     }
 
     #[test]
-    fn pane_paint_idle_draws_prompt_bar_below_and_returns_cursor() {
+    fn pane_paint_idle_frames_input_and_returns_cursor_to_it() {
         let mut u = ui_buf();
-        u.paint_idle(true);
-        assert_eq!(drain(&mut u), "\x1b[1A\r\x1b[Kjingwei> \x1b7\x1b[1B\r\x1b[K\x1b8");
-        u.paint_idle(false); // recovery path: no move up
-        assert_eq!(drain(&mut u), "\r\x1b[Kjingwei> \x1b7\x1b[1B\r\x1b[K\x1b8");
+        let rule = rule_str();
+        // readline draws the prompt itself: the input row is left empty for it
+        u.paint_idle(true, false);
+        assert_eq!(
+            drain(&mut u),
+            format!("\x1b[3A\r\x1b[K{rule}\x1b[1B\r\x1b[K\x1b7\x1b[1B\r\x1b[K{rule}\x1b[1B\r\x1b[K\x1b8")
+        );
+        // piped stdin: the prompt is painted into the row for readline("")
+        u.paint_idle(true, true);
+        assert_eq!(
+            drain(&mut u),
+            format!("\x1b[3A\r\x1b[K{rule}\x1b[1B\r\x1b[Kjingwei> \x1b7\x1b[1B\r\x1b[K{rule}\x1b[1B\r\x1b[K\x1b8")
+        );
+        u.paint_idle(false, true); // recovery path: no move up
+        assert_eq!(
+            drain(&mut u),
+            format!("\r\x1b[K{rule}\x1b[1B\r\x1b[Kjingwei> \x1b7\x1b[1B\r\x1b[K{rule}\x1b[1B\r\x1b[K\x1b8")
+        );
+    }
+
+    #[test]
+    fn pane_lands_after_readline_and_parks_on_bar() {
+        let mut u = ui_buf();
+        u.land_after_readline(1); // tty path: newline stepped onto the bottom rule
+        assert_eq!(drain(&mut u), "\x1b[1B\r\x1b[K");
+        u.land_after_readline(2); // direct path: cursor still on the input row
+        assert_eq!(drain(&mut u), "\x1b[2B\r\x1b[K");
     }
 
     #[test]
     fn plain_mode_passes_through_and_never_touches_the_pane() {
         let mut u = ui_buf();
         u.pane = false;
+        u.paint_idle(true, false); // nothing: readline owns the prompt
         u.stream_text("x"); // goes to the real stdout (captured by the harness)
         u.transcript_line("hi", Style::Plain);
         u.warn("watch out");

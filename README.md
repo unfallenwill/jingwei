@@ -68,6 +68,11 @@ saved to `~/.jingwei_history` and reloaded on start. Each answer (including the
 final text turn of an agent run) stays in the conversation, so follow-ups keep
 context.
 
+The input row sits in a small pane at the foot of the scrolling transcript —
+separator rules above and below it, a status bar (spinner, elapsed, per-turn
+and session token usage, cache traffic) beneath — and the prompt rides with
+readline, so history recall and reverse search redraw it instead of erasing it.
+
 ## The three knobs people confuse
 
 | Knob | Layer | What it controls |
