@@ -302,13 +302,19 @@ pub async fn run(cfg: &Config) -> crate::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     display::install_chan(tx);
     display::disp(Msg::Banner(format!(
-        "jingwei — 精卫填海，一石一石 · {} · {} · {}",
-        cfg.protocol_label(), cfg.model, cfg.base_url)));
+        "jingwei — 精卫填海，一石一石 · {}",
+        cfg.identity())));
     display::disp(Msg::Banner(
         "type a task · Ctrl-J / Shift-Enter breaks the line · Ctrl-O unfolds · Ctrl-C interrupts (twice exits) · /exit or Ctrl-D rests".into()));
 
     let mut app = App::new();
     app.input.history = load_history();
+    app.info = model::Info {
+        model: cfg.model.clone(),
+        effort: cfg.effort_label().map(str::to_owned),
+        context_limit: cfg.context_size,
+        max_turns: cfg.max_turns,
+    };
 
     let history = Arc::new(AsyncMutex::new(Vec::<serde_json::Value>::new()));
     let mut agent: Option<Agent> = None;

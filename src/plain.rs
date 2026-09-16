@@ -122,7 +122,7 @@ pub async fn plain_repl(cfg: &crate::Config) -> crate::Result<()> {
     use crate::{agent_turn, CancelToken};
     let tty = std::io::stdin().is_terminal();
     display::disp(Msg::Banner("jingwei — 精卫填海，一石一石 · type a task, /exit or Ctrl-D rests, Ctrl-C interrupts".into()));
-    disp(Msg::Banner(format!("{} · {} · {}", cfg.protocol_label(), cfg.model, cfg.base_url)));
+    disp(Msg::Banner(cfg.identity()));
     let mut history: Vec<serde_json::Value> = vec![];
     let stdin = std::io::stdin();
     loop {

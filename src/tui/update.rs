@@ -61,6 +61,9 @@ fn msg(app: &mut App, m: Msg) -> Action {
         Msg::TaskBegin(t) => {
             app.status.task = Some(Task { text: t.clone(), elapsed: Duration::ZERO });
             app.status.spin = 0;
+            // the step counter is per task: --max-turns is each task's
+            // budget of API requests, not the session's
+            app.status.turns = 0;
             app.cancel_sent = false;
             app.scroll = Scroll::Tail;
             app.flush_partial();
@@ -87,6 +90,7 @@ fn msg(app: &mut App, m: Msg) -> Action {
         Msg::OutTokens(n) => app.status.turn.output = n,
         Msg::Done => {
             app.status.total.add(&app.status.turn);
+            app.status.turns += 1;
             app.flush_partial();
             app.fold_thought();
         }

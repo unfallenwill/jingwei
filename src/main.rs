@@ -316,6 +316,36 @@ enum CacheMode { Auto, Active }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Thinking { Preserve, Strip }
 
+/// Reasoning effort, when the endpoint offers the knob. Absent (`None`)
+/// means *say nothing on the wire* — the endpoint's own default rules, so
+/// existing setups see byte-identical requests.
+///
+/// The two wires spell it differently: OpenAI takes a word
+/// (`reasoning_effort`), Anthropic a token budget (`thinking.
+/// budget_tokens`). `max` is not an OpenAI word — it is passed through
+/// verbatim and the endpoint decides; on the Anthropic wire it maps to
+/// "everything but a floor for the reply".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Effort { Low, Medium, High, Max }
+
+impl Effort {
+    fn label(self) -> &'static str {
+        match self { Self::Low => "low", Self::Medium => "medium", Self::High => "high", Self::Max => "max" }
+    }
+    /// The Anthropic budget for this tier, clamped into the wire's rules:
+    /// at least 1024, and strictly under `max_tokens` so the reply has
+    /// room (thinking enabled requires `max_tokens > budget_tokens`).
+    fn budget(self, max_tokens: u32) -> u32 {
+        let nominal = match self {
+            Self::Low => 1024,
+            Self::Medium => 8192,
+            Self::High => 32768,
+            Self::Max => max_tokens.saturating_sub(1024),
+        };
+        nominal.clamp(1024, max_tokens.saturating_sub(1024).max(1024))
+    }
+}
+
 #[derive(Clone)]
 struct Config {
     api_key: String,
@@ -324,6 +354,7 @@ struct Config {
     protocol: Protocol,
     cache: CacheMode,
     thinking: Thinking,
+    effort: Option<Effort>,
     max_tokens: u32,
     context_size: u64,
     max_turns: u32,
@@ -338,6 +369,7 @@ struct Args {
     protocol: Option<String>,
     cache: Option<String>,
     thinking: Option<String>,
+    effort: Option<String>,
     max_tokens: Option<u32>,
     context_size: Option<u64>,
     max_turns: Option<u32>,
@@ -358,6 +390,7 @@ fn parse_from<I: Iterator<Item = String>>(mut it: I) -> Result<Args> {
             "--protocol" => a.protocol = Some(val()?),
             "--cache" => a.cache = Some(val()?),
             "--thinking" => a.thinking = Some(val()?),
+            "--effort" => a.effort = Some(val()?),
             "--max-tokens" => a.max_tokens = Some(val()?.parse().map_err(|_| Error::Msg("--max-tokens expects a number".into()))?),
             "--context-size" => a.context_size = Some(val()?.parse().map_err(|_| Error::Msg("--context-size expects a number (tokens)".into()))?),
             "--max-turns" => a.max_turns = Some(val()?.parse().map_err(|_| Error::Msg("--max-turns expects a number".into()))?),
@@ -384,6 +417,15 @@ fn enum_of<T: Copy>(raw: &Option<String>, var: &str, name: &str, variants: &[(&'
         )))
 }
 
+/// [`enum_of`] without a default: absent flag and env mean `None`, which
+/// the caller turns into "say nothing on the wire".
+fn opt_enum_of<T: Copy>(raw: &Option<String>, var: &str, name: &str, variants: &[(&'static str, T)]) -> Result<Option<T>> {
+    match raw.clone().or_else(|| env::var(var).ok()) {
+        None => Ok(None),
+        Some(s) => enum_of(&Some(s), var, name, variants).map(Some),
+    }
+}
+
 fn build_config(args: &Args) -> Result<Config> {
     let req = |flag: &Option<String>, var: &str, what: &str| flag.clone()
         .or_else(|| env::var(var).ok())
@@ -394,8 +436,17 @@ fn build_config(args: &Args) -> Result<Config> {
         &[("auto", CacheMode::Auto), ("active", CacheMode::Active)])?;
     let thinking = enum_of(&args.thinking, "JINGWEI_THINKING", "thinking",
         &[("preserve", Thinking::Preserve), ("strip", Thinking::Strip)])?;
+    let effort = opt_enum_of(&args.effort, "JINGWEI_EFFORT", "effort",
+        &[("low", Effort::Low), ("medium", Effort::Medium), ("high", Effort::High), ("max", Effort::Max)])?;
     if cache == CacheMode::Active && protocol != Protocol::Anthropic {
         return Err(Error::Msg("--cache active needs --protocol anthropic (it is Anthropic's cache_control scheme)".into()));
+    }
+    // Interleaved thinking is a wire requirement: with thinking enabled the
+    // Anthropic API rejects history whose earlier thinking blocks were
+    // stripped. (The OpenAI wire has no such continuity rule — reasoning
+    // is conventionally *not* echoed back there.)
+    if effort.is_some() && thinking == Thinking::Strip && protocol == Protocol::Anthropic {
+        return Err(Error::Msg("--effort needs --thinking preserve on the anthropic protocol (enabled thinking requires the history's thinking blocks)".into()));
     }
     let max_turns = args.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
     if max_turns == 0 {
@@ -405,7 +456,7 @@ fn build_config(args: &Args) -> Result<Config> {
         api_key: req(&args.api_key, "JINGWEI_API_KEY", "--api-key")?,
         base_url: req(&args.base_url, "JINGWEI_BASE_URL", "--base-url")?,
         model: req(&args.model, "JINGWEI_MODEL", "-m/--model")?,
-        protocol, cache, thinking,
+        protocol, cache, thinking, effort,
         max_tokens: args.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         context_size: args.context_size.unwrap_or(DEFAULT_CONTEXT_SIZE),
         max_turns,
@@ -435,6 +486,13 @@ BEHAVIOR:
     --context-size <N>  trim history when estimated tokens exceed N (default 1000000)
     --cache <MODE>      auto (default, passive server cache) | active (Anthropic cache_control)
     --thinking <MODE>   preserve (default) | strip reasoning from sent history
+    --effort <TIER>     low | medium | high | max — reasoning effort, when the
+                        endpoint offers the knob (JINGWEI_EFFORT); unset (default)
+                        sends nothing and the endpoint's default rules.
+                        openai wire: reasoning_effort, passed verbatim (max only
+                        if the endpoint knows it) · anthropic wire: thinking
+                        budget_tokens (low 1024 · medium 8k · high 32k ·
+                        max = max-tokens minus a floor for the reply)
     -s, --stream        stream output token by token (default)
     -S, --no-stream     wait for each turn to finish before printing
     -h, --help          this help
@@ -551,6 +609,23 @@ async fn agent_turn(cfg: &Config, history: &mut Vec<Value>, token: &CancelToken)
 impl Config {
     fn protocol_label(&self) -> &'static str {
         match self.protocol { Protocol::Anthropic => "anthropic", Protocol::OpenAI => "openai" }
+    }
+
+    /// The banner's identity tail: protocol · model [· effort] · base url.
+    /// Effort appears only when set — the banner is where the bar's shed
+    /// order sends identity when the pane narrows.
+    fn identity(&self) -> String {
+        let mut s = format!("{} · {}", self.protocol_label(), self.model);
+        if let Some(e) = self.effort {
+            s.push_str(&format!(" · effort {}", e.label()));
+        }
+        s.push_str(&format!(" · {}", self.base_url));
+        s
+    }
+
+    /// The effort tier's label for the status bar, when one was chosen.
+    fn effort_label(&self) -> Option<&'static str> {
+        self.effort.map(Effort::label)
     }
 }
 
@@ -873,6 +948,9 @@ fn anthropic_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: b
     let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
         "system": system, "tools": tools, "messages": messages});
     body["stream"] = json!(stream);
+    if let Some(e) = cfg.effort {
+        body["thinking"] = json!({"type": "enabled", "budget_tokens": e.budget(cfg.max_tokens)});
+    }
     body
 }
 
@@ -1017,6 +1095,39 @@ fn openai_tools(schemas: &[Value]) -> Value {
         "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}})).collect::<Vec<_>>())
 }
 
+/// The OpenAI request body; `stream` adds the usage-bearing stream options.
+/// Effort, when set, is the wire's own word — the endpoint decides its
+/// vocabulary.
+fn openai_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: bool) -> Value {
+    let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
+        "messages": to_openai_messages(SYSTEM, messages, cfg), "tools": openai_tools(schemas)});
+    if stream {
+        body["stream"] = json!(true);
+        body["stream_options"] = json!({"include_usage": true});
+    }
+    if let Some(e) = cfg.effort {
+        body["reasoning_effort"] = json!(e.label());
+    }
+    body
+}
+
+/// OpenAI usage → internal shape + display usage, in one place so both
+/// consumers stay identical. Normalizes a wire asymmetry: OpenAI's
+/// `prompt_tokens` *includes* `cached_tokens`, while Anthropic's
+/// `input_tokens` excludes cache traffic — so `input` here becomes
+/// "non-cached input", and `context_in()` (input + cache read + write)
+/// reads true on both wires.
+fn openai_usage(u: &Value) -> (Value, Usage) {
+    let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
+    let cached = u["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
+    let fresh = prompt.saturating_sub(cached);
+    (
+        json!({"input_tokens": fresh, "output_tokens": u["completion_tokens"],
+            "cache_read_input_tokens": cached, "cache_creation_input_tokens": 0}),
+        Usage { input: fresh, output: u["completion_tokens"].as_u64().unwrap_or(0), cache_read: cached, cache_write: 0 },
+    )
+}
+
 /// OpenAI response → internal {content, usage} shape.
 fn openai_to_internal(v: &Value) -> Value {
     let msg = &v["choices"][0]["message"];
@@ -1031,17 +1142,13 @@ fn openai_to_internal(v: &Value) -> Value {
         content.push(json!({"type": "tool_use", "id": tc["id"], "name": tc["function"]["name"],
             "input": serde_json::from_str::<Value>(tc["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}))}));
     }
-    let u = &v["usage"];
-    json!({"content": content, "usage": json!({
-        "input_tokens": u["prompt_tokens"], "output_tokens": u["completion_tokens"],
-        "cache_read_input_tokens": u["prompt_tokens_details"]["cached_tokens"],
-        "cache_creation_input_tokens": 0})})
+    let (usage, _) = openai_usage(&v["usage"]);
+    json!({"content": content, "usage": usage})
 }
 
 async fn openai_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
-        "messages": to_openai_messages(SYSTEM, messages, cfg), "tools": openai_tools(schemas)});
+    let body = openai_body(cfg, messages, schemas, false);
     let key = cfg.api_key.clone();
     let v = blocking(token, move || -> Result<Value> {
         let v: Value = post(&key, url, body, false)?.into_json()?;
@@ -1053,9 +1160,7 @@ async fn openai_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], to
 
 async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens, "stream": true,
-        "stream_options": {"include_usage": true},
-        "messages": to_openai_messages(SYSTEM, messages, cfg), "tools": openai_tools(schemas)});
+    let body = openai_body(cfg, messages, schemas, true);
     let key = cfg.api_key.clone();
     let resp = blocking(token, move || post(&key, url, body, false)).await?;
     let (mut text, mut reasoning, mut tool_calls) = (String::new(), String::new(), vec![]);
@@ -1074,15 +1179,9 @@ async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], t
         if data == "[DONE]" { break }
         let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
         if v["usage"].is_object() {
-            usage["input_tokens"] = v["usage"]["prompt_tokens"].clone();
-            usage["output_tokens"] = v["usage"]["completion_tokens"].clone();
-            usage["cache_read_input_tokens"] = v["usage"]["prompt_tokens_details"]["cached_tokens"].clone();
-            disp(Msg::Usage(Usage {
-                input: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-                output: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-                cache_read: v["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
-                cache_write: 0,
-            }));
+            let (internal, shown) = openai_usage(&v["usage"]);
+            usage = internal;
+            disp(Msg::Usage(shown));
         }
         let Some(delta) = v["choices"][0]["delta"].as_object() else { continue };
         let delta = Value::Object(delta.clone());
@@ -1158,6 +1257,7 @@ mod tests {
         Config {
             api_key: "test-key".into(), base_url: base, model: "test-model".into(),
             protocol: Protocol::Anthropic, cache: CacheMode::Auto, thinking: Thinking::Preserve,
+            effort: None,
             max_tokens: 1024, context_size: DEFAULT_CONTEXT_SIZE, max_turns: DEFAULT_MAX_TURNS, streaming,
         }
     }
@@ -1529,9 +1629,61 @@ mod tests {
         assert_eq!(resp["content"][2]["type"], json!("tool_use"));
         assert_eq!(resp["content"][2]["id"], json!("t1"));
         assert_eq!(resp["content"][2]["input"]["command"], json!("echo hi"));
-        assert_eq!(resp["usage"]["input_tokens"], json!(9));
+        // prompt_tokens includes cached_tokens on this wire; the internal
+        // shape normalizes to non-cached input (9 - 2) so context_in()
+        // reads true beside the Anthropic numbers
+        assert_eq!(resp["usage"]["input_tokens"], json!(7));
         assert_eq!(resp["usage"]["output_tokens"], json!(4));
         assert_eq!(resp["usage"]["cache_read_input_tokens"], json!(2));
+    }
+
+    #[test]
+    fn effort_maps_to_the_wires_and_respects_their_rules() {
+        let mut c = cfg("https://x".into(), true);
+
+        // anthropic: thinking budget, clamped under max_tokens
+        c.effort = Some(Effort::Low);
+        let body = anthropic_body(&c, &[], &[], true);
+        assert_eq!(body["thinking"], json!({"type": "enabled", "budget_tokens": 1024}));
+        c.effort = Some(Effort::Max);
+        c.max_tokens = 4096;
+        assert_eq!(anthropic_body(&c, &[], &[], true)["thinking"]["budget_tokens"], json!(3072),
+            "max = everything but a floor for the reply");
+        c.max_tokens = 1024; // degenerate: the floor itself
+        assert_eq!(Effort::High.budget(1024), 1024, "clamped to the wire minimum");
+
+        // openai: the word, verbatim — the endpoint decides its vocabulary
+        c.protocol = Protocol::OpenAI;
+        c.effort = Some(Effort::High);
+        assert_eq!(openai_body(&c, &[], &[], false)["reasoning_effort"], json!("high"));
+
+        // absent: nothing on the wire, byte-identical to before the knob
+        c.effort = None;
+        assert!(openai_body(&c, &[], &[], false).get("reasoning_effort").is_none());
+        assert!(anthropic_body(&c, &[], &[], true).get("thinking").is_none());
+
+        // anthropic + strip: the wire forbids it (thinking continuity)
+        let mut args = Args { effort: Some("high".into()), thinking: Some("strip".into()), ..Default::default() };
+        std::env::remove_var("JINGWEI_EFFORT");
+        std::env::remove_var("JINGWEI_THINKING");
+        assert!(build_config(&args).is_err(), "effort + strip on anthropic is rejected");
+        args.protocol = Some("openai".into());
+        // the openai wire has no thinking-continuity rule; but the rest of
+        // the config is incomplete here, so only probe the guard itself
+        let probe = |p: Protocol| {
+            let mut a = Args { effort: Some("high".into()), thinking: Some("strip".into()),
+                protocol: Some(if p == Protocol::OpenAI { "openai".into() } else { "anthropic".into() }),
+                ..Default::default() };
+            a.api_key = Some("k".into()); a.base_url = Some("https://x".into()); a.model = Some("m".into());
+            build_config(&a)
+        };
+        assert!(probe(Protocol::Anthropic).is_err());
+        assert!(probe(Protocol::OpenAI).is_ok(), "the openai wire keeps strip + effort");
+        // the env var spells it too
+        std::env::set_var("JINGWEI_EFFORT", "max");
+        let a = Args { api_key: Some("k".into()), base_url: Some("https://x".into()), model: Some("m".into()), ..Default::default() };
+        assert_eq!(build_config(&a).unwrap().effort, Some(Effort::Max));
+        std::env::remove_var("JINGWEI_EFFORT");
     }
 
     #[test]

@@ -23,6 +23,7 @@ export JINGWEI_MODEL=...
 export JINGWEI_PROTOCOL=anthropic    # or openai
 export JINGWEI_CACHE=auto            # or active (anthropic protocol only)
 export JINGWEI_THINKING=preserve     # or strip
+export JINGWEI_EFFORT=high           # low | medium | high | max — reasoning effort knob
 export NO_COLOR=1                    # disable colors, both frontends (JINGWEI_NO_COLOR too)
 export JINGWEI_COLOR=always          # force colors on (e.g. through a pipe into a pager)
 ```
@@ -73,9 +74,13 @@ context.
 
 The interactive UI is an inline TUI (crossterm, with ratatui only for the
 review overlay) that owns a small framed pane — separator rules above and
-below the input row, a live status bar underneath (spinner, elapsed,
-per-turn and session token usage, cache traffic) — at the bottom of the
-screen you already had. Everything above is the terminal's own scrollback:
+below the input row, a live status bar underneath — at the bottom of the
+screen you already had. The bar has two zones: state on the left (spinner,
+elapsed, `#request/max-turns` — glanced every few seconds, never shed),
+ledger on the right (model, effort tier, session token totals, cache hit
+rate, `ctx used/--context-size` — checked occasionally, shed in that
+reverse order as the pane narrows; the totals are pinned). Everything
+above is the terminal's own scrollback:
 finished lines are appended to it, so the mouse wheel, text selection, and
 whatever was on screen before jingwei started keep working; there is no
 alternate screen and no mouse capture while the REPL runs. The editor is
@@ -128,6 +133,7 @@ gate (`NO_COLOR` honored everywhere; `JINGWEI_COLOR=always` forces it on).
 | Knob | Layer | What it controls |
 | --- | --- | --- |
 | `--thinking preserve\|strip` | client policy | whether reasoning blocks from earlier turns stay in the history you send back |
+| `--effort low\|medium\|high\|max` | request | reasoning effort, when the endpoint offers the knob: `reasoning_effort` on the openai wire (verbatim — the endpoint decides its vocabulary), a `thinking.budget_tokens` tier on the anthropic wire (low 1024 · medium 8k · high 32k · max = max-tokens minus a floor for the reply). Unset sends nothing — the endpoint's default rules |
 | `--cache auto\|active` | cost/latency | `auto`: rely on the server's passive cache. `active`: mark Anthropic `cache_control` breakpoints (system + last tool) — anthropic protocol only |
 | interleaved thinking | model capability | whether the model can reason between tool calls within a turn — not a client switch; jingwei just keeps turn structure intact so it can happen |
 

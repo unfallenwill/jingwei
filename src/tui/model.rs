@@ -108,15 +108,36 @@ fn floor_boundary(text: &str, i: usize) -> usize {
     i
 }
 
-/// The status bar's state. `elapsed` accumulates measured tick deltas.
+/// The status bar's state. `elapsed` accumulates measured tick deltas;
+/// `turns` counts finished API requests (one `Done` each) — the step
+/// number the bar shows against `Info::max_turns`.
 #[derive(Clone, Debug)]
 pub struct Status {
     /// Mirrors the last `Row::Task` — both are written together, in
     /// `TaskBegin`, and nowhere else.
     pub task: Option<Task>,
+    /// Usage of the latest request (live while it streams). Also the
+    /// bar's context reading: what the model just read is the best
+    /// estimate of what the next request will carry.
     pub turn: Usage,
     pub total: Usage,
     pub spin: usize,
+    pub turns: u32,
+}
+
+/// Session facts the bar renders but events never change: who is being
+/// talked to and what the limits are. Set once by the frontend (which
+/// owns the config); defaults are "unknown", and every segment keyed on
+/// them simply does not appear.
+#[derive(Clone, Debug, Default)]
+pub struct Info {
+    pub model: String,
+    /// The effort tier's label, when `--effort` was given.
+    pub effort: Option<String>,
+    /// `--context-size`; 0 = unknown → no ctx gauge.
+    pub context_limit: u64,
+    /// `--max-turns`; 0 = unknown → no step counter.
+    pub max_turns: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +206,8 @@ pub struct App {
     think_start: Option<Duration>,
     pub input: Input,
     pub status: Status,
+    /// Static session facts for the bar (see [`Info`]).
+    pub info: Info,
     /// Ctrl-C was sent to the running agent; a second one exits.
     pub cancel_sent: bool,
     pub quit: bool,
@@ -202,7 +225,8 @@ impl App {
             think_buf: String::new(),
             think_start: None,
             input: Input::default(),
-            status: Status { task: None, turn: Usage::default(), total: Usage::default(), spin: 0 },
+            status: Status { task: None, turn: Usage::default(), total: Usage::default(), spin: 0, turns: 0 },
+            info: Info::default(),
             cancel_sent: false,
             quit: false,
             scroll: Scroll::Tail,
