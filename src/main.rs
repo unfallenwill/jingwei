@@ -1269,6 +1269,13 @@ async fn minimax_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], 
             }
             Some("message_delta") => {
                 merge_usage(&mut usage, v["usage"].as_object());
+                // This wire's real ledger lands here — message_start opens
+                // all-zero, and input/cache arrive only in this final event
+                // (probe-verified) — so the display port hears it too:
+                // Usage replaces the live turn's counters wholesale, which
+                // lands ctx and cache% on the bar before Done folds the
+                // turn into the session totals.
+                disp(Msg::Usage(Usage::from_value(&usage)));
                 if let Some(n) = v["usage"]["output_tokens"].as_u64() {
                     disp(Msg::OutTokens(n)); // output count ticks while text flows
                 }
