@@ -13,6 +13,7 @@
 
 use serde_json::Value;
 use std::env;
+use std::time::Duration;
 use std::io::{self, IsTerminal};
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::mpsc::UnboundedSender;
@@ -119,6 +120,11 @@ pub fn prompt_w() -> usize {
     disp_width(PROMPT_HEAD) + disp_width(PROMPT_GUTTER)
 }
 
+/// The gutter a fold's body hangs from — `│ ` — shared by both frontends
+/// so the block's visual grouping reads the same in the log and the TUI.
+/// Structural, not chromatic: it survives NO_COLOR and DIM-blind terminals.
+pub const FOLD_GUTTER: &str = "│ ";
+
 /// Backgrounds for short, high-attention signals. Warn is honey, Err is red.
 pub const WARN_BG: (u8, u8, u8) = (255, 220, 100);
 pub const ERR_BG: (u8, u8, u8) = (198, 40, 40);
@@ -135,11 +141,25 @@ pub fn paint(s: &str, bg: (u8, u8, u8), white: bool) -> String {
     }
 }
 
-/// The one-line marker a folded (or unfolded) reasoning block shows, in
-/// both frontends: `▸ thought #3 · 14 lines`. The glyph is the fold's
-/// state — `▸` closed, `▾` open — so callers never string-surgery it.
-pub fn thought_marker(glyph: &str, n: usize, lines: usize) -> String {
-    format!("{glyph} thought #{n} · {lines} lines")
+/// The one-line marker a *folded* reasoning block shows — the one form
+/// both frontends render: `▸ thought #3 · checking Cargo.toml first … +13`.
+/// Content beats counts for the expand-or-skip decision, so the collapsed
+/// marker previews the block's first line and names how much is hidden
+/// behind it. The state glyph lives here, not in the caller.
+pub fn thought_folded(n: usize, first: &str, more: usize) -> String {
+    let first = first.trim();
+    match (first.is_empty(), more) {
+        (true, _) => format!("▸ thought #{n}"),
+        (false, 0) => format!("▸ thought #{n} · {first}"),
+        (false, m) => format!("▸ thought #{n} · {first} … +{m}"),
+    }
+}
+
+/// Elapsed time, the way both the status bar and the fold markers read it:
+/// `3s`, then `1m03s`. A shared vocabulary word, not two spellings.
+pub fn elapsed_str(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 { format!("{s}s") } else { format!("{}m{:02}s", s / 60, s % 60) }
 }
 
 /// Should we color at all? Honors `NO_COLOR`/`JINGWEI_NO_COLOR`, requires a
@@ -177,6 +197,29 @@ pub fn truncate_cols(s: &str, max: usize) -> String {
         out.push_str(g);
         w += gw;
     }
+    out
+}
+
+/// Wrap to `max` display columns, grapheme-greedy: every chunk fits, no
+/// ellipsis — the review mode's ruler, where reading the whole line beats
+/// keeping the row count. Empty input yields one empty chunk, so a wrapped
+/// line never loses its row.
+pub fn wrap_cols(s: &str, max: usize) -> Vec<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let max = max.max(1);
+    let mut out = vec![];
+    let mut cur = String::new();
+    let mut w = 0;
+    for g in s.graphemes(true) {
+        let gw = disp_width(g).max(1);
+        if w + gw > max && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            w = 0;
+        }
+        cur.push_str(g);
+        w += gw;
+    }
+    out.push(cur);
     out
 }
 
@@ -218,6 +261,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn thought_folded_previews_content_and_counts_the_hidden() {
+        assert_eq!(thought_folded(1, "half a thought", 0), "▸ thought #1 · half a thought");
+        assert_eq!(thought_folded(3, "step one", 13), "▸ thought #3 · step one … +13");
+        // an empty first line previews nothing rather than a dangling dot
+        assert_eq!(thought_folded(2, "  ", 4), "▸ thought #2");
+    }
+
+    #[test]
+    fn elapsed_str_reads_clock_like_a_person() {
+        assert_eq!(elapsed_str(Duration::from_secs(3)), "3s");
+        assert_eq!(elapsed_str(Duration::from_secs(59)), "59s");
+        assert_eq!(elapsed_str(Duration::from_secs(63)), "1m03s");
+    }
+
+    #[test]
     fn prompt_w_matches_the_strings_it_is_derived_from() {
         assert_eq!(prompt_w(), disp_width(&format!("{PROMPT_HEAD}{PROMPT_GUTTER}")));
     }
@@ -229,6 +287,21 @@ mod tests {
         let long = "x".repeat(80);
         let t = truncate_cols(&long, 60);
         assert!(t.ends_with('…') && t.chars().count() == 59, "cut to ~60 columns: {t}");
+    }
+
+    #[test]
+    fn wrap_cols_fits_every_chunk_and_keeps_empty_rows() {
+        assert_eq!(wrap_cols("", 10), vec!["".to_string()], "an empty line keeps its row");
+        assert_eq!(wrap_cols("ab", 10), vec!["ab".to_string()]);
+        assert_eq!(wrap_cols("abcd", 2), vec!["ab".to_string(), "cd".to_string()]);
+        // wide chars never split across chunks
+        let chunks = wrap_cols("精卫填海", 4);
+        assert_eq!(chunks, vec!["精卫".to_string(), "填海".to_string()]);
+        // every chunk fits, nothing is lost, and the join is the original
+        let long = format!("{} 精卫 {}", "x".repeat(37), "y".repeat(41));
+        let chunks = wrap_cols(&long, 20);
+        assert!(chunks.iter().all(|c| disp_width(c) <= 20), "{chunks:?}");
+        assert_eq!(chunks.concat(), long);
     }
 
     #[test]

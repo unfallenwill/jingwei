@@ -60,7 +60,7 @@ impl Plain {
                     lines.push((Stream::Out, format!("│ {l}")));
                 }
                 if all.len() > shown {
-                    lines.push((Stream::Out, format!("… +{} more lines", all.len() - shown)));
+                    lines.push((Stream::Out, format!("{}… +{} more lines", display::FOLD_GUTTER, all.len() - shown)));
                 }
             }
             // both severities ride stderr: notes are asides to the answer,
@@ -106,8 +106,9 @@ impl Plain {
         }
         let text = std::mem::take(&mut self.think);
         self.thoughts += 1;
-        let n = text.lines().count().max(1);
-        lines.push((Stream::Out, display::thought_marker("▸", self.thoughts, n)));
+        let mut all = text.lines();
+        let first = all.next().unwrap_or("");
+        lines.push((Stream::Out, display::thought_folded(self.thoughts, first, all.count())));
     }
 }
 
@@ -184,7 +185,7 @@ mod tests {
         let texts: Vec<String> = out.iter().map(|(_, l)| l.clone()).collect();
         assert_eq!(texts, vec![
             format!("{}{}count files", display::PROMPT_HEAD, display::PROMPT_GUTTER),
-            "▸ thought #1 · 2 lines".to_string(),
+            "▸ thought #1 · step one … +1".to_string(),
             "there are 3 files".to_string(),
         ]);
         assert!(out.iter().all(|(s, _)| *s == Stream::Out), "no stderr in a clean run");
@@ -229,14 +230,14 @@ mod tests {
         assert_eq!(out.len(), 1 + 20 + 1);
         assert_eq!(out[0].1, "[bash] $ seq 1 30");
         assert_eq!(out[1].1, "│ 1");
-        assert_eq!(out.last().unwrap().1, "… +10 more lines");
+        assert_eq!(out.last().unwrap().1, "│ … +10 more lines");
     }
 
     #[test]
     fn interrupted_thinking_still_folds_on_done() {
         let out = run(vec![Msg::Think("half a thought".into()), Msg::Done]);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].1, "▸ thought #1 · 1 lines");
+        assert_eq!(out[0].1, "▸ thought #1 · half a thought");
     }
 
     #[test]

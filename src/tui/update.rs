@@ -74,7 +74,7 @@ fn msg(app: &mut App, m: Msg) -> Action {
             app.rows.push(Row::Sep);
         }
         Msg::Text(t) => app.push_text(&t),
-        Msg::Think(t) => app.think_buf.push_str(&t),
+        Msg::Think(t) => app.push_think(&t),
         Msg::ThinkEnd => app.fold_thought(),
         Msg::Tool { name, summary, output } => {
             app.fold_tool(format!("[{name}] {summary}"), output);
@@ -536,6 +536,27 @@ mod tests {
     }
 
     // ---- messages ----
+
+    #[test]
+    fn thought_duration_is_measured_between_first_delta_and_fold() {
+        let mut a = App::new();
+        drive(&mut a, vec![Ev::Msg(Msg::TaskBegin("t".into()))]);
+        drive(&mut a, vec![Ev::Tick(TICK * 2)]); // thinking has not started yet
+        drive(&mut a, vec![Ev::Msg(Msg::Think("l1".into()))]);
+        drive(&mut a, vec![Ev::Tick(TICK), Ev::Tick(TICK * 9)]);
+        drive(&mut a, vec![Ev::Msg(Msg::ThinkEnd)]);
+        match a.rows.last() {
+            Some(Row::Thought(f)) => assert_eq!(f.duration, Some(TICK * 10), "anchored at the first delta"),
+            r => panic!("thought folded: {r:?}"),
+        }
+        // outside a task there is no clock to read — no duration claimed
+        let mut b = App::new();
+        drive(&mut b, vec![Ev::Msg(Msg::Think("musing".into())), Ev::Msg(Msg::ThinkEnd)]);
+        match b.rows.last() {
+            Some(Row::Thought(f)) => assert_eq!(f.duration, None),
+            r => panic!("thought folded: {r:?}"),
+        }
+    }
 
     #[test]
     fn streamed_text_lands_lines_and_keeps_partial_live() {

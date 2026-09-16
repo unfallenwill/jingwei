@@ -25,19 +25,11 @@ pub enum Mode {
     Browse,
 }
 
-/// Which kind of block a [`Fold`] holds — decides the marker's wording and
-/// how the collapsed preview reads. An enum, not a string: the render path
-/// matches on it, and a mismatch with the row carrying the fold is now a
-/// type error instead of a silent wrong rendering.
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
-pub enum FoldKind {
-    Thought,
-    Tool,
-}
-
 /// One transcript row. A row that folds *owns* its fold — no index into a
 /// side table, so a fold can never be lost, duplicated, or rendered with
-/// the wrong kind.
+/// the wrong kind. What kind of fold a row carries *is* the variant:
+/// `Thought` holds reasoning, `Tool` a head line plus an output tail —
+/// there is no second copy of that fact inside `Fold` to disagree with it.
 #[derive(Clone, Debug)]
 pub enum Row {
     /// The echoed task this run is working on.
@@ -56,15 +48,19 @@ pub enum Row {
 }
 
 /// A foldable block. `expanded` only ever flips false → true: Ctrl-O opens
-/// everything, and what has been open stays open.
+/// everything, and what has been open stays open. The kind of block this is
+/// lives in the [`Row`] variant carrying it, never here.
 #[derive(Clone, Debug)]
 pub struct Fold {
     /// 1-based number among folds of the same kind (thought #3).
     pub n: usize,
-    pub kind: FoldKind,
     /// The full body, kept verbatim.
     pub body: String,
     pub expanded: bool,
+    /// How long the model spent inside this block — measured from the
+    /// ticks that elapsed between the first delta and the fold. `None`
+    /// when no task was running to keep time.
+    pub duration: Option<Duration>,
 }
 
 impl Fold {
@@ -183,6 +179,10 @@ pub struct App {
     pub partial: String,
     /// Reasoning arriving now, folded away until `ThinkEnd`.
     pub think_buf: String,
+    /// The task clock's reading when the current reasoning block opened —
+    /// the anchor `duration` is measured against. Set by the first delta
+    /// of a block, taken by the fold that closes it.
+    think_start: Option<Duration>,
     pub input: Input,
     pub status: Status,
     /// Ctrl-C was sent to the running agent; a second one exits.
@@ -200,6 +200,7 @@ impl App {
             rows: vec![],
             partial: String::new(),
             think_buf: String::new(),
+            think_start: None,
             input: Input::default(),
             status: Status { task: None, turn: Usage::default(), total: Usage::default(), spin: 0 },
             cancel_sent: false,
@@ -229,17 +230,32 @@ impl App {
         }
     }
 
-    /// 1-based count of folds of one kind already in the transcript.
-    fn nth_of_kind(&self, kind: FoldKind) -> usize {
-        self.rows
-            .iter()
-            .filter(|r| match r {
-                Row::Thought(f) => f.kind == kind,
-                Row::Tool { fold, .. } => fold.kind == kind,
-                _ => false,
-            })
-            .count()
-            + 1
+    /// Reasoning delta in; the first delta of a block anchors the clock.
+    pub fn push_think(&mut self, t: &str) {
+        if self.think_buf.is_empty() {
+            self.think_start = self.status.task.as_ref().map(|t| t.elapsed);
+        }
+        self.think_buf.push_str(t);
+    }
+
+    /// How long the in-flight reasoning block has been running, against
+    /// the same task clock [`Fold::duration`] is measured with.
+    pub fn thinking_for(&self) -> Option<Duration> {
+        match (self.think_start, self.status.task.as_ref()) {
+            (Some(start), Some(t)) if t.elapsed >= start => Some(t.elapsed - start),
+            _ => None,
+        }
+    }
+
+    /// 1-based number the next fold of one kind will carry — counted over
+    /// the rows themselves, so it can never drift from what was rendered.
+    /// Also the number the *live* reasoning block previews.
+    pub fn next_thought_n(&self) -> usize {
+        self.rows.iter().filter(|r| matches!(r, Row::Thought(_))).count() + 1
+    }
+
+    fn next_tool_n(&self) -> usize {
+        self.rows.iter().filter(|r| matches!(r, Row::Tool { .. })).count() + 1
     }
 
     /// Fold the reasoning accumulated so far into a marker row. Interrupted
@@ -250,16 +266,20 @@ impl App {
         }
         self.flush_partial();
         let body = std::mem::take(&mut self.think_buf);
-        let n = self.nth_of_kind(FoldKind::Thought);
-        self.rows.push(Row::Thought(Fold { n, kind: FoldKind::Thought, body, expanded: false }));
+        let n = self.next_thought_n();
+        let duration = match (self.think_start.take(), self.status.task.as_ref()) {
+            (Some(start), Some(t)) if t.elapsed >= start => Some(t.elapsed - start),
+            _ => None,
+        };
+        self.rows.push(Row::Thought(Fold { n, body, expanded: false, duration }));
     }
 
     /// Fold a tool call's output into a header row plus a tail.
     pub fn fold_tool(&mut self, head: String, output: String) {
         self.flush_partial();
         self.fold_thought();
-        let n = self.nth_of_kind(FoldKind::Tool);
-        self.rows.push(Row::Tool { head, fold: Fold { n, kind: FoldKind::Tool, body: output, expanded: false } });
+        let n = self.next_tool_n();
+        self.rows.push(Row::Tool { head, fold: Fold { n, body: output, expanded: false, duration: None } });
     }
 
     /// Ctrl-O's ratchet: open every fold that is still closed.

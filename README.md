@@ -86,13 +86,20 @@ clears the input line for the next task; Up recalls the last one. Pipes,
 one-shot runs, and `JINGWEI_NO_TUI=1` get the plain line-oriented log
 instead.
 
-Reasoning arrives folded: each thinking block lands as one dim marker line
-(`▸ thought #3 · 14 lines`) instead of a wall of text. **Ctrl-O unfolds
-everything** — thoughts and tool-output tails alike — into a scrollable
-full-screen review (the one place an alternate screen is used, and only
-while it is open); Ctrl-O again returns to the prompt, and what has been
-unfolded never refolds. There are no display switches: folding is simply
-how reasoning is shown, in the TUI and in the plain log alike.
+Reasoning arrives *live and folded*: while a block streams, the pane shows
+it as it arrives (`◌ thought #2 · 4 lines · 12s` plus its moving tail) — a
+spinner alone cannot tell "thinking" from "hung". When it closes, it lands
+as one dim marker that previews its first line (`▸ thought #3 · checking
+Cargo.toml … +13`) instead of a wall of text. **Ctrl-O unfolds everything**
+— thoughts and tool-output tails alike — into a scrollable full-screen
+review (the one place an alternate screen is used, and only while it is
+open); Ctrl-O again returns to the prompt, and what has been unfolded never
+refolds. Folded bodies hang from a `│` gutter — structure, not color, so
+the hierarchy survives NO_COLOR and DIM-blind terminals — and the review
+mode wraps where the scrollback truncates: what is flushed is immutable and
+renders once, what is reviewed re-renders every frame and owes the reader
+the whole line. There are no display switches: folding is simply how
+reasoning is shown, in the TUI and in the plain log alike.
 
 ## Architecture
 
