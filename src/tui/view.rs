@@ -38,15 +38,15 @@ fn humanize(n: u64) -> String {
     else { format!("{:.1}M", n as f64 / 1_000_000.0) }
 }
 
-/// Session cache hit rate: of everything the model has read, the share
-/// that came from cache. `None` until cache traffic exists — an endpoint
-/// that never caches would otherwise carry a permanent "0%", which is
-/// noise; the first write (cache being built, nothing hit yet) does count,
-/// because "0%" then is the truth and the change.
-fn cache_pct(total: &Usage) -> Option<u64> {
+/// Session cache hit rate, to two decimals: of everything the model has
+/// read, the share that came from cache. `None` until cache traffic exists
+/// — an endpoint that never caches would otherwise carry a permanent
+/// "0.00%", which is noise; the first write (cache being built, nothing hit
+/// yet) does count, because "0.00%" then is the truth and the change.
+fn cache_pct(total: &Usage) -> Option<f64> {
     let read = total.context_in();
     (read > 0 && (total.cache_read > 0 || total.cache_write > 0))
-        .then(|| total.cache_read * 100 / read)
+        .then(|| total.cache_read as f64 * 100.0 / read as f64)
 }
 
 /// The status bar's text within `max_w` display columns: the session's
@@ -95,7 +95,7 @@ fn bar_segs(app: &App) -> Vec<Seg> {
     if !i.model.is_empty() { right.push(Seg { content: i.model.clone(), pinned: false }); }
     if let Some(e) = &i.effort { right.push(Seg { content: format!("effort {e}"), pinned: false }); }
     if let Some(p) = cache_pct(&st.total) {
-        right.push(Seg { content: format!("cache {p}%"), pinned: false });
+        right.push(Seg { content: format!("cache {p:.2}%"), pinned: false });
     }
     if i.context_limit > 0 && st.turn.context_in() > 0 {
         right.push(Seg { content: format!("ctx {}/{}", humanize(st.turn.context_in()), humanize(i.context_limit)), pinned: false });
@@ -633,14 +633,14 @@ mod tests {
         informed(&mut a);
         assert_eq!(bar_text(&a, BAR_W), format!("{}MiniMax-M3 · effort high", " ".repeat(BAR_W - disp_width("MiniMax-M3 · effort high"))));
         // traffic without cache: still no cache segment (a permanent
-        // "cache 0%" on non-caching endpoints is noise) — and the session
+        // "cache 0.00%" on non-caching endpoints is noise) — and the session
         // totals are not bar material at all
         a.status.total = Usage { input: 4600, output: 336, ..Usage::default() };
         assert!(!bar_text(&a, BAR_W).contains("cache"), "{}", bar_text(&a, BAR_W));
         assert!(!bar_text(&a, BAR_W).contains("total"), "{}", bar_text(&a, BAR_W));
         a.status.total = Usage { input: 26_156, output: 336, cache_read: 25_344, cache_write: 1188 };
         let bar = bar_text(&a, BAR_W);
-        assert!(bar.contains("cache 48%"), "25344/(26156+25344+1188) ≈ 48: {bar}");
+        assert!(bar.contains("cache 48.10%"), "25344/(26156+25344+1188) = 48.10%: {bar}");
         assert!(!bar.contains("total"), "session totals left the bar: {bar}");
         // a finished request sizes the next one: the ctx gauge reads the
         // last request's context against the limit
@@ -658,13 +658,13 @@ mod tests {
         // wide: everything, flush right
         let wide = bar_text(&a, 120);
         assert!(wide.contains("MiniMax-M3") && wide.contains("effort high")
-            && wide.contains("cache 30%") && wide.contains("ctx 45.0k/1.0M"), "{wide}");
+            && wide.contains("cache 30.77%") && wide.contains("ctx 45.0k/1.0M"), "{wide}");
         assert!(wide.starts_with(' '), "flush right: {wide}");
 
         // narrower: identity sheds first — the banner already said it
         let mid = bar_text(&a, 50);
         assert!(!mid.contains("MiniMax-M3"), "model shed: {mid}");
-        assert!(mid.contains("effort high") && mid.contains("cache 30%")
+        assert!(mid.contains("effort high") && mid.contains("cache 30.77%")
             && mid.contains("ctx 45.0k/1.0M"), "{mid}");
 
         // narrower still: effort, then the cache rate — the ctx gauge is
@@ -672,7 +672,7 @@ mod tests {
         // you do next
         let tighter = bar_text(&a, 35);
         assert!(!tighter.contains("effort"), "effort sheds next: {tighter}");
-        assert!(tighter.contains("cache 30%") && tighter.contains("ctx"), "{tighter}");
+        assert!(tighter.contains("cache 30.77%") && tighter.contains("ctx"), "{tighter}");
         let tight = bar_text(&a, 20);
         assert!(!tight.contains("cache"), "cache sheds before ctx: {tight}");
         assert!(tight.contains("ctx 45.0k/1.0M"), "{tight}");
