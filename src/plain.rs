@@ -3,7 +3,7 @@
 //! `JINGWEI_NO_TUI=1`). The TUI's sibling — same port, same vocabulary
 //! (`crate::display`), none of the terminal machinery.
 
-use crate::display::{self, disp, Msg, Sev};
+use crate::display::{self, Msg, Sev, Show};
 use std::io::{IsTerminal, Write};
 
 /// Where a rendered plain line goes.
@@ -112,6 +112,35 @@ impl Plain {
     }
 }
 
+/// The plain frontend's sink: fold each message and write the finished lines
+/// (stdout for the answer, stderr for notes). The fold is pure ([`Plain`]);
+/// the write is the sink's, so the agent coroutine and the shell share one
+/// handle (`&self`) — the `Mutex` is that sharing, not logic.
+pub struct PlainSink(std::sync::Mutex<Plain>);
+
+impl PlainSink {
+    pub fn new() -> Self {
+        Self(std::sync::Mutex::new(Plain::new()))
+    }
+}
+
+impl Default for PlainSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Show for PlainSink {
+    fn show(&self, m: Msg) {
+        for (stream, line) in self.0.lock().unwrap().feed(m) {
+            match stream {
+                Stream::Out => println!("{line}"),
+                Stream::Err => eprintln!("{line}"),
+            }
+        }
+    }
+}
+
 /// Drive the plain REPL: read lines, run the agent, print via the port.
 /// Used when stdout is not a terminal (pipes, one-shot runs) or when
 /// `JINGWEI_NO_TUI` asks for the log form.
@@ -124,11 +153,12 @@ pub async fn plain_repl(
     banners: Vec<String>,
 ) -> crate::Result<()> {
     use crate::{agent_turn, CancelToken};
+    let sink = PlainSink::new();
     let tty = std::io::stdin().is_terminal();
-    display::disp(Msg::Banner("jingwei — 精卫填海，一石一石 · type a task, /exit or Ctrl-D rests, Ctrl-C interrupts".into()));
-    disp(Msg::Banner(cfg.identity()));
+    sink.show(Msg::Banner("jingwei — 精卫填海，一石一石 · type a task, /exit or Ctrl-D rests, Ctrl-C interrupts".into()));
+    sink.show(Msg::Banner(cfg.identity()));
     for b in banners {
-        disp(Msg::Banner(b));
+        sink.show(Msg::Banner(b));
     }
     let stdin = std::io::stdin();
     loop {
@@ -142,7 +172,7 @@ pub async fn plain_repl(
             Ok(_) => {}
             // bad bytes on stdin: warn and carry on
             Err(e) => {
-                disp(Msg::Note { sev: Sev::Warn, text: format!("warning: input ({e})") });
+                sink.show(Msg::Note { sev: Sev::Warn, text: format!("warning: input ({e})") });
                 continue;
             }
         }
@@ -157,16 +187,16 @@ pub async fn plain_repl(
             break;
         }
         convo.history.push(crate::user_message(&line));
-        convo.persist(); // the task is on disk before the first stone moves
-        disp(Msg::TaskBegin(line));
+        convo.persist(&sink); // the task is on disk before the first stone moves
+        sink.show(Msg::TaskBegin(line));
         let token = CancelToken::new();
-        match agent_turn(cfg, &mut convo.history, &token).await {
+        match agent_turn(cfg, &mut convo.history, &token, &sink).await {
             Err(crate::Error::Interrupted) => {}
-            Err(e) => disp(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
+            Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
             Ok(()) => {}
         }
-        convo.persist(); // run boundary: the file never ends mid-run
-        disp(Msg::TaskEnd);
+        convo.persist(&sink); // run boundary: the file never ends mid-run
+        sink.show(Msg::TaskEnd);
     }
     Ok(())
 }

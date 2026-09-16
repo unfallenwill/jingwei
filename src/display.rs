@@ -1,21 +1,18 @@
 //! The display port: the agent core never touches a terminal. It emits
-//! [`Msg`]s through [`disp`], and a *frontend* interprets them — the plain
-//! frontend (`crate::plain`) folds them into a log, the TUI (`crate::tui`)
-//! folds them into application state.
-//!
-//! This module is only the contract: the message type, the usage shape it
-//! carries, and the small vocabulary both frontends render with (the
-//! prompt, the thought marker, measurement). No frontend lives here — the
-//! default plain instance is constructed by `disp` on demand, nothing else.
-//!
-//! With no frontend installed, `disp` routes to a default plain instance —
-//! agent-core tests exercise the protocols without driving any UI.
+//! [`Msg`]s through a [`Show`] sink, and a *frontend* interprets them — the
+//! plain frontend (`crate::plain`) folds them into a log, the TUI
+//! (`crate::tui`) folds them into application state, and a remote adapter (a
+//! web socket, say) would ship them as JSON to a browser. No frontend lives
+//! here: the port is the contract ([`Msg`], [`Usage`], the [`Show`] trait)
+//! plus the small rendering vocabulary the terminal frontends share. Nothing
+//! imports a concrete frontend; there is no process-global sink — the
+//! composition root hands the core whichever frontend owns this run's
+//! transport.
 
 use serde_json::Value;
 use std::env;
 use std::time::Duration;
 use std::io::{self, IsTerminal};
-use std::sync::{Mutex, OnceLock};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Severity of a note row (warnings scroll with the transcript).
@@ -233,35 +230,35 @@ pub fn wrap_cols(s: &str, max: usize) -> Vec<String> {
 }
 
 /// The installed frontend. TUI installs a channel; plain is the default.
-static FRONT: OnceLock<Front> = OnceLock::new();
-
-enum Front {
-    Chan(UnboundedSender<Msg>),
-    Plain(Mutex<crate::plain::Plain>),
+/// The display port's sink — the one thing the agent core knows about a
+/// frontend. `&self` so one handle serves the coroutine and the shell at
+/// once; `Send + Sync` so the same shape carries a terminal, a pipe, and (one
+/// day) a web socket. The core is handed a `&dyn Show` and never learns
+/// which one — the frontend is a detail the composition root plugs in.
+pub trait Show: Send + Sync {
+    /// Show one message. Infallible and quiet by contract: a dropped receiver
+    /// (or a frontend that stopped listening) must never take the agent down
+    /// — the sea does not care whether anyone is watching.
+    fn show(&self, m: Msg);
 }
 
-/// Install the TUI frontend: messages flow to its event loop.
-pub fn install_chan(tx: UnboundedSender<Msg>) {
-    let _ = FRONT.set(Front::Chan(tx));
+/// The common sink: hand each message to a channel another task drains. The
+/// terminal TUI and any remote frontend (a web socket, say) work this way —
+/// the adapter owns the receiver and the transport, the core owns neither.
+/// `Clone`, so a frontend can hand one copy to a spawned agent task and keep
+/// another for itself.
+#[derive(Clone)]
+pub struct ChannelSink(UnboundedSender<Msg>);
+
+impl ChannelSink {
+    pub fn new(tx: UnboundedSender<Msg>) -> Self {
+        Self(tx)
+    }
 }
 
-/// Route one message to the installed frontend. Infallible and quiet: a
-/// dropped TUI receiver (or no frontend at all) must never take the agent
-/// down — the sea does not care whether anyone is watching.
-pub fn disp(m: Msg) {
-    match FRONT.get_or_init(|| Front::Plain(Mutex::new(crate::plain::Plain::new()))) {
-        Front::Chan(tx) => {
-            let _ = tx.send(m);
-        }
-        Front::Plain(p) => {
-            let mut p = p.lock().unwrap();
-            for (stream, line) in p.feed(m) {
-                match stream {
-                    crate::plain::Stream::Out => println!("{line}"),
-                    crate::plain::Stream::Err => eprintln!("{line}"),
-                }
-            }
-        }
+impl Show for ChannelSink {
+    fn show(&self, m: Msg) {
+        let _ = self.0.send(m);
     }
 }
 

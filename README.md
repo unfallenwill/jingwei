@@ -88,12 +88,11 @@ below the input row, a live status bar underneath — at the bottom of the
 screen you already had. The bar is the session's ledger, flush right
 (model, effort tier, cache hit rate, `ctx used/--context-size` — checked
 occasionally, shed in that reverse order as the pane narrows). While a
-task runs the pane only ever grows — and when a reasoning block folds,
-its tail *lingers* where it streamed (`▸ thought #33 · 12 lines · 34s`
-over its last lines, the folded glyph marking record rather than motion),
-so the status bar never walks between rows, nothing blank opens under the
-bar when a task ends, and the pane holds its height into the next task
-until new thinking arrives. Everything
+task runs the pane only ever grows, and when a reasoning block folds the
+rows it held become blank reserve — so the status bar never walks between
+rows and nothing opens under the bar as thoughts fold and restream. The
+reserve is blank, never the folded reasoning: only a live, streaming block
+is ever drawn above the input. Everything
 above is the terminal's own scrollback:
 finished lines are appended to it, so the mouse wheel, text selection, and
 whatever was on screen before jingwei started keep working; there is no
@@ -165,9 +164,15 @@ port (`src/display.rs`), and a frontend interprets them —
   dumb line reader that drives it.
 
 The port module is only the contract: the `Msg` type (with its documented
-ordering), the usage shape it carries, and the vocabulary both frontends
-render with — the prompt, the thought marker, width measurement, the color
-gate (`NO_COLOR` honored everywhere; `JINGWEI_COLOR=always` forces it on).
+ordering), the usage shape it carries, the `Show` sink the core emits
+through, and the vocabulary both frontends render with — the prompt, the
+thought marker, width measurement, the color gate (`NO_COLOR` honored
+everywhere; `JINGWEI_COLOR=always` forces it on). The core is handed a
+`&dyn Show` and never learns which frontend is listening — there is no
+process-global sink, so a run's frontend is a detail the composition root
+plugs in: the terminal TUI, the plain log, or (one day) a web socket that
+ships the same `Msg`s as JSON. The port imports no frontend; the frontends
+import the port.
 
 Providers sit behind a port of their own. The core speaks one internal
 history and asks the composition root which wire to hand it to; each wire

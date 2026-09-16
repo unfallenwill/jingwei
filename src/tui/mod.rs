@@ -38,7 +38,7 @@ pub mod model;
 pub mod update;
 pub mod view;
 
-use crate::display::{self, Msg, Sev};
+use crate::display::{ChannelSink, Msg, Sev, Show as DisplayShow};
 use crate::session::Convo;
 use crate::{agent_turn, home_dir, user_message, CancelToken, Config, Error};
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -76,9 +76,9 @@ impl Agent {
     /// Reap the coroutine after it signalled `TaskEnd`. Its panic (dev
     /// builds; release aborts the process) becomes a visible error row
     /// instead of silence.
-    async fn reap(self) {
+    async fn reap(self, sink: &dyn DisplayShow) {
         if let Err(e) = self.job.await {
-            display::disp(Msg::Note { sev: Sev::Err, text: format!(" agent task panicked: {e} ") });
+            sink.show(Msg::Note { sev: Sev::Err, text: format!(" agent task panicked: {e} ") });
         }
     }
 }
@@ -403,14 +403,14 @@ fn needs_paint(
 /// banners come from the composition root and land beside ours.
 pub async fn run(cfg: &Config, convo: Convo, banners: Vec<String>) -> crate::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    display::install_chan(tx);
-    display::disp(Msg::Banner(format!(
+    let sink = ChannelSink::new(tx);
+    sink.show(Msg::Banner(format!(
         "jingwei — 精卫填海，一石一石 · {}",
         cfg.identity())));
-    display::disp(Msg::Banner(
+    sink.show(Msg::Banner(
         "type a task · Ctrl-J / Shift-Enter breaks the line · Ctrl-O unfolds · Ctrl-C interrupts (twice exits) · /exit or Ctrl-D rests".into()));
     for b in banners {
-        display::disp(Msg::Banner(b));
+        sink.show(Msg::Banner(b));
     }
 
     let mut app = App::new();
@@ -539,10 +539,10 @@ pub async fn run(cfg: &Config, convo: Convo, banners: Vec<String>) -> crate::Res
                 match maybe {
                     Some(ev) => match ev {
                         crossterm::event::Event::Key(k) => {
-                            handle(step(&mut app, Ev::Key(k)), cfg, &convo, &mut agent);
+                            handle(step(&mut app, Ev::Key(k)), cfg, &convo, &mut agent, &sink);
                         }
                         crossterm::event::Event::Paste(p) => {
-                            handle(step(&mut app, Ev::Paste(p)), cfg, &convo, &mut agent);
+                            handle(step(&mut app, Ev::Paste(p)), cfg, &convo, &mut agent, &sink);
                         }
                         // a resize lands immediately: re-fit the pane and
                         // force the next frame to repaint at the new size —
@@ -569,7 +569,7 @@ pub async fn run(cfg: &Config, convo: Convo, banners: Vec<String>) -> crate::Res
                     step(&mut app, Ev::Msg(m));
                     if ended {
                         if let Some(a) = agent.take() {
-                            a.reap().await;
+                            a.reap(&sink).await;
                         }
                     }
                 }
@@ -621,6 +621,7 @@ fn handle(
     cfg: &Config,
     convo: &Arc<AsyncMutex<Convo>>,
     agent: &mut Option<Agent>,
+    sink: &ChannelSink,
 ) {
     match action {
         Action::None => {}
@@ -634,18 +635,19 @@ fn handle(
             let convo = convo.clone();
             let token = Arc::new(CancelToken::new());
             let tok = token.clone();
-            display::disp(Msg::TaskBegin(line.clone()));
+            sink.show(Msg::TaskBegin(line.clone()));
+            let sink = sink.clone(); // one for the spawned task, one for the shell
             let job = tokio::spawn(async move {
                 let mut c = convo.lock().await;
                 c.history.push(user_message(&line));
-                c.persist(); // the task is on disk before the first stone moves
-                match agent_turn(&cfg, &mut c.history, &tok).await {
+                c.persist(&sink); // the task is on disk before the first stone moves
+                match agent_turn(&cfg, &mut c.history, &tok, &sink).await {
                     Err(Error::Interrupted) => {}
-                    Err(e) => display::disp(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
+                    Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
                     Ok(()) => {}
                 }
-                c.persist(); // run boundary: the file never ends mid-run
-                display::disp(Msg::TaskEnd);
+                c.persist(&sink); // run boundary: the file never ends mid-run
+                sink.show(Msg::TaskEnd);
             });
             *agent = Some(Agent { token, job });
         }

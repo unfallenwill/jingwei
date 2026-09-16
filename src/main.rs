@@ -11,16 +11,20 @@
 //      JINGWEI_CACHE, JINGWEI_THINKING, JINGWEI_NO_TUI, NO_COLOR
 
 mod display;
+mod ir;
 mod plain;
 mod session;
 mod tui;
 
-use display::{disp, Msg, Sev, Usage};
+use display::{Msg, Sev, Show, Usage};
+use ir::{Block, Message, Response, ToolResult};
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
+use std::future::Future;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -94,8 +98,8 @@ fn tool_summary(name: &str, input: &Value) -> String {
 
 /// Echo a tool call through the display port: the frontends decide how
 /// much of the output tail to show (and how to fold the rest).
-fn print_tool_call(name: &str, input: &Value, output: &str) {
-    disp(Msg::Tool { name: name.into(), summary: tool_summary(name, input), output: output.into() });
+fn print_tool_call(name: &str, input: &Value, output: &str, sink: &dyn Show) {
+    sink.show(Msg::Tool { name: name.into(), summary: tool_summary(name, input), output: output.into() });
 }
 
 // ---- tools -----------------------------------------------------------------
@@ -316,34 +320,131 @@ async fn run_tool(name: &str, input: &Value, token: &CancelToken) -> String {
 
 // ---- config ----------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-/// The wire protocol spoken to the endpoint — the provider port's only
-/// vocabulary word. Three speak the same internal history: minimax (the
-/// Messages wire: content blocks, tool_use/result pairs, thinking with a
-/// signature, interleaved reasoning, cache_control breakpoints), zai
-/// (chat-completions with preserved thinking and an always-on flagship
-/// reasoner), and deepseek (chat-completions plus a thinking toggle and an
-/// echo rule of its own).
-enum Protocol { MiniMax, Zai, DeepSeek }
+/// The boxed future a vendor's `turn` returns. Boxed because the wire is
+/// chosen at runtime — one allocation per request, and the vendor's own
+/// streaming/blocking machinery stays its own.
+type Turn<'a> = Pin<Box<dyn Future<Output = Result<(Response, bool)>> + Send + 'a>>;
+
+/// The provider port. One impl per wire; the composition root holds a
+/// [`Protocol`] handle and calls through it — no `match` anywhere. Adding a
+/// vendor is one `impl` and one row in [`VENDORS`], both the compiler's
+/// problem to keep complete.
+trait Vendor: Sync {
+    /// The name the user types (`--protocol`) and the session records.
+    fn label(&self) -> &'static str;
+    /// The endpoint the wire names for itself when the user names none — the
+    /// one case where the address belongs to the vendor outright.
+    fn default_base(&self) -> Option<&'static str>;
+    /// The flagship the wire names for itself, when it has one.
+    fn default_model(&self) -> Option<&'static str>;
+    /// What this wire can serve, in its own words — the rules the
+    /// composition root only *asks* about.
+    fn accepts(&self, cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()>;
+    /// One turn: hand over the IR, get the IR back. `sink` is where the
+    /// turn's own `Msg`s go — the vendor never learns which frontend is
+    /// listening.
+    fn turn<'a>(
+        &'a self,
+        cfg: &'a Config,
+        history: &'a [Message],
+        schemas: &'a [Value],
+        token: &'a CancelToken,
+        sink: &'a dyn Show,
+    ) -> Turn<'a>;
+}
+
+/// The Messages wire (MiniMax): content blocks, tool_use/result pairs,
+/// thinking with a signature, interleaved reasoning, cache_control
+/// breakpoints — and its own dialect of policy words on top.
+struct MiniMax;
+/// Chat Completions with preserved thinking (Zhipu's zai): an always-on
+/// flagship reasoner whose cache is implicit.
+struct Zai;
+/// Chat Completions plus a thinking toggle and a disk cache (DeepSeek).
+struct DeepSeek;
+
+static MINIMAX: MiniMax = MiniMax;
+static ZAI: Zai = Zai;
+static DEEPSEEK: DeepSeek = DeepSeek;
+
+impl Vendor for MiniMax {
+    fn label(&self) -> &'static str { "minimax" }
+    fn default_base(&self) -> Option<&'static str> { Some("https://api.minimax.cn/anthropic") }
+    fn default_model(&self) -> Option<&'static str> { Some("MiniMax-M3") }
+    fn accepts(&self, cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
+        minimax_accepts(cache, thinking, effort)
+    }
+    fn turn<'a>(&'a self, cfg: &'a Config, history: &'a [Message], schemas: &'a [Value], token: &'a CancelToken, sink: &'a dyn Show)
+        -> Turn<'a>
+    {
+        Box::pin(minimax_turn(cfg, history, schemas, token, sink))
+    }
+}
+
+impl Vendor for Zai {
+    fn label(&self) -> &'static str { "zai" }
+    fn default_base(&self) -> Option<&'static str> { Some("https://open.bigmodel.cn/api/paas/v4") }
+    fn default_model(&self) -> Option<&'static str> { Some("glm-5.3-flash") }
+    fn accepts(&self, cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
+        zai_accepts(cache, thinking, effort)
+    }
+    fn turn<'a>(&'a self, cfg: &'a Config, history: &'a [Message], schemas: &'a [Value], token: &'a CancelToken, sink: &'a dyn Show)
+        -> Turn<'a>
+    {
+        Box::pin(zai_turn(cfg, history, schemas, token, sink))
+    }
+}
+
+impl Vendor for DeepSeek {
+    fn label(&self) -> &'static str { "deepseek" }
+    fn default_base(&self) -> Option<&'static str> { Some("https://api.deepseek.com") }
+    fn default_model(&self) -> Option<&'static str> { None } // flash or pro is the user's call
+    fn accepts(&self, cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
+        deepseek_accepts(cache, thinking, effort)
+    }
+    fn turn<'a>(&'a self, cfg: &'a Config, history: &'a [Message], schemas: &'a [Value], token: &'a CancelToken, sink: &'a dyn Show)
+        -> Turn<'a>
+    {
+        Box::pin(deepseek_turn(cfg, history, schemas, token, sink))
+    }
+}
+
+/// Every wire, by the name the user types (`--protocol`, `JINGWEI_PROTOCOL`).
+/// The one place a new vendor registers; the default is the first row.
+const VENDORS: &[(&str, Protocol)] = &[
+    ("minimax", Protocol::MINIMAX),
+    ("zai", Protocol::ZAI),
+    ("deepseek", Protocol::DEEPSEEK),
+];
+
+/// A handle to one wire — what used to be an enum spelling each protocol's
+/// facts and dispatching by `match`, now a newtype over the trait object.
+/// The three constants are the statics above; equality is by wire.
+#[derive(Clone, Copy)]
+struct Protocol(&'static dyn Vendor);
 
 impl Protocol {
-    /// The endpoint a protocol names for itself when the user names none —
-    /// the one case where the wire belongs to the vendor outright. A
-    /// vendor that lives at one address says so here; the rest stay None
-    /// and the composition root keeps requiring --base-url.
-    fn default_base(self) -> Option<&'static str> {
-        match self {
-            Self::MiniMax => Some("https://api.minimax.cn/anthropic"),
-            Self::Zai => Some("https://open.bigmodel.cn/api/paas/v4"),
-            Self::DeepSeek => Some("https://api.deepseek.com"),
-        }
+    const MINIMAX: Protocol = Protocol(&MINIMAX);
+    const ZAI: Protocol = Protocol(&ZAI);
+    const DEEPSEEK: Protocol = Protocol(&DEEPSEEK);
+
+    fn label(self) -> &'static str { self.0.label() }
+    fn default_base(self) -> Option<&'static str> { self.0.default_base() }
+    fn default_model(self) -> Option<&'static str> { self.0.default_model() }
+    fn accepts(self, cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
+        self.0.accepts(cache, thinking, effort)
     }
-    /// The model a protocol names for itself when the user names none —
-    /// only for a vendor with one flagship, never for a wire with many
-    /// speakers or a catalogue in flux (deepseek's flash/pro).
-    fn default_model(self) -> Option<&'static str> {
-        match self { Self::MiniMax => Some("MiniMax-M3"), Self::Zai => Some("glm-5.3-flash"), Self::DeepSeek => None }
+    async fn turn(self, cfg: &Config, history: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
+        self.0.turn(cfg, history, schemas, token, sink).await
     }
+}
+
+impl PartialEq for Protocol {
+    fn eq(&self, other: &Self) -> bool { self.label() == other.label() }
+}
+impl Eq for Protocol {}
+impl std::fmt::Debug for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.label()) }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -497,8 +598,7 @@ fn build_config(args: &Args) -> Result<Config> {
     let req = |flag: &Option<String>, var: &str, what: &str| flag.clone()
         .or_else(|| env::var(var).ok())
         .ok_or_else(|| Error::Msg(format!("missing {what} (or env {var})")));
-    let protocol = enum_of(&args.protocol, "JINGWEI_PROTOCOL", "protocol",
-        &[("minimax", Protocol::MiniMax), ("zai", Protocol::Zai), ("deepseek", Protocol::DeepSeek)])?;
+    let protocol = enum_of(&args.protocol, "JINGWEI_PROTOCOL", "protocol", VENDORS)?;
     let cache = enum_of(&args.cache, "JINGWEI_CACHE", "cache",
         &[("auto", CacheMode::Auto), ("active", CacheMode::Active)])?;
     let thinking = enum_of(&args.thinking, "JINGWEI_THINKING", "thinking",
@@ -506,12 +606,8 @@ fn build_config(args: &Args) -> Result<Config> {
     let effort = opt_enum_of(&args.effort, "JINGWEI_EFFORT", "effort",
         &[("low", Effort::Low), ("medium", Effort::Medium), ("high", Effort::High), ("max", Effort::Max)])?;
     // Wire rules live with their wires: each adapter owns what it can
-    // serve, and the composition root only asks.
-    match protocol {
-        Protocol::MiniMax => minimax_accepts(cache, thinking, effort)?,
-        Protocol::Zai => zai_accepts(cache, thinking, effort)?,
-        Protocol::DeepSeek => deepseek_accepts(cache, thinking, effort)?,
-    }
+    // serve, and the composition root only asks — no match.
+    protocol.accepts(cache, thinking, effort)?;
     let max_turns = args.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
     if max_turns == 0 {
         return Err(Error::Msg("--max-turns must be at least 1".into()));
@@ -682,16 +778,17 @@ async fn run() -> Result<()> {
     // One-shot: always the plain frontend — its output must stay in the
     // terminal after the process exits, and an alt-screen would take it.
     let prompt = args.prompt.join(" ");
+    let sink = plain::PlainSink::new();
     for b in &banners {
-        disp(Msg::Banner(b.clone()));
+        sink.show(Msg::Banner(b.clone()));
     }
-    disp(Msg::TaskBegin(prompt.clone()));
+    sink.show(Msg::TaskBegin(prompt.clone()));
     convo.history.push(user_message(&prompt));
-    convo.persist();
+    convo.persist(&sink);
     let token = CancelToken::new();
-    let res = agent_turn(&cfg, &mut convo.history, &token).await;
-    convo.persist();
-    disp(Msg::TaskEnd);
+    let res = agent_turn(&cfg, &mut convo.history, &token, &sink).await;
+    convo.persist(&sink);
+    sink.show(Msg::TaskEnd);
     res
 }
 
@@ -749,8 +846,8 @@ fn begin_session(args: &Args, cfg: &Config, interactive: bool) -> Result<(sessio
 /// The one constructor of a user task message. The internal history shape
 /// belongs to the agent core — so its constructor does too, and no
 /// frontend spells the shape by hand.
-fn user_message(text: &str) -> Value {
-    json!({"role": "user", "content": text})
+fn user_message(text: &str) -> Message {
+    Message::User(text.to_string())
 }
 
 /// Drive one agent run as an interruptible coroutine.
@@ -761,8 +858,8 @@ fn user_message(text: &str) -> Value {
 /// REPL prompt comes back with everything the agent already carried still in
 /// place. A second Ctrl-C while it is unwinding exits immediately, for when
 /// even graceful is too slow.
-async fn agent_turn(cfg: &Config, history: &mut Vec<Value>, token: &CancelToken) -> Result<()> {
-    let agent = agent_loop(cfg, history, token);
+async fn agent_turn(cfg: &Config, history: &mut Vec<Message>, token: &CancelToken, sink: &dyn Show) -> Result<()> {
+    let agent = agent_loop(cfg, history, token, sink);
     tokio::pin!(agent);
     tokio::select! {
         res = &mut agent => return res,
@@ -773,19 +870,19 @@ async fn agent_turn(cfg: &Config, history: &mut Vec<Value>, token: &CancelToken)
     let res = tokio::select! {
         res = &mut agent => res,
         _ = tokio::signal::ctrl_c() => {
-            disp(Msg::Note { sev: Sev::Err, text: " interrupted again — exiting ".into() });
+            sink.show(Msg::Note { sev: Sev::Err, text: " interrupted again — exiting ".into() });
             std::process::exit(130);
         }
     };
     if let Err(Error::Interrupted) = &res {
-        disp(Msg::Note { sev: Sev::Warn, text: " interrupted — stopped at a safe point; history kept ".into() });
+        sink.show(Msg::Note { sev: Sev::Warn, text: " interrupted — stopped at a safe point; history kept ".into() });
     }
     res
 }
 
 impl Config {
     fn protocol_label(&self) -> &'static str {
-        match self.protocol { Protocol::MiniMax => "minimax", Protocol::Zai => "zai", Protocol::DeepSeek => "deepseek" }
+        self.protocol.label()
     }
 
     /// The banner's identity tail: protocol · model [· effort] · base url.
@@ -868,33 +965,32 @@ impl CancelToken {
 /// runs. On cancellation it returns `Err(Interrupted)` after leaving the
 /// history valid — interrupted tools get results, unfinished tool calls are
 /// dropped from the turn, and the REPL prompt simply returns.
-async fn agent_loop(cfg: &Config, history: &mut Vec<Value>, token: &CancelToken) -> Result<()> {
+async fn agent_loop(cfg: &Config, history: &mut Vec<Message>, token: &CancelToken, sink: &dyn Show) -> Result<()> {
     let schemas: Vec<Value> = tools().iter()
         .map(|t| json!({"name": t.name, "description": t.desc, "input_schema": t.schema}))
         .collect();
     for turn in 0..cfg.max_turns {
         if token.is_cancelled() { return Err(Error::Interrupted); }
         if fit_context(history, cfg.context_size) {
-            disp(Msg::Note { sev: Sev::Warn, text: " trimmed history to fit --context-size ".into() });
+            sink.show(Msg::Note { sev: Sev::Warn, text: " trimmed history to fit --context-size ".into() });
         }
-        let (resp, interrupted) = call_api(cfg, history, &schemas, token).await?;
-        let content = resp["content"].as_array().cloned().unwrap_or_default();
+        let (resp, interrupted) = call_api(cfg, history, &schemas, token, sink).await?;
+        let content = resp.blocks;
         if interrupted {
             // Cut off mid-response: keep finished text/thinking, drop tool
             // calls — a tool_use whose tool_result never ran would poison
             // the next request.
-            let kept: Vec<Value> = content.into_iter()
-                .filter(|b| b["type"] != "tool_use").collect();
+            let kept: Vec<Block> = content.into_iter().filter(|b| b.tool_use().is_none()).collect();
             if !kept.is_empty() {
-                history.push(json!({"role": "assistant", "content": kept}));
+                history.push(Message::Assistant(kept));
             }
             return Err(Error::Interrupted);
         }
-        let calls: Vec<_> = content.iter().filter(|b| b["type"] == "tool_use").cloned().collect();
+        let calls: Vec<Block> = content.iter().filter(|b| b.tool_use().is_some()).cloned().collect();
         // Echo the full assistant turn back so interleaved thinking stays continuous —
         // including the final text-only turn, so follow-up questions keep context.
         if !content.is_empty() {
-            history.push(json!({"role": "assistant", "content": content}));
+            history.push(Message::Assistant(content));
         }
         if calls.is_empty() { return Ok(()); }
 
@@ -904,22 +1000,22 @@ async fn agent_loop(cfg: &Config, history: &mut Vec<Value>, token: &CancelToken)
         let mut results = Vec::with_capacity(calls.len());
         let mut stopped = false;
         for c in &calls {
-            let name = c["name"].as_str().unwrap_or("");
+            let (id, name, input) = c.tool_use().expect("filtered to tool calls");
             let out = if stopped {
                 "skipped: this run was interrupted before the tool ran".into()
             } else {
-                run_tool(name, &c["input"], token).await
+                run_tool(name, input, token).await
             };
             let out = truncate(&out);
-            print_tool_call(name, &c["input"], &out);
-            results.push(json!({"type": "tool_result", "tool_use_id": c["id"], "content": out}));
+            print_tool_call(name, input, &out, sink);
+            results.push(ToolResult { id: id.to_string(), content: out });
             if token.is_cancelled() { stopped = true; }
         }
-        history.push(json!({"role": "user", "content": results}));
+        history.push(Message::ToolResults(results));
         if stopped { return Err(Error::Interrupted); }
 
         if turn + 1 == cfg.max_turns {
-            disp(Msg::Note { sev: Sev::Warn, text: format!(" warning: hit --max-turns={}, stopping ", cfg.max_turns) });
+            sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: hit --max-turns={}, stopping ", cfg.max_turns) });
         }
     }
     Ok(())
@@ -933,8 +1029,8 @@ fn truncate(s: &str) -> String {
 }
 
 /// Rough token estimate (bytes/3 — conservative for CJK-heavy content).
-fn est_tokens(history: &[Value]) -> u64 {
-    serde_json::to_string(history).map_or(0, |s| (s.len() / 3) as u64)
+fn est_tokens(history: &[Message]) -> u64 {
+    serde_json::to_string(&ir::history_value(history)).map_or(0, |s| (s.len() / 3) as u64)
 }
 
 /// Shrink history until the estimate fits `limit`, trimming the oldest
@@ -942,14 +1038,14 @@ fn est_tokens(history: &[Value]) -> u64 {
 /// in-place cut touches only the result's text, and a minimal result leaves
 /// together with its paired tool_use (an orphaned tool_use is a 400 on the
 /// next request), along with any message left holding no blocks.
-fn fit_context(history: &mut Vec<Value>, limit: u64) -> bool {
+fn fit_context(history: &mut Vec<Message>, limit: u64) -> bool {
     let mut changed = false;
     while est_tokens(history) > limit {
         let Some((mi, bi)) = oldest_tool_result(history) else { break };
-        let s = history[mi]["content"][bi]["content"].as_str().unwrap_or("").to_owned();
-        if s.chars().count() > 200 {
-            let cut: String = s.chars().take(200).collect();
-            history[mi]["content"][bi]["content"] = json!(format!("{cut}…[trimmed to fit context]"));
+        let Message::ToolResults(rs) = &mut history[mi] else { break };
+        if rs[bi].content.chars().count() > 200 {
+            let cut: String = rs[bi].content.chars().take(200).collect();
+            rs[bi].content = format!("{cut}…[trimmed to fit context]");
             changed = true;
             continue;
         }
@@ -960,32 +1056,32 @@ fn fit_context(history: &mut Vec<Value>, limit: u64) -> bool {
 }
 
 /// The first (oldest) tool_result in the history, as (message, block) indices.
-fn oldest_tool_result(history: &[Value]) -> Option<(usize, usize)> {
-    history.iter().enumerate().find_map(|(mi, m)| {
-        (m["role"] == "user").then_some(m["content"].as_array()).flatten()
-            .and_then(|a| a.iter().enumerate().find(|(_, b)| b["type"] == "tool_result").map(|(bi, _)| (mi, bi)))
-    })
+fn oldest_tool_result(history: &[Message]) -> Option<(usize, usize)> {
+    history.iter().position(|m| matches!(m, Message::ToolResults(rs) if !rs.is_empty())).map(|mi| (mi, 0))
 }
 
 /// Delete the tool_result at (mi, bi) and its tool_use — which sits in the
 /// assistant message just before — so neither survives unpaired. A thinking
 /// block that only led up to that call goes too; messages emptied of blocks
 /// are removed outright (an empty content array is its own API error).
-fn drop_result_and_pair(history: &mut Vec<Value>, mi: usize, bi: usize) {
-    let id = history[mi]["content"][bi]["tool_use_id"].as_str().map(str::to_owned);
-    history[mi]["content"].as_array_mut().unwrap().remove(bi);
-    if mi > 0 && history[mi - 1]["role"] == "assistant" {
-        if let Some(blocks) = history[mi - 1]["content"].as_array_mut() {
-            blocks.retain(|b| b["type"] != "tool_use" || b["id"].as_str() != id.as_deref());
+fn drop_result_and_pair(history: &mut Vec<Message>, mi: usize, bi: usize) {
+    let id = match &history[mi] {
+        Message::ToolResults(rs) => rs[bi].id.clone(),
+        _ => return,
+    };
+    if let Message::ToolResults(rs) = &mut history[mi] { rs.remove(bi); }
+    if mi > 0 {
+        if let Message::Assistant(blocks) = &mut history[mi - 1] {
+            blocks.retain(|b| match b.tool_use() { Some((bid, _, _)) => bid != id, None => true });
             // thinking whose tool_use is gone: nothing left to reason towards
-            if blocks.iter().all(|b| b["type"] == "thinking") { blocks.clear(); }
+            if !blocks.is_empty() && blocks.iter().all(Block::is_thinking) { blocks.clear(); }
         }
     }
-    if history[mi]["content"].as_array().is_some_and(|a| a.is_empty()) {
+    let empty = |m: &Message| matches!(m, Message::Assistant(b) if b.is_empty())
+        || matches!(m, Message::ToolResults(r) if r.is_empty());
+    if empty(&history[mi]) {
         history.remove(mi);
-        if mi > 0 && history[mi - 1]["role"] == "assistant"
-            && history[mi - 1]["content"].as_array().is_some_and(|a| a.is_empty())
-        {
+        if mi > 0 && empty(&history[mi - 1]) {
             history.remove(mi - 1);
         }
     }
@@ -997,40 +1093,32 @@ fn drop_result_and_pair(history: &mut Vec<Value>, mi: usize, bi: usize) {
 /// Whether a wire streams or blocks, how it spells its fields, which rules
 /// its history must obey — all of that is the adapter's own machinery,
 /// invisible here. The core hands over the IR and gets the IR back.
-async fn call_api(cfg: &Config, history: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
-    match cfg.protocol {
-        Protocol::MiniMax => minimax_turn(cfg, history, schemas, token).await,
-        Protocol::Zai => zai_turn(cfg, history, schemas, token).await,
-        Protocol::DeepSeek => deepseek_turn(cfg, history, schemas, token).await,
-    }
+async fn call_api(cfg: &Config, history: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
+    cfg.protocol.turn(cfg, history, schemas, token, sink).await
 }
 
 /// A blocking turn's events, shown once at the end — the same port the
 /// streaming paths speak event-by-event as content arrives. Called by the
 /// blocking paths only; a blocking socket cannot show anything sooner.
-fn show_turn(v: &Value) {
-    if let Some(blocks) = v["content"].as_array() {
-        for block in blocks {
-            match block["type"].as_str() {
-                Some("text") => disp(Msg::Text(format!("\n{}", block["text"].as_str().unwrap_or("")))),
-                Some("thinking") => {
-                    disp(Msg::Think(block["thinking"].as_str().unwrap_or("").into()));
-                    disp(Msg::ThinkEnd);
-                }
-                _ => {}
+fn show_turn(resp: &Response, sink: &dyn Show) {
+    for block in &resp.blocks {
+        match block {
+            Block::Text(t) => sink.show(Msg::Text(format!("\n{t}"))),
+            Block::Thinking { text, .. } => {
+                sink.show(Msg::Think(text.clone()));
+                sink.show(Msg::ThinkEnd);
             }
+            _ => {}
         }
     }
-    disp(Msg::Usage(Usage::from_value(&v["usage"])));
-    disp(Msg::Done);
+    sink.show(Msg::Usage(Usage::from_value(&resp.usage)));
+    sink.show(Msg::Done);
 }
 
-fn strip_thinking(messages: &[Value]) -> Vec<Value> {
-    messages.iter().map(|m| match m["role"].as_str() {
-        Some("assistant") => json!({"role": "assistant", "content": m["content"].as_array()
-            .map(|a| a.iter().filter(|b| b["type"] != "thinking").cloned().collect::<Vec<_>>())
-            .unwrap_or_default()}),
-        _ => m.clone(),
+fn strip_thinking(messages: &[Message]) -> Vec<Message> {
+    messages.iter().map(|m| match m {
+        Message::Assistant(blocks) => Message::Assistant(blocks.iter().filter(|b| !b.is_thinking()).cloned().collect()),
+        other => other.clone(),
     }).collect()
 }
 
@@ -1105,13 +1193,6 @@ fn merge_usage(usage: &mut Value, src: Option<&serde_json::Map<String, Value>>) 
     }
 }
 
-fn append_str_field(block: &mut Value, key: &str, tail: &str) {
-    if let Some(o) = block.as_object_mut() {
-        let cur = o.get(key).and_then(Value::as_str).unwrap_or("").to_string();
-        o.insert(key.into(), json!(cur + tail));
-    }
-}
-
 // (The old "blank line before the reply" lead is the pane's job now: the
 // task echo already separates prompt from reply.)
 
@@ -1144,16 +1225,25 @@ fn minimax_accepts(_cache: CacheMode, thinking: Thinking, effort: Option<Effort>
 /// wire rule wearing a policy flag: this wire carries thinking blocks in
 /// its history verbatim, so stripping them is this adapter's job, never
 /// the core's.
-async fn minimax_turn(cfg: &Config, history: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
-    let messages = if cfg.thinking == Thinking::Strip { strip_thinking(history) } else { history.to_vec() };
-    if cfg.streaming {
-        minimax_streaming(cfg, &messages, schemas, token).await
-    } else {
-        minimax_blocking(cfg, &messages, schemas, token).await
+/// The Messages wire's response is the internal shape: its `content` blocks
+/// decode straight, its `usage` is the internal ledger already.
+fn response_from_value(v: &Value) -> Response {
+    Response {
+        blocks: v["content"].as_array().map(|a| a.iter().map(Block::from_value).collect()).unwrap_or_default(),
+        usage: v["usage"].clone(),
     }
 }
 
-fn minimax_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: bool) -> Value {
+async fn minimax_turn(cfg: &Config, history: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
+    let messages: Vec<Message> = if cfg.thinking == Thinking::Strip { strip_thinking(history) } else { history.to_vec() };
+    if cfg.streaming {
+        minimax_streaming(cfg, &messages, schemas, token, sink).await
+    } else {
+        minimax_blocking(cfg, &messages, schemas, token, sink).await
+    }
+}
+
+fn minimax_body(cfg: &Config, messages: &[Message], schemas: &[Value], stream: bool) -> Value {
     let active = cfg.cache == CacheMode::Active;
     let system = if active {
         json!([{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}])
@@ -1164,8 +1254,9 @@ fn minimax_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: boo
     if active {
         if let Some(last) = tools.last_mut() { last["cache_control"] = json!({"type": "ephemeral"}); }
     }
+    let wire: Vec<Value> = messages.iter().map(Message::to_value).collect();
     let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
-        "system": system, "tools": tools, "messages": messages});
+        "system": system, "tools": tools, "messages": wire});
     body["stream"] = json!(stream);
     // Thinking is this vendor's dial, spelled its way: `adaptive` turns it
     // on (M3 ships thinking *off* by default — an agent wants it on),
@@ -1180,7 +1271,7 @@ fn minimax_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: boo
     body
 }
 
-async fn minimax_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+async fn minimax_blocking(cfg: &Config, messages: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
     let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
     let body = minimax_body(cfg, messages, schemas, false);
     let key = cfg.api_key.clone();
@@ -1189,16 +1280,22 @@ async fn minimax_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], t
         if let Some(err) = v.get("error") { return Err(Error::Msg(err.to_string())); }
         Ok(v)
     }).await?;
-    show_turn(&v);
-    Ok((v, token.is_cancelled()))
+    let resp = response_from_value(&v);
+    show_turn(&resp, sink);
+    Ok((resp, token.is_cancelled()))
 }
 
-async fn minimax_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+async fn minimax_streaming(cfg: &Config, messages: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
     let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
     let body = minimax_body(cfg, messages, schemas, true);
     let key = cfg.api_key.clone();
     let resp = blocking(token, move || post(&key, url, body, true)).await?;
-    let (mut content, mut usage) = (vec![], empty_usage());
+    // Blocks arrive one at a time, indexed; a tool_use's arguments stream as
+    // partial JSON, so they accumulate in `tool_json` beside the typed block
+    // until the block closes and the assembled JSON parses into `input`.
+    let mut blocks: Vec<Option<Block>> = vec![];
+    let mut tool_json: Vec<String> = vec![];
+    let mut usage = empty_usage();
     let mut interrupted = false;
     let mut lines = sse_channel(resp);
     // Consume the stream as a coroutine: each line is one suspension point,
@@ -1215,56 +1312,54 @@ async fn minimax_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], 
         match v["type"].as_str() {
             Some("message_start") => {
                 merge_usage(&mut usage, v["message"]["usage"].as_object());
-                disp(Msg::Usage(Usage::from_value(&v["message"]["usage"]))); // the bar jumps at stream start
+                sink.show(Msg::Usage(Usage::from_value(&v["message"]["usage"]))); // the bar jumps at stream start
             }
             Some("content_block_start") => {
                 let i = v["index"].as_u64().unwrap_or(0) as usize;
-                while content.len() <= i { content.push(Value::Null); }
-                content[i] = v["content_block"].clone();
+                while blocks.len() <= i { blocks.push(None); tool_json.push(String::new()); }
+                blocks[i] = Some(Block::from_value(&v["content_block"]));
             }
             Some("content_block_delta") => {
                 let i = v["index"].as_u64().unwrap_or(0) as usize;
-                let (Some(block), d) = (content.get_mut(i), &v["delta"]) else { continue };
-                match (block["type"].as_str(), d["type"].as_str()) {
-                    (Some("text"), Some("text_delta")) => {
-                        if let Some(t) = d["text"].as_str() {
-                            disp(Msg::Text(t.into()));
-                            append_str_field(block, "text", t);
+                let d = &v["delta"];
+                let Some(Some(block)) = blocks.get_mut(i) else { continue };
+                match (block, d["type"].as_str()) {
+                    (Block::Text(t), Some("text_delta")) => {
+                        if let Some(s) = d["text"].as_str() {
+                            sink.show(Msg::Text(s.into()));
+                            t.push_str(s);
                         }
                     }
-                    (Some("thinking"), Some("thinking_delta")) => {
-                        if let Some(t) = d["thinking"].as_str() {
-                            disp(Msg::Think(t.into()));
-                            append_str_field(block, "thinking", t);
+                    (Block::Thinking { text, .. }, Some("thinking_delta")) => {
+                        if let Some(s) = d["thinking"].as_str() {
+                            sink.show(Msg::Think(s.into()));
+                            text.push_str(s);
                         }
                     }
                     // the wire stamps a signature on the block as it closes;
                     // it rides the IR so the next request echoes the block
                     // whole — the vendor's continuity rule, signature and all
-                    (Some("thinking"), Some("signature_delta")) => {
+                    (Block::Thinking { signature, .. }, Some("signature_delta")) => {
                         if let Some(s) = d["signature"].as_str() {
-                            append_str_field(block, "signature", s);
+                            *signature = Some(signature.take().unwrap_or_default() + s);
                         }
                     }
-                    (Some("tool_use"), Some("input_json_delta")) => {
-                        if let Some(p) = d["partial_json"].as_str() {
-                            let acc = block["input_json_str"].as_str().unwrap_or("").to_string() + p;
-                            block["input_json_str"] = json!(acc);
-                        }
+                    (Block::ToolUse { .. }, Some("input_json_delta")) => {
+                        if let Some(p) = d["partial_json"].as_str() { tool_json[i].push_str(p); }
                     }
                     _ => {}
                 }
             }
             Some("content_block_stop") => {
-                if let Some(block) = content.get_mut(v["index"].as_u64().unwrap_or(0) as usize) {
+                let i = v["index"].as_u64().unwrap_or(0) as usize;
+                match blocks.get_mut(i).and_then(Option::as_mut) {
                     // a thinking block closing is the fold point: its marker lands now
-                    if block["type"] == "thinking" {
-                        disp(Msg::ThinkEnd);
+                    Some(Block::Thinking { .. }) => sink.show(Msg::ThinkEnd),
+                    // the call's arguments are whole now: parse them into input
+                    Some(Block::ToolUse { input, .. }) => {
+                        *input = serde_json::from_str(&tool_json[i]).unwrap_or(Value::Null);
                     }
-                    if let Some(s) = block["input_json_str"].as_str() {
-                        block["input"] = serde_json::from_str(s).unwrap_or(Value::Null);
-                        if let Some(o) = block.as_object_mut() { o.remove("input_json_str"); }
-                    }
+                    _ => {}
                 }
             }
             Some("message_delta") => {
@@ -1275,9 +1370,9 @@ async fn minimax_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], 
                 // Usage replaces the live turn's counters wholesale, which
                 // lands ctx and cache% on the bar before Done folds the
                 // turn into the session totals.
-                disp(Msg::Usage(Usage::from_value(&usage)));
+                sink.show(Msg::Usage(Usage::from_value(&usage)));
                 if let Some(n) = v["usage"]["output_tokens"].as_u64() {
-                    disp(Msg::OutTokens(n)); // output count ticks while text flows
+                    sink.show(Msg::OutTokens(n)); // output count ticks while text flows
                 }
             }
             Some("message_stop") => break,
@@ -1285,9 +1380,8 @@ async fn minimax_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], 
             _ => {}
         }
     }
-    disp(Msg::Done);
-    content.retain(|v| !v.is_null());
-    Ok((json!({"content": content, "usage": usage}), interrupted))
+    sink.show(Msg::Done);
+    Ok((Response { blocks: blocks.into_iter().flatten().collect(), usage }, interrupted))
 }
 
 // ---- api: the chat-completions wire family --------------------------------
@@ -1312,30 +1406,26 @@ fn chat_url(cfg: &Config) -> String {
 /// endpoint *requires* that echo (deepseek with tools), merely accepts it,
 /// or ignores it — the vendor decides — is a vendor fact, and the dialect serves the
 /// strictest reading: echo unless told to strip.
-fn chat_messages(system: &str, history: &[Value], cfg: &Config) -> Vec<Value> {
+fn chat_messages(system: &str, history: &[Message], cfg: &Config) -> Vec<Value> {
     let mut out = vec![json!({"role": "system", "content": system})];
     for msg in history {
-        match msg["role"].as_str() {
-            Some("user") => match msg["content"].as_str() {
-                Some(s) => out.push(json!({"role": "user", "content": s})),
-                None => out.extend(msg["content"].as_array().into_iter().flatten()
-                    .filter(|b| b["type"] == "tool_result")
-                    .map(|b| json!({"role": "tool", "tool_call_id": b["tool_use_id"],
-                                    "content": b["content"].as_str().unwrap_or("")}))),
-            },
-            Some("assistant") => {
+        match msg {
+            Message::User(s) => out.push(json!({"role": "user", "content": s})),
+            Message::ToolResults(results) => out.extend(results.iter()
+                .map(|r| json!({"role": "tool", "tool_call_id": r.id, "content": r.content}))),
+            Message::Assistant(blocks) => {
                 let mut text = String::new();
                 let mut reasoning = String::new();
                 let mut tool_calls = vec![];
-                for block in msg["content"].as_array().into_iter().flatten() {
-                    match block["type"].as_str() {
-                        Some("text") => text.push_str(block["text"].as_str().unwrap_or("")),
-                        Some("thinking") if cfg.thinking == Thinking::Preserve => {
-                            reasoning.push_str(block["thinking"].as_str().unwrap_or(""));
+                for block in blocks {
+                    match block {
+                        Block::Text(t) => text.push_str(t),
+                        Block::Thinking { text: r, .. } if cfg.thinking == Thinking::Preserve => {
+                            reasoning.push_str(r);
                         }
-                        Some("tool_use") => tool_calls.push(json!({
-                            "id": block["id"], "type": "function",
-                            "function": {"name": block["name"], "arguments": block["input"].to_string()}})),
+                        Block::ToolUse { id, name, input } => tool_calls.push(json!({
+                            "id": id, "type": "function",
+                            "function": {"name": name, "arguments": input.to_string()}})),
                         _ => {}
                     }
                 }
@@ -1345,7 +1435,6 @@ fn chat_messages(system: &str, history: &[Value], cfg: &Config) -> Vec<Value> {
                 if !tool_calls.is_empty() { m["tool_calls"] = json!(tool_calls); }
                 out.push(m);
             }
-            _ => {}
         }
     }
     out
@@ -1361,7 +1450,7 @@ fn chat_tools(schemas: &[Value]) -> Value {
 /// translate through the vendor, show the turn once. The blocking/streaming
 /// split is the family's machinery — a vendor hands over a body and its
 /// response translator, nothing else.
-async fn chat_blocking(cfg: &Config, body: Value, to_internal: fn(&Value) -> Value, token: &CancelToken) -> Result<(Value, bool)> {
+async fn chat_blocking(cfg: &Config, body: Value, to_internal: fn(&Value) -> Response, token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
     let url = chat_url(cfg);
     let key = cfg.api_key.clone();
     let v = blocking(token, move || -> Result<Value> {
@@ -1369,35 +1458,38 @@ async fn chat_blocking(cfg: &Config, body: Value, to_internal: fn(&Value) -> Val
         if let Some(err) = v.get("error") { return Err(Error::Msg(err.to_string())); }
         Ok(v)
     }).await?;
-    let v = to_internal(&v);
-    show_turn(&v);
-    Ok((v, token.is_cancelled()))
+    let resp = to_internal(&v);
+    show_turn(&resp, sink);
+    Ok((resp, token.is_cancelled()))
 }
 
 /// A response in this dialect → internal {content, usage}: the message walk
 /// is the dialect's own, the ledger is the one thing vendors spell
 /// differently, so it arrives as a function.
-fn chat_to_internal(v: &Value, usage_of: fn(&Value) -> (Value, Usage)) -> Value {
+fn chat_to_internal(v: &Value, usage_of: fn(&Value) -> (Value, Usage)) -> Response {
     let msg = &v["choices"][0]["message"];
-    let mut content = vec![];
+    let mut blocks = vec![];
     if let Some(r) = msg["reasoning_content"].as_str().filter(|r| !r.is_empty()) {
-        content.push(json!({"type": "thinking", "thinking": r}));
+        blocks.push(Block::Thinking { text: r.to_string(), signature: None });
     }
     if let Some(t) = msg["content"].as_str().filter(|t| !t.is_empty()) {
-        content.push(json!({"type": "text", "text": t}));
+        blocks.push(Block::Text(t.to_string()));
     }
     for tc in msg["tool_calls"].as_array().into_iter().flatten() {
-        content.push(json!({"type": "tool_use", "id": tc["id"], "name": tc["function"]["name"],
-            "input": serde_json::from_str::<Value>(tc["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}))}));
+        blocks.push(Block::ToolUse {
+            id: tc["id"].as_str().unwrap_or("").to_string(),
+            name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
+            input: serde_json::from_str::<Value>(tc["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({})),
+        });
     }
     let (usage, _) = usage_of(&v["usage"]);
-    json!({"content": content, "usage": usage})
+    Response { blocks, usage }
 }
 
 /// One streaming call on the dialect: SSE deltas assembled into internal
 /// blocks, events shown as they arrive. `usage_of` is the vendor's ledger
 /// translation — the field families cannot agree on.
-async fn chat_streaming(cfg: &Config, body: Value, usage_of: fn(&Value) -> (Value, Usage), token: &CancelToken) -> Result<(Value, bool)> {
+async fn chat_streaming(cfg: &Config, body: Value, usage_of: fn(&Value) -> (Value, Usage), token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
     let url = chat_url(cfg);
     let key = cfg.api_key.clone();
     let resp = blocking(token, move || post(&key, url, body, false)).await?;
@@ -1419,7 +1511,7 @@ async fn chat_streaming(cfg: &Config, body: Value, usage_of: fn(&Value) -> (Valu
         if v["usage"].is_object() {
             let (internal, shown) = usage_of(&v["usage"]);
             usage = internal;
-            disp(Msg::Usage(shown));
+            sink.show(Msg::Usage(shown));
         }
         let Some(delta) = v["choices"][0]["delta"].as_object() else { continue };
         let delta = Value::Object(delta.clone());
@@ -1431,16 +1523,16 @@ async fn chat_streaming(cfg: &Config, body: Value, usage_of: fn(&Value) -> (Valu
         let has_tool = !delta["tool_calls"].is_null();
         if think_open && (has_text || has_tool) {
             think_open = false;
-            disp(Msg::ThinkEnd);
+            sink.show(Msg::ThinkEnd);
         }
         if has_text {
             let t = delta["content"].as_str().unwrap();
-            disp(Msg::Text(t.into()));
+            sink.show(Msg::Text(t.into()));
             text.push_str(t);
         }
         if has_reason {
             let r = delta["reasoning_content"].as_str().unwrap();
-            disp(Msg::Think(r.into()));
+            sink.show(Msg::Think(r.into()));
             think_open = true;
             reasoning.push_str(r);
         }
@@ -1456,15 +1548,18 @@ async fn chat_streaming(cfg: &Config, body: Value, usage_of: fn(&Value) -> (Valu
             }
         }
     }
-    disp(Msg::Done);
-    let mut content = vec![];
-    if !reasoning.is_empty() { content.push(json!({"type": "thinking", "thinking": reasoning})); }
-    if !text.is_empty() { content.push(json!({"type": "text", "text": text})); }
+    sink.show(Msg::Done);
+    let mut blocks = vec![];
+    if !reasoning.is_empty() { blocks.push(Block::Thinking { text: reasoning, signature: None }); }
+    if !text.is_empty() { blocks.push(Block::Text(text)); }
     for tc in tool_calls {
-        content.push(json!({"type": "tool_use", "id": tc["id"], "name": tc["name"],
-            "input": serde_json::from_str::<Value>(tc["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}))}));
+        blocks.push(Block::ToolUse {
+            id: tc["id"].as_str().unwrap_or("").to_string(),
+            name: tc["name"].as_str().unwrap_or("").to_string(),
+            input: serde_json::from_str::<Value>(tc["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({})),
+        });
     }
-    Ok((json!({"content": content, "usage": usage}), interrupted))
+    Ok((Response { blocks, usage }, interrupted))
 }
 
 // ---- api: zai vendor -------------------------------------------------------
@@ -1497,11 +1592,11 @@ fn zai_accepts(cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> 
 }
 
 /// The zai vendor's one entry into the provider port.
-async fn zai_turn(cfg: &Config, history: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+async fn zai_turn(cfg: &Config, history: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
     if cfg.streaming {
-        zai_streaming(cfg, history, schemas, token).await
+        zai_streaming(cfg, history, schemas, token, sink).await
     } else {
-        zai_blocking(cfg, history, schemas, token).await
+        zai_blocking(cfg, history, schemas, token, sink).await
     }
 }
 
@@ -1520,7 +1615,7 @@ fn zai_effort_word(e: Effort) -> &'static str {
 /// thinking object at all: the flagship cannot stop thinking (`disabled`
 /// is a hard 400), so strip on this wire means "not kept", never "off" —
 /// the history blocks drop in the dialect's message translation.
-fn zai_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: bool) -> Value {
+fn zai_body(cfg: &Config, messages: &[Message], schemas: &[Value], stream: bool) -> Value {
     let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
         "messages": chat_messages(SYSTEM, messages, cfg), "tools": chat_tools(schemas)});
     if cfg.thinking == Thinking::Preserve {
@@ -1555,16 +1650,16 @@ fn zai_usage(u: &Value) -> (Value, Usage) {
 
 /// OpenAI response → internal {content, usage}: the dialect's walk, this
 /// vendor's ledger.
-fn zai_to_internal(v: &Value) -> Value {
+fn zai_to_internal(v: &Value) -> Response {
     chat_to_internal(v, zai_usage)
 }
 
-async fn zai_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
-    chat_blocking(cfg, zai_body(cfg, messages, schemas, false), zai_to_internal, token).await
+async fn zai_blocking(cfg: &Config, messages: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
+    chat_blocking(cfg, zai_body(cfg, messages, schemas, false), zai_to_internal, token, sink).await
 }
 
-async fn zai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
-    chat_streaming(cfg, zai_body(cfg, messages, schemas, true), zai_usage, token).await
+async fn zai_streaming(cfg: &Config, messages: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
+    chat_streaming(cfg, zai_body(cfg, messages, schemas, true), zai_usage, token, sink).await
 }
 
 // ---- api: deepseek vendor --------------------------------------------------
@@ -1591,11 +1686,11 @@ fn deepseek_accepts(cache: CacheMode, thinking: Thinking, effort: Option<Effort>
 }
 
 /// The deepseek vendor's one entry into the provider port.
-async fn deepseek_turn(cfg: &Config, history: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+async fn deepseek_turn(cfg: &Config, history: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
     if cfg.streaming {
-        deepseek_streaming(cfg, history, schemas, token).await
+        deepseek_streaming(cfg, history, schemas, token, sink).await
     } else {
-        deepseek_blocking(cfg, history, schemas, token).await
+        deepseek_blocking(cfg, history, schemas, token, sink).await
     }
 }
 
@@ -1606,7 +1701,7 @@ async fn deepseek_turn(cfg: &Config, history: &[Value], schemas: &[Value], token
 /// reasoning back) a stripped history would break on the second request.
 /// Effort rides `reasoning_effort` verbatim: low/high/max are the wire's
 /// own words, and it maps medium→high itself for compatibility.
-fn deepseek_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: bool) -> Value {
+fn deepseek_body(cfg: &Config, messages: &[Message], schemas: &[Value], stream: bool) -> Value {
     let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
         "thinking": {"type": if cfg.thinking == Thinking::Strip { "disabled" } else { "enabled" }},
         "messages": chat_messages(SYSTEM, messages, cfg), "tools": chat_tools(schemas)});
@@ -1637,16 +1732,16 @@ fn deepseek_usage(u: &Value) -> (Value, Usage) {
 
 /// DeepSeek response → internal {content, usage}: the dialect's walk, this
 /// vendor's ledger.
-fn deepseek_to_internal(v: &Value) -> Value {
+fn deepseek_to_internal(v: &Value) -> Response {
     chat_to_internal(v, deepseek_usage)
 }
 
-async fn deepseek_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
-    chat_blocking(cfg, deepseek_body(cfg, messages, schemas, false), deepseek_to_internal, token).await
+async fn deepseek_blocking(cfg: &Config, messages: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
+    chat_blocking(cfg, deepseek_body(cfg, messages, schemas, false), deepseek_to_internal, token, sink).await
 }
 
-async fn deepseek_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
-    chat_streaming(cfg, deepseek_body(cfg, messages, schemas, true), deepseek_usage, token).await
+async fn deepseek_streaming(cfg: &Config, messages: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
+    chat_streaming(cfg, deepseek_body(cfg, messages, schemas, true), deepseek_usage, token, sink).await
 }
 
 // ---- tests -----------------------------------------------------------------
@@ -1658,6 +1753,32 @@ mod tests {
     use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+
+    /// A typed history from JSON literals — the tests still speak the wire
+    /// shape, and `ir` owns the only translation of it.
+    fn hv(values: Vec<Value>) -> Vec<Message> {
+        values.iter().map(Message::from_value).collect()
+    }
+    /// History back as JSON, for the assertions the tests have always made.
+    fn hist(history: &[Message]) -> Value {
+        ir::history_value(history)
+    }
+    /// A response's blocks as JSON, read like a `content` array.
+    fn blocks(b: &[Block]) -> Value {
+        Value::Array(b.iter().map(Block::to_value).collect())
+    }
+
+    /// A sink that drops everything — the tests assert on state and on the
+    /// mock wire, never on what a frontend shows. The real frontends
+    /// (`plain::PlainSink`, the TUI's `ChannelSink`) are exercised through
+    /// the binary instead.
+    struct NullSink;
+    impl Show for NullSink {
+        fn show(&self, _m: Msg) {}
+    }
+    fn sink() -> NullSink {
+        NullSink
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -1676,7 +1797,7 @@ mod tests {
     fn cfg(base: String, streaming: bool) -> Config {
         Config {
             api_key: "test-key".into(), base_url: base, model: "test-model".into(),
-            protocol: Protocol::MiniMax, cache: CacheMode::Auto, thinking: Thinking::Preserve,
+            protocol: Protocol::MINIMAX, cache: CacheMode::Auto, thinking: Thinking::Preserve,
             effort: None,
             max_tokens: 1024, context_size: DEFAULT_CONTEXT_SIZE, max_turns: DEFAULT_MAX_TURNS, streaming,
         }
@@ -1832,7 +1953,7 @@ mod tests {
         assert_eq!(a.prompt, vec!["do", "stuff"]);
         assert!(!a.streaming);
         let cfg = build_config(&a).unwrap();
-        assert_eq!(cfg.protocol, Protocol::Zai);
+        assert_eq!(cfg.protocol, Protocol::ZAI);
         assert_eq!(cfg.cache, CacheMode::Auto);
         assert_eq!(cfg.thinking, Thinking::Strip);
         assert_eq!(cfg.max_tokens, 4096);
@@ -1888,7 +2009,7 @@ mod tests {
 
     #[test]
     fn user_message_is_the_single_spelling_of_a_task() {
-        assert_eq!(user_message("count files"), json!({"role": "user", "content": "count files"}));
+        assert_eq!(user_message("count files").to_value(), json!({"role": "user", "content": "count files"}));
     }
 
     #[test]
@@ -1897,7 +2018,7 @@ mod tests {
             ["--api-key", "k", "--base-url", "https://x", "-m", "m"].iter()
                 .chain(extra.iter()).map(|s| s.to_string())).unwrap();
         // spellings are case-insensitive in every position
-        assert_eq!(build_config(&parse(&["--protocol", "ZAI"])).unwrap().protocol, Protocol::Zai);
+        assert_eq!(build_config(&parse(&["--protocol", "ZAI"])).unwrap().protocol, Protocol::ZAI);
         let cfg = build_config(&parse(&["--cache", "Active", "--thinking", "STRIP"])).unwrap();
         assert_eq!(cfg.cache, CacheMode::Active);
         assert_eq!(cfg.thinking, Thinking::Strip);
@@ -1914,43 +2035,44 @@ mod tests {
 
     #[test]
     fn strip_thinking_keeps_everything_else() {
-        let history = vec![json!({"role": "assistant", "content": [
-            {"type": "thinking", "thinking": "hmm"}, {"type": "text", "text": "hello"}]})];
+        let history = hv(vec![json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "hmm"}, {"type": "text", "text": "hello"}]})]);
         let stripped = strip_thinking(&history);
-        assert_eq!(stripped[0]["content"].as_array().unwrap().len(), 1);
-        assert_eq!(history[0]["content"].as_array().unwrap().len(), 2); // untouched
+        assert_eq!(hist(&stripped)[0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(hist(&history)[0]["content"].as_array().unwrap().len(), 2); // untouched
     }
 
     #[test]
     fn fit_context_trims_oldest_tool_result_and_keeps_pairing() {
         let big = "x".repeat(10_000);
-        let mut history = vec![
+        let mut history = hv(vec![
             json!({"role": "user", "content": "go"}),
             json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]}),
             json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": big}]}),
-        ];
+        ]);
         assert!(fit_context(&mut history, 500));
-        assert!(history[2]["content"][0]["content"].as_str().unwrap().contains("trimmed"));
-        assert_eq!(history[1]["content"][0]["id"], history[2]["content"][0]["tool_use_id"]);
-        let mut tiny = vec![json!({"role": "user", "content": "t"})];
+        let j = hist(&history);
+        assert!(j[2]["content"][0]["content"].as_str().unwrap().contains("trimmed"));
+        assert_eq!(j[1]["content"][0]["id"], j[2]["content"][0]["tool_use_id"]);
+        let mut tiny = hv(vec![json!({"role": "user", "content": "t"})]);
         assert!(!fit_context(&mut tiny, 10_000));
     }
 
     #[test]
     fn fit_context_drops_short_tool_result_messages_when_still_over() {
-        let mut history = vec![
+        let mut history = hv(vec![
             json!({"role": "user", "content": "go"}),
             json!({"role": "assistant", "content": [
                 {"type": "thinking", "thinking": "one call, one thought"},
                 {"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]}),
             json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}), // too short to trim in place
             json!({"role": "assistant", "content": [{"type": "text", "text": "padding to keep the estimate high"}]}),
-        ];
+        ]);
         let limit = est_tokens(&history) - 1; // guarantee the first pass is over
         assert!(fit_context(&mut history, limit));
         // the whole exchange is gone — the assistant message held only the call
         assert_eq!(history.len(), 2);
-        assert!(!serde_json::to_string(&history).unwrap().contains("tool_result"));
+        assert!(!hist(&history).to_string().contains("tool_result"));
         assert_pairing(&history);
     }
 
@@ -1958,7 +2080,7 @@ mod tests {
     fn fit_context_keeps_unpaired_blocks_of_partially_dropped_batches() {
         // a batch of two calls where only the first result is minimal: the
         // second call/result pair must survive the first one's removal
-        let mut history = vec![
+        let mut history = hv(vec![
             json!({"role": "user", "content": "go"}),
             json!({"role": "assistant", "content": [
                 {"type": "thinking", "thinking": "plan: run two"},
@@ -1968,11 +2090,11 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},        // minimal → dropped with t1
                 {"type": "tool_result", "tool_use_id": "t2", "content": "y".repeat(500)}]}), // trimmed in place
             json!({"role": "assistant", "content": [{"type": "text", "text": "padding to keep the estimate high"}]}),
-        ];
+        ]);
         let limit = est_tokens(&history) - 1;
         assert!(fit_context(&mut history, limit));
         assert_pairing(&history);
-        let body = serde_json::to_string(&history).unwrap();
+        let body = hist(&history).to_string();
         assert!(!body.contains("\"id\": \"t1\""), "t1's tool_use must not survive its result: {body}");
         assert!(body.contains("t2"), "t2's pair must both survive: {body}");
         assert!(body.contains("thinking"), "thinking led up to t2 as well — it stays: {body}");
@@ -1980,19 +2102,24 @@ mod tests {
 
     /// Every tool_use keeps exactly one tool_result and vice versa, and no
     /// message is left with an empty content array.
-    fn assert_pairing(history: &[Value]) {
-        let ids = |ty: &str, key: &str| -> Vec<String> {
-            history.iter().filter(|m| m["content"].is_array())
-                .filter_map(|m| m["content"].as_array())
-                .flatten().filter(|b| b["type"] == ty)
-                .filter_map(|b| b[key].as_str().map(str::to_owned)).collect()
-        };
-        let uses = ids("tool_use", "id");
-        let results = ids("tool_result", "tool_use_id");
+    fn assert_pairing(history: &[Message]) {
+        let uses: Vec<String> = history.iter().flat_map(|m| match m {
+            Message::Assistant(blocks) => blocks.iter()
+                .filter_map(|b| b.tool_use().map(|(id, _, _)| id.to_string())).collect::<Vec<_>>(),
+            _ => vec![],
+        }).collect();
+        let results: Vec<String> = history.iter().flat_map(|m| match m {
+            Message::ToolResults(rs) => rs.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            _ => vec![],
+        }).collect();
         for u in &uses { assert!(results.contains(u), "tool_use {u} lost its tool_result"); }
         for r in &results { assert!(uses.contains(r), "tool_result {r} lost its tool_use"); }
-        for m in history.iter().filter(|m| m["content"].is_array()) {
-            assert!(!m["content"].as_array().unwrap().is_empty(), "empty message left behind");
+        for m in history {
+            match m {
+                Message::Assistant(b) => assert!(!b.is_empty(), "empty message left behind"),
+                Message::ToolResults(r) => assert!(!r.is_empty(), "empty message left behind"),
+                Message::User(_) => {}
+            }
         }
     }
 
@@ -2000,7 +2127,7 @@ mod tests {
 
     #[test]
     fn zai_conversion_maps_all_message_shapes() {
-        let history = vec![
+        let history = hv(vec![
             json!({"role": "user", "content": "go"}),
             json!({"role": "assistant", "content": [
                 {"type": "thinking", "thinking": "reason away"},
@@ -2008,7 +2135,7 @@ mod tests {
                 {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}}]}),
             json!({"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "t1", "content": "exit=0"}]}),
-        ];
+        ]);
         let msgs = chat_messages("sys", &history, &cfg("https://x".into(), false));
         assert_eq!(msgs[0], json!({"role": "system", "content": "sys"}));
         assert_eq!(msgs[2]["reasoning_content"], json!("reason away"));
@@ -2025,12 +2152,12 @@ mod tests {
     #[test]
     fn zai_conversion_assistant_shapes_and_tool_schemas() {
         // text-only assistant keeps a plain string content
-        let history = vec![json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})];
+        let history = hv(vec![json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})]);
         let msgs = chat_messages("sys", &history, &cfg("https://x".into(), false));
         assert_eq!(msgs[1]["content"], json!("hi"));
         assert!(msgs[1].get("tool_calls").is_none());
         // text-less assistant sends null content, not ""
-        let history = vec![json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "bash", "input": {}}]})];
+        let history = hv(vec![json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "bash", "input": {}}]})]);
         let msgs = chat_messages("sys", &history, &cfg("https://x".into(), false));
         assert_eq!(msgs[1]["content"], Value::Null);
         assert!(msgs[1]["tool_calls"].is_array());
@@ -2053,10 +2180,11 @@ mod tests {
             "usage": {"prompt_tokens": 11, "completion_tokens": 7,
                 "prompt_tokens_details": {"cached_tokens": 4}}});
         let n = zai_to_internal(&v);
-        assert_eq!(n["content"][0]["type"], json!("thinking"));
-        assert_eq!(n["content"][1]["text"], json!("answer"));
-        assert_eq!(n["content"][2]["input"]["command"], json!("ls"));
-        assert_eq!(n["usage"]["cache_read_input_tokens"], json!(4));
+        let c = blocks(&n.blocks);
+        assert_eq!(c[0]["type"], json!("thinking"));
+        assert_eq!(c[1]["text"], json!("answer"));
+        assert_eq!(c[2]["input"]["command"], json!("ls"));
+        assert_eq!(n.usage["cache_read_input_tokens"], json!(4));
     }
 
     #[test]
@@ -2070,21 +2198,22 @@ mod tests {
             r#"data: {"usage":{"prompt_tokens":9,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":2}}}"#, "\n\n",
             r#"data: [DONE]"#, "\n\n");
         let mut c = cfg(format!("http://127.0.0.1:{}", mock(events, 200, true)), true);
-        c.protocol = Protocol::Zai;
+        c.protocol = Protocol::ZAI;
         c.streaming = true;
-        let (resp, cut) = block_on(call_api(&c, &[json!({"role": "user", "content": "hey"})], &[], &CancelToken::new())).unwrap();
+        let (resp, cut) = block_on(call_api(&c, &hv(vec![json!({"role": "user", "content": "hey"})]), &[], &CancelToken::new(), &sink())).unwrap();
         assert!(!cut);
-        assert_eq!(resp["content"][0], json!({"type": "thinking", "thinking": "think"}));
-        assert_eq!(resp["content"][1], json!({"type": "text", "text": "hello"}));
-        assert_eq!(resp["content"][2]["type"], json!("tool_use"));
-        assert_eq!(resp["content"][2]["id"], json!("t1"));
-        assert_eq!(resp["content"][2]["input"]["command"], json!("echo hi"));
+        let content = blocks(&resp.blocks);
+        assert_eq!(content[0], json!({"type": "thinking", "thinking": "think"}));
+        assert_eq!(content[1], json!({"type": "text", "text": "hello"}));
+        assert_eq!(content[2]["type"], json!("tool_use"));
+        assert_eq!(content[2]["id"], json!("t1"));
+        assert_eq!(content[2]["input"]["command"], json!("echo hi"));
         // prompt_tokens includes cached_tokens on this wire; the internal
         // shape normalizes to non-cached input (9 - 2) so context_in()
         // reads true beside the Anthropic numbers
-        assert_eq!(resp["usage"]["input_tokens"], json!(7));
-        assert_eq!(resp["usage"]["output_tokens"], json!(4));
-        assert_eq!(resp["usage"]["cache_read_input_tokens"], json!(2));
+        assert_eq!(resp.usage["input_tokens"], json!(7));
+        assert_eq!(resp.usage["output_tokens"], json!(4));
+        assert_eq!(resp.usage["cache_read_input_tokens"], json!(2));
     }
 
     #[test]
@@ -2103,7 +2232,7 @@ mod tests {
         assert_eq!(Effort::High.budget(1024), 1024, "clamped to the wire minimum");
 
         // zai: the word in its own vocabulary — medium folds into high
-        c.protocol = Protocol::Zai;
+        c.protocol = Protocol::ZAI;
         c.effort = Some(Effort::High);
         assert_eq!(zai_body(&c, &[], &[], false)["reasoning_effort"], json!("high"));
         c.effort = Some(Effort::Medium);
@@ -2123,7 +2252,7 @@ mod tests {
         assert!(zai_body(&c, &[], &[], false).get("thinking").is_none(),
             "the flagship cannot stop thinking — strip sends no object, it just isn't kept");
         c.thinking = Thinking::Preserve;
-        c.protocol = Protocol::MiniMax;
+        c.protocol = Protocol::MINIMAX;
         assert_eq!(minimax_body(&c, &[], &[], true)["thinking"], json!({"type": "adaptive"}));
 
         // minimax + strip: the wire forbids it (thinking continuity)
@@ -2135,16 +2264,16 @@ mod tests {
         // the openai wire has no thinking-continuity rule; but the rest of
         // the config is incomplete here, so only probe the guard itself
         let probe = |p: Protocol| {
-            let word = match p { Protocol::MiniMax => "minimax", Protocol::Zai => "zai", Protocol::DeepSeek => "deepseek" };
+            let word = p.label();
             let mut a = Args { effort: Some("high".into()), thinking: Some("strip".into()),
                 protocol: Some(word.into()),
                 ..Default::default() };
             a.api_key = Some("k".into()); a.base_url = Some("https://x".into()); a.model = Some("m".into());
             build_config(&a)
         };
-        assert!(probe(Protocol::MiniMax).is_err());
-        assert!(probe(Protocol::Zai).is_err(), "zai keeps its reasoning: strip + effort is refused");
-        assert!(probe(Protocol::DeepSeek).is_err());
+        assert!(probe(Protocol::MINIMAX).is_err());
+        assert!(probe(Protocol::ZAI).is_err(), "zai keeps its reasoning: strip + effort is refused");
+        assert!(probe(Protocol::DEEPSEEK).is_err());
         // the env var spells it too
         std::env::set_var("JINGWEI_EFFORT", "max");
         let a = Args { api_key: Some("k".into()), base_url: Some("https://x".into()), model: Some("m".into()), ..Default::default() };
@@ -2165,9 +2294,9 @@ mod tests {
         // history rides the wire verbatim — signature and all, the vendor's
         // continuity rule for interleaved thinking
         c.thinking = Thinking::Preserve;
-        let history = vec![json!({"role": "assistant", "content": [
+        let history = hv(vec![json!({"role": "assistant", "content": [
             {"type": "thinking", "thinking": "step", "signature": "sig1"},
-            {"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]})];
+            {"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]})]);
         let body = minimax_body(&c, &history, &[], false);
         assert_eq!(body["messages"][0]["content"][0]["signature"], json!("sig1"));
         assert_eq!(body["messages"][0]["content"][1]["id"], json!("t1"));
@@ -2201,7 +2330,7 @@ mod tests {
         // minimax: /v1/messages with x-api-key + the Messages-wire version
         // header + bearer (the endpoint honors both auth styles)
         let (port, reqs) = mock_seq(vec![(200, r#"{"content":[],"usage":{}}"#.into())]);
-        block_on(call_api(&cfg(format!("http://127.0.0.1:{port}"), false), &[], &[], &CancelToken::new())).unwrap();
+        block_on(call_api(&cfg(format!("http://127.0.0.1:{port}"), false), &[], &[], &CancelToken::new(), &sink())).unwrap();
         let req = reqs.lock().unwrap()[0].to_lowercase();
         assert!(req.contains("post /v1/messages http/1.1"), "{req}");
         assert!(req.contains("x-api-key: test-key"), "{req}");
@@ -2209,13 +2338,13 @@ mod tests {
         assert!(req.contains("authorization: bearer test-key"), "{req}");
         // trailing slash in base_url must not double the path
         let (port, reqs) = mock_seq(vec![(200, r#"{"content":[],"usage":{}}"#.into())]);
-        block_on(call_api(&cfg(format!("http://127.0.0.1:{port}/"), false), &[], &[], &CancelToken::new())).unwrap();
+        block_on(call_api(&cfg(format!("http://127.0.0.1:{port}/"), false), &[], &[], &CancelToken::new(), &sink())).unwrap();
         assert!(reqs.lock().unwrap()[0].contains("POST /v1/messages HTTP/1.1"));
         // openai: /chat/completions with bearer only
         let (port, reqs) = mock_seq(vec![(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#.into())]);
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
-        c.protocol = Protocol::Zai;
-        block_on(call_api(&c, &[json!({"role": "user", "content": "hi"})], &[], &CancelToken::new())).unwrap();
+        c.protocol = Protocol::ZAI;
+        block_on(call_api(&c, &hv(vec![json!({"role": "user", "content": "hi"})]), &[], &CancelToken::new(), &sink())).unwrap();
         let req = reqs.lock().unwrap()[0].to_lowercase();
         assert!(req.contains("post /chat/completions http/1.1"), "{req}");
         assert!(req.contains("authorization: bearer test-key"), "{req}");
@@ -2227,11 +2356,11 @@ mod tests {
     #[test]
     fn minimax_blocking_roundtrip_and_error() {
         let port = mock(r#"{"content":[{"type":"text","text":"hi from mock"}],"usage":{"input_tokens":7,"output_tokens":3}}"#, 200, false);
-        let (resp, cut) = block_on(call_api(&cfg(format!("http://127.0.0.1:{port}"), false), &[], &[], &CancelToken::new())).unwrap();
-        assert_eq!(resp["content"][0]["text"], "hi from mock");
+        let (resp, cut) = block_on(call_api(&cfg(format!("http://127.0.0.1:{port}"), false), &[], &[], &CancelToken::new(), &sink())).unwrap();
+        assert_eq!(blocks(&resp.blocks)[0]["text"], "hi from mock");
         assert!(!cut);
         let port = mock(r#"{"error":{"message":"bad model"}}"#, 400, false);
-        let err = block_on(call_api(&cfg(format!("http://127.0.0.1:{port}"), false), &[], &[], &CancelToken::new())).unwrap_err();
+        let err = block_on(call_api(&cfg(format!("http://127.0.0.1:{port}"), false), &[], &[], &CancelToken::new(), &sink())).unwrap_err();
         assert!(err.to_string().contains("bad model"), "got: {err}");
     }
 
@@ -2239,10 +2368,10 @@ mod tests {
     fn zai_blocking_roundtrip() {
         let port = mock(r#"{"choices":[{"message":{"content":"mock says hi"}}],"usage":{"prompt_tokens":5,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":1}}}"#, 200, false);
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
-        c.protocol = Protocol::Zai;
-        let (resp, _) = block_on(call_api(&c, &[json!({"role": "user", "content": "hey"})], &[], &CancelToken::new())).unwrap();
-        assert_eq!(resp["content"][0]["text"], "mock says hi");
-        assert_eq!(resp["usage"]["cache_read_input_tokens"], json!(1));
+        c.protocol = Protocol::ZAI;
+        let (resp, _) = block_on(call_api(&c, &hv(vec![json!({"role": "user", "content": "hey"})]), &[], &CancelToken::new(), &sink())).unwrap();
+        assert_eq!(blocks(&resp.blocks)[0]["text"], "mock says hi");
+        assert_eq!(resp.usage["cache_read_input_tokens"], json!(1));
     }
 
     #[test]
@@ -2287,7 +2416,7 @@ mod tests {
     #[test]
     fn deepseek_body_carries_the_toggle_and_the_effort_word() {
         let mut c = cfg("https://x".into(), true);
-        c.protocol = Protocol::DeepSeek;
+        c.protocol = Protocol::DEEPSEEK;
         // preserve + effort: thinking on, the wire's own word verbatim
         // (medium arrives as "medium" — the wire maps it to high itself)
         c.effort = Some(Effort::Max);
@@ -2305,9 +2434,9 @@ mod tests {
         // reasoning echo: the dialect's strictest reading serves this wire's
         // rule (tools ⇒ every past turn's reasoning_content back)
         c.thinking = Thinking::Preserve;
-        let history = vec![json!({"role": "assistant", "content": [
+        let history = hv(vec![json!({"role": "assistant", "content": [
             {"type": "thinking", "thinking": "step one"},
-            {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}}]})];
+            {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}}]})]);
         let msgs = chat_messages(SYSTEM, &history, &c);
         assert_eq!(msgs[1]["reasoning_content"], json!("step one"));
         assert_eq!(msgs[1]["tool_calls"][0]["id"], json!("t1"));
@@ -2322,12 +2451,12 @@ mod tests {
         assert!(ok(CacheMode::Auto, Thinking::Strip, None), "strip alone is the toggle off");
         // the vendor names its own endpoint (and flagship, when it has
         // one); the wires stay unnamed
-        assert_eq!(Protocol::DeepSeek.default_base(), Some("https://api.deepseek.com"));
-        assert_eq!(Protocol::MiniMax.default_base(), Some("https://api.minimax.cn/anthropic"));
-        assert_eq!(Protocol::MiniMax.default_model(), Some("MiniMax-M3"));
-        assert_eq!(Protocol::Zai.default_base(), Some("https://open.bigmodel.cn/api/paas/v4"));
-        assert_eq!(Protocol::Zai.default_model(), Some("glm-5.3-flash"));
-        assert_eq!(Protocol::DeepSeek.default_model(), None, "flash or pro is the user's call");
+        assert_eq!(Protocol::DEEPSEEK.default_base(), Some("https://api.deepseek.com"));
+        assert_eq!(Protocol::MINIMAX.default_base(), Some("https://api.minimax.cn/anthropic"));
+        assert_eq!(Protocol::MINIMAX.default_model(), Some("MiniMax-M3"));
+        assert_eq!(Protocol::ZAI.default_base(), Some("https://open.bigmodel.cn/api/paas/v4"));
+        assert_eq!(Protocol::ZAI.default_model(), Some("glm-5.3-flash"));
+        assert_eq!(Protocol::DEEPSEEK.default_model(), None, "flash or pro is the user's call");
     }
 
     #[test]
@@ -2368,16 +2497,17 @@ mod tests {
     fn deepseek_blocking_roundtrip_and_error() {
         let port = mock(r#"{"choices":[{"message":{"content":"北京","reasoning_content":"thinking hard"}}],"usage":{"prompt_tokens":38,"prompt_cache_hit_tokens":12,"prompt_cache_miss_tokens":26,"completion_tokens":4}}"#, 200, false);
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
-        c.protocol = Protocol::DeepSeek;
-        let (resp, _) = block_on(call_api(&c, &[json!({"role": "user", "content": "capital?"})], &[], &CancelToken::new())).unwrap();
-        assert_eq!(resp["content"][0]["thinking"], json!("thinking hard"));
-        assert_eq!(resp["content"][1]["text"], json!("北京"));
-        assert_eq!(resp["usage"]["input_tokens"], json!(26));
-        assert_eq!(resp["usage"]["cache_read_input_tokens"], json!(12));
+        c.protocol = Protocol::DEEPSEEK;
+        let (resp, _) = block_on(call_api(&c, &hv(vec![json!({"role": "user", "content": "capital?"})]), &[], &CancelToken::new(), &sink())).unwrap();
+        let content = blocks(&resp.blocks);
+        assert_eq!(content[0]["thinking"], json!("thinking hard"));
+        assert_eq!(content[1]["text"], json!("北京"));
+        assert_eq!(resp.usage["input_tokens"], json!(26));
+        assert_eq!(resp.usage["cache_read_input_tokens"], json!(12));
         let port = mock(r#"{"error":{"message":"The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek-bogus."}}"#, 400, false);
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
-        c.protocol = Protocol::DeepSeek;
-        let err = block_on(call_api(&c, &[json!({"role": "user", "content": "hi"})], &[], &CancelToken::new())).unwrap_err();
+        c.protocol = Protocol::DEEPSEEK;
+        let err = block_on(call_api(&c, &hv(vec![json!({"role": "user", "content": "hi"})]), &[], &CancelToken::new(), &sink())).unwrap_err();
         assert!(err.to_string().contains("deepseek-bogus"), "the wire's error body, verbatim; got: {err}");
     }
 
@@ -2396,14 +2526,14 @@ mod tests {
             r#"data: {"choices":[{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":275,"completion_tokens":37,"prompt_cache_hit_tokens":128,"prompt_cache_miss_tokens":147}}"#, "\n\n",
             r#"data: [DONE]"#, "\n\n");
         let mut c = cfg(format!("http://127.0.0.1:{}", mock(events, 200, true)), true);
-        c.protocol = Protocol::DeepSeek;
+        c.protocol = Protocol::DEEPSEEK;
         c.streaming = true;
-        let (resp, cut) = block_on(call_api(&c, &[], &[], &CancelToken::new())).unwrap();
+        let (resp, cut) = block_on(call_api(&c, &[], &[], &CancelToken::new(), &sink())).unwrap();
         assert!(!cut);
-        assert_eq!(resp["content"][0]["thinking"], json!("The user wants the date."));
-        assert_eq!(resp["content"][1]["input"]["command"], json!("date"));
-        assert_eq!(resp["usage"]["input_tokens"], json!(147));
-        assert_eq!(resp["usage"]["cache_read_input_tokens"], json!(128));
+        assert_eq!(blocks(&resp.blocks)[0]["thinking"], json!("The user wants the date."));
+        assert_eq!(blocks(&resp.blocks)[1]["input"]["command"], json!("date"));
+        assert_eq!(resp.usage["input_tokens"], json!(147));
+        assert_eq!(resp.usage["cache_read_input_tokens"], json!(128));
     }
 
     #[test]
@@ -2428,14 +2558,14 @@ mod tests {
             r#"data: {"type":"message_stop"}"#, "\n\n");
         let mut c = cfg(format!("http://127.0.0.1:{}", mock(events, 200, true)), true);
         c.streaming = true;
-        let (resp, cut) = block_on(call_api(&c, &[], &[], &CancelToken::new())).unwrap();
+        let (resp, cut) = block_on(call_api(&c, &[], &[], &CancelToken::new(), &sink())).unwrap();
         assert!(!cut);
-        assert_eq!(resp["content"][0]["thinking"], json!("step"));
-        assert_eq!(resp["content"][0]["signature"], json!("c8b7a9218aec"));
-        assert_eq!(resp["content"][1]["text"], json!("hello world"));
-        assert_eq!(resp["content"][2]["input"]["command"], json!("ls"));
-        assert_eq!(resp["usage"]["output_tokens"], json!(2));
-        assert_eq!(resp["usage"]["cache_read_input_tokens"], json!(203));
+        assert_eq!(blocks(&resp.blocks)[0]["thinking"], json!("step"));
+        assert_eq!(blocks(&resp.blocks)[0]["signature"], json!("c8b7a9218aec"));
+        assert_eq!(blocks(&resp.blocks)[1]["text"], json!("hello world"));
+        assert_eq!(blocks(&resp.blocks)[2]["input"]["command"], json!("ls"));
+        assert_eq!(resp.usage["output_tokens"], json!(2));
+        assert_eq!(resp.usage["cache_read_input_tokens"], json!(203));
     }
 
     #[test]
@@ -2444,7 +2574,7 @@ mod tests {
             r#"data: {"type":"error","error":{"type":"overloaded","message":"server overloaded"}}"#, "\n\n");
         let mut c = cfg(format!("http://127.0.0.1:{}", mock(events, 200, true)), true);
         c.streaming = true;
-        assert!(block_on(call_api(&c, &[], &[], &CancelToken::new())).unwrap_err().to_string().contains("overloaded"));
+        assert!(block_on(call_api(&c, &[], &[], &CancelToken::new(), &sink())).unwrap_err().to_string().contains("overloaded"));
     }
 
     // ---- agent loop ----
@@ -2454,15 +2584,16 @@ mod tests {
         let tool = r#"{"content":[{"type":"tool_use","id":"t1","name":"bash","input":{"command":"echo hi"}}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
         let done = r#"{"content":[{"type":"text","text":"done"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
         let (port, reqs) = mock_seq(vec![(200, tool.into()), (200, done.into())]);
-        let mut history = vec![json!({"role": "user", "content": "run echo"})];
-        block_on(agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &CancelToken::new())).unwrap();
+        let mut history = hv(vec![json!({"role": "user", "content": "run echo"})]);
+        block_on(agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &CancelToken::new(), &sink())).unwrap();
         assert_eq!(history.len(), 4); // user + assistant(tool_use) + user(tool_result) + assistant(text)
-        assert_eq!(history[1]["role"], json!("assistant"));
-        assert_eq!(history[1]["content"][0]["id"], json!("t1")); // full turn echoed back, thinking intact
-        assert_eq!(history[2]["content"][0]["type"], json!("tool_result"));
-        assert_eq!(history[2]["content"][0]["tool_use_id"], json!("t1"));
-        assert!(history[2]["content"][0]["content"].as_str().unwrap().contains("hi"));
-        assert_eq!(history[3]["content"][0]["text"], json!("done")); // final answer stays in history for follow-ups
+        let j = hist(&history);
+        assert_eq!(j[1]["role"], json!("assistant"));
+        assert_eq!(j[1]["content"][0]["id"], json!("t1")); // full turn echoed back, thinking intact
+        assert_eq!(j[2]["content"][0]["type"], json!("tool_result"));
+        assert_eq!(j[2]["content"][0]["tool_use_id"], json!("t1"));
+        assert!(j[2]["content"][0]["content"].as_str().unwrap().contains("hi"));
+        assert_eq!(j[3]["content"][0]["text"], json!("done")); // final answer stays in history for follow-ups
         let reqs = reqs.lock().unwrap();
         assert!(reqs[0].contains("input_schema"), "tool schemas must be sent");
         assert!(reqs[1].contains("\"type\":\"tool_result\""), "results must feed the next request");
@@ -2474,8 +2605,8 @@ mod tests {
         let (port, _) = mock_seq(vec![(200, tool.into())]);
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
         c.max_turns = 1;
-        let mut history = vec![json!({"role": "user", "content": "go"})];
-        block_on(agent_loop(&c, &mut history, &CancelToken::new())).unwrap(); // must return instead of spinning
+        let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
+        block_on(agent_loop(&c, &mut history, &CancelToken::new(), &sink())).unwrap(); // must return instead of spinning
         assert_eq!(history.len(), 3); // user + assistant(tool_use) + user(tool_result)
     }
 
@@ -2536,7 +2667,7 @@ mod tests {
             r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
             r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answ"}}"#, "\n\n");
         let port = mock_stall(tool, stalled);
-        let mut history = vec![json!({"role": "user", "content": "go"})];
+        let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
         let err = block_on(async {
             let token = Arc::new(CancelToken::new());
             let t = token.clone();
@@ -2544,19 +2675,20 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 t.cancel();
             });
-            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), true), &mut history, &token).await
+            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), true), &mut history, &token, &sink()).await
         }).unwrap_err();
         assert!(matches!(err, Error::Interrupted), "got: {err}");
         // user + assistant(tool_use) + user(tool_result) + assistant(partial text; tool_use dropped)
         assert_eq!(history.len(), 4);
-        assert_eq!(history[3]["role"], json!("assistant"));
-        assert_eq!(history[3]["content"][0]["type"], json!("text"));
-        assert_eq!(history[3]["content"][0]["text"], json!("partial answ"));
-        assert!(history[3]["content"].as_array().unwrap().iter().all(|b| b["type"] != "tool_use"));
+        let j = hist(&history);
+        assert_eq!(j[3]["role"], json!("assistant"));
+        assert_eq!(j[3]["content"][0]["type"], json!("text"));
+        assert_eq!(j[3]["content"][0]["text"], json!("partial answ"));
+        assert!(j[3]["content"].as_array().unwrap().iter().all(|b| b["type"] != "tool_use"));
         // every tool_use still has its tool_result — the history stays sendable
-        let ids: Vec<&str> = history[1]["content"].as_array().unwrap().iter()
+        let ids: Vec<&str> = j[1]["content"].as_array().unwrap().iter()
             .filter(|b| b["type"] == "tool_use").map(|b| b["id"].as_str().unwrap()).collect();
-        let results: Vec<&str> = history[2]["content"].as_array().unwrap().iter()
+        let results: Vec<&str> = j[2]["content"].as_array().unwrap().iter()
             .map(|b| b["tool_use_id"].as_str().unwrap()).collect();
         assert!(ids.iter().all(|i| results.contains(i)));
     }
@@ -2567,7 +2699,7 @@ mod tests {
         let tool = format!(
             r#"{{"content":[{{"type":"tool_use","id":"t1","name":"bash","input":{{"command":"{cmd}"}}}}],"usage":{{"input_tokens":1,"output_tokens":1}}}}"#);
         let (port, _) = mock_seq(vec![(200, tool)]);
-        let mut history = vec![json!({"role": "user", "content": "go"})];
+        let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
         let err = block_on(async {
             let token = Arc::new(CancelToken::new());
             let t = token.clone();
@@ -2575,13 +2707,13 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 t.cancel();
             });
-            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &token).await
+            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &token, &sink()).await
         }).unwrap_err();
         assert!(matches!(err, Error::Interrupted), "got: {err}");
         assert_eq!(history.len(), 3); // user + assistant(tool_use) + user(tool_result)
-        let result = history[2]["content"][0]["content"].as_str().unwrap();
+        let result = hist(&history)[2]["content"][0]["content"].as_str().unwrap().to_string();
         assert!(result.contains("[interrupted by user]"), "got: {result}");
-        assert_eq!(history[2]["content"][0]["tool_use_id"], json!("t1"));
+        assert_eq!(hist(&history)[2]["content"][0]["tool_use_id"], json!("t1"));
     }
 
     /// Regression: a grandchild holding the pipes (backgrounded process,

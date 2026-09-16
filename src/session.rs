@@ -45,7 +45,8 @@
 //! the internal representation, which every wire adapter already speaks —
 //! a session started on one protocol resumes on another for free.
 
-use crate::display::{self, disp, Msg, Sev};
+use crate::display::{self, Msg, Sev, Show};
+use crate::ir::Message;
 use crate::{home_dir, Error};
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
@@ -100,7 +101,7 @@ pub fn project_dir_of(cwd: &str) -> Option<PathBuf> {
 /// checking (see the module docs).
 pub struct Convo {
     /// The internal history — the agent core's own shape, borrowed as `&mut`.
-    pub history: Vec<Value>,
+    pub history: Vec<Message>,
     session: Option<Session>,
 }
 
@@ -112,17 +113,17 @@ impl Convo {
 
     /// A conversation persisted to `session` — fresh, or resumed with its
     /// history loaded from the file.
-    pub fn persistent(session: Session, history: Vec<Value>) -> Self {
+    pub fn persistent(session: Session, history: Vec<Message>) -> Self {
         Self { history, session: Some(session) }
     }
 
     /// Land everything not yet on disk. Run boundaries only. A failure
     /// here must never take the agent down: the note says what happened,
     /// the conversation continues in memory.
-    pub fn persist(&mut self) {
+    pub fn persist(&mut self, sink: &dyn Show) {
         let Some(s) = self.session.as_mut() else { return };
         if let Err(e) = s.sync(&self.history) {
-            disp(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
+            sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
         }
     }
 }
@@ -229,7 +230,7 @@ impl Session {
     /// (an in-place content cut) appends nothing: the file keeps the fuller
     /// record, and the trim simply happens again on load. An empty tail
     /// writes nothing, so a session that never ran never lands on disk.
-    pub fn sync(&mut self, history: &[Value]) -> io::Result<()> {
+    pub fn sync(&mut self, history: &[Message]) -> io::Result<()> {
         if self.path.is_none() {
             return Ok(()); // no home directory: persistence quietly off
         }
@@ -250,7 +251,7 @@ impl Session {
             writeln!(f, "{}", self.header)?;
         }
         for m in tail {
-            writeln!(f, "{m}")?;
+            writeln!(f, "{}", m.to_value())?;
         }
         f.flush()?;
         self.persisted = history.len();
@@ -259,7 +260,7 @@ impl Session {
 
     /// Write the whole file anew — temp file, then rename, so a crash never
     /// leaves a half-rewritten session.
-    fn rewrite(&mut self, history: &[Value]) -> io::Result<()> {
+    fn rewrite(&mut self, history: &[Message]) -> io::Result<()> {
         let tmp = self.path.as_deref().unwrap().with_extension("tmp");
         if let Some(p) = tmp.parent() {
             fs::create_dir_all(p)?;
@@ -267,7 +268,7 @@ impl Session {
         let mut f = fs::File::create(&tmp)?;
         writeln!(f, "{}", self.header)?;
         for m in history {
-            writeln!(f, "{m}")?;
+            writeln!(f, "{}", m.to_value())?;
         }
         f.flush()?;
         fs::rename(&tmp, self.path.as_deref().unwrap())?;
@@ -279,7 +280,7 @@ impl Session {
     /// whose id starts with `selector`. Scoping comes from the layout —
     /// the project subdirectory *is* the filter. The returned session
     /// keeps the file's identity — new turns append to it.
-    pub fn load(selector: Option<&str>) -> crate::Result<(Session, Vec<Value>)> {
+    pub fn load(selector: Option<&str>) -> crate::Result<(Session, Vec<Message>)> {
         let dir = project_dir()
             .ok_or_else(|| Error::Msg("no home directory — cannot find ~/.jingwei/projects".into()))?;
         load_in(&dir, selector)
@@ -312,7 +313,7 @@ impl Session {
 
 // ---- directory scan ---------------------------------------------------------
 
-fn load_in(dir: &Path, selector: Option<&str>) -> crate::Result<(Session, Vec<Value>)> {
+fn load_in(dir: &Path, selector: Option<&str>) -> crate::Result<(Session, Vec<Message>)> {
     let metas = list_in(dir)?;
     let chosen = match selector {
         Some(s) => {
@@ -343,7 +344,7 @@ fn load_in(dir: &Path, selector: Option<&str>) -> crate::Result<(Session, Vec<Va
         // corruption this defends against is framing damage — a write
         // killed mid-line — and that is a parse failure.
         if let Ok(v) = serde_json::from_str::<Value>(line) {
-            history.push(v);
+            history.push(Message::from_value(&v));
         }
     }
     Ok((
@@ -620,14 +621,14 @@ mod tests {
         Provenance { model: "test-model".into(), protocol: "test-proto".into(), base_url: "https://x".into() }
     }
 
-    fn history() -> Vec<Value> {
+    fn history() -> Vec<Message> {
         vec![
             crate::user_message("count files"),
-            json!({"role": "assistant", "content": [
-                {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}}]}),
-            json!({"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "t1", "content": "a\nb"}]}),
-            json!({"role": "assistant", "content": [{"type": "text", "text": "there are 2"}]}),
+            Message::from_value(&json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}}]})),
+            Message::from_value(&json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "a\nb"}]})),
+            Message::from_value(&json!({"role": "assistant", "content": [{"type": "text", "text": "there are 2"}]})),
         ]
     }
 
@@ -666,7 +667,7 @@ mod tests {
         assert_eq!(header["model"], "test-model");
         assert_eq!(header["protocol"], "test-proto");
         assert!(header["cwd"].as_str().is_some_and(|s| !s.is_empty()), "provenance: where it started");
-        assert!(body.ends_with(&format!("{}\n", h[1])), "messages land verbatim, one per line");
+        assert!(body.ends_with(&format!("{}\n", h[1].to_value())), "messages land verbatim, one per line");
         s.sync(&h).unwrap(); // appending continues from the counter
         let body = fs::read_to_string(s.path().unwrap()).unwrap();
         assert_eq!(body.lines().count(), 1 + 4);
@@ -762,7 +763,7 @@ mod tests {
         let mut b = Session::create(Some(&d), &prov(), 1, 2000);
         b.sync(&[
             crate::user_message("second task"),
-            json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]}),
+            Message::from_value(&json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]})),
         ])
         .unwrap();
         // a foreign file in the directory is skipped, not fatal
@@ -870,13 +871,13 @@ mod tests {
         // fixed point — and numbers round-trip exactly.
         let h = vec![
             crate::user_message("count 精卫 \"quoted\" \\backslash\\ \nnewline\ttab 🪨"),
-            json!({"role": "assistant", "content": [
+            Message::from_value(&json!({"role": "assistant", "content": [
                 {"type": "thinking", "thinking": "考虑\n多行推理 é\u{301}"},
                 {"type": "tool_use", "id": "t1", "name": "bash", "input": {
                     "command": "printf 'a\\b'", "n": -12, "f": 2.5,
                     "big": 9007199254740993i64,
                     "nested": {"k": [1, 2, {"z": null}]}}},
-                {"type": "text", "text": "done"}]}),
+                {"type": "text", "text": "done"}]})),
         ];
         let d = dir("bytes");
         let mut s = Session::create(Some(&d), &prov(), 1, 0);
@@ -884,8 +885,8 @@ mod tests {
         let (_, loaded) = load_in(&d, Some(s.id())).unwrap();
         assert_eq!(h, loaded, "the value tree comes back identical");
         assert_eq!(
-            serde_json::to_string(&h).unwrap(),
-            serde_json::to_string(&loaded).unwrap(),
+            serde_json::to_string(&crate::ir::history_value(&h)).unwrap(),
+            serde_json::to_string(&crate::ir::history_value(&loaded)).unwrap(),
             "bytes identical — the resumed request replays into the same prefix"
         );
     }
@@ -894,7 +895,7 @@ mod tests {
     fn ephemeral_convo_persists_nothing_and_never_panics() {
         let mut c = Convo::ephemeral();
         c.history.push(crate::user_message("hi"));
-        c.persist(); // a quiet no-op — one-shots leave no session behind
+        c.persist(&crate::plain::PlainSink::new()); // a quiet no-op — one-shots leave no session behind
         assert_eq!(c.history.len(), 1);
     }
 }
