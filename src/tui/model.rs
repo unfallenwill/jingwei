@@ -6,14 +6,16 @@
 use crate::display::{Sev, Usage};
 use std::time::Duration;
 
-/// The one heartbeat cadence; the spinner advances one frame per tick and
-/// the elapsed clock accumulates the *measured* deltas each tick carries
-/// (see [`crate::tui::update::Ev::Tick`]). Keeping time *in the state* (not
-/// read from the wall clock at render time) is what makes views
-/// deterministic and testable.
+/// The one heartbeat cadence; the task clock accumulates the *measured*
+/// deltas each tick carries (see [`crate::tui::update::Ev::Tick`]). Keeping
+/// time *in the state* (not read from the wall clock at render time) is
+/// what makes views deterministic and testable.
 pub const TICK: Duration = Duration::from_millis(120);
 
-pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// How many body lines the *live* reasoning block shows — its tail, the
+/// part that is still moving: motion, not bulk. (Ctrl-O and the plain
+/// log's 20-line echo exist to see the rest.)
+pub const THINK_TAIL_SHOWN: usize = 3;
 
 /// The two modes. `Input` is the REPL (editing a line); `Browse` is the
 /// expanded review mode: every fold is open and the transcript scrolls.
@@ -108,9 +110,10 @@ fn floor_boundary(text: &str, i: usize) -> usize {
     i
 }
 
-/// The status bar's state. `elapsed` accumulates measured tick deltas;
-/// `turns` counts finished API requests (one `Done` each) — the step
-/// number the bar shows against `Info::max_turns`.
+/// The running task and the usage readings. The task's `elapsed` clock is
+/// what fold durations ([`Fold::duration`]) and the live thinking block's
+/// label are measured against — measured time stays in the state, never
+/// read from the wall at render time.
 #[derive(Clone, Debug)]
 pub struct Status {
     /// Mirrors the last `Row::Task` — both are written together, in
@@ -120,15 +123,23 @@ pub struct Status {
     /// bar's context reading: what the model just read is the best
     /// estimate of what the next request will carry.
     pub turn: Usage,
+    /// Usage accumulated across the session. Not a bar segment of its
+    /// own — the cache hit rate is computed over it.
     pub total: Usage,
-    pub spin: usize,
-    pub turns: u32,
+    /// The pane's high-water mark this task: the most live rows (think
+    /// tail, streaming partial) it has shown above the input block. The
+    /// pane pads to it, so within a task the pane only ever grows — a
+    /// fold swaps tail rows for blank padding and the status bar keeps
+    /// its row (a bar that walks up and down as thoughts fold and
+    /// restream reads as breakage). Kept through idle for the same
+    /// reason; the next task starts tight.
+    pub pane_floor: usize,
 }
 
 /// Session facts the bar renders but events never change: who is being
-/// talked to and what the limits are. Set once by the frontend (which
-/// owns the config); defaults are "unknown", and every segment keyed on
-/// them simply does not appear.
+/// talked to and what the limit is. Set once by the frontend (which owns
+/// the config); defaults are "unknown", and every segment keyed on them
+/// simply does not appear.
 #[derive(Clone, Debug, Default)]
 pub struct Info {
     pub model: String,
@@ -136,8 +147,6 @@ pub struct Info {
     pub effort: Option<String>,
     /// `--context-size`; 0 = unknown → no ctx gauge.
     pub context_limit: u64,
-    /// `--max-turns`; 0 = unknown → no step counter.
-    pub max_turns: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -225,7 +234,7 @@ impl App {
             think_buf: String::new(),
             think_start: None,
             input: Input::default(),
-            status: Status { task: None, turn: Usage::default(), total: Usage::default(), spin: 0, turns: 0 },
+            status: Status { task: None, turn: Usage::default(), total: Usage::default(), pane_floor: 0 },
             info: Info::default(),
             cancel_sent: false,
             quit: false,
@@ -244,6 +253,7 @@ impl App {
             let line: String = self.partial.drain(..=i).collect();
             self.rows.push(Row::Line(line.trim_end_matches('\n').to_string()));
         }
+        self.raise_floor();
     }
 
     /// Flush the partial line into the transcript.
@@ -260,6 +270,29 @@ impl App {
             self.think_start = self.status.task.as_ref().map(|t| t.elapsed);
         }
         self.think_buf.push_str(t);
+        self.raise_floor();
+    }
+
+    /// Live rows above the input block right now: the think block's head
+    /// plus its shown tail ([`THINK_TAIL_SHOWN`]), and the streaming
+    /// partial when one is in flight. The same arithmetic
+    /// [`crate::tui::view`] renders — kept beside it in the model so the
+    /// floor the pane pads to can never drift from what it shows.
+    fn live_rows(&self) -> usize {
+        let mut n = 0;
+        if !self.think_buf.is_empty() {
+            n += 1 + self.think_buf.lines().count().min(THINK_TAIL_SHOWN);
+        }
+        if !self.partial.is_empty() {
+            n += 1;
+        }
+        n
+    }
+
+    /// Record [`live_rows`] in the floor if it is a new peak (see
+    /// [`Status::pane_floor`]).
+    fn raise_floor(&mut self) {
+        self.status.pane_floor = self.status.pane_floor.max(self.live_rows());
     }
 
     /// How long the in-flight reasoning block has been running, against

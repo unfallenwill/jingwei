@@ -16,7 +16,7 @@
 //! Styling honors [`crate::display::color_on`]: with NO_COLOR the same
 //! structure renders without color, exactly like the plain frontend.
 
-use super::model::{App, Fold, Mode, Row};
+use super::model::{App, Fold, Mode, Row, THINK_TAIL_SHOWN};
 use crate::display::{color_on, disp_width, elapsed_str, prompt_w, thought_folded, truncate_cols, wrap_cols, Usage, ERR_BG, FOLD_GUTTER, PROMPT_GUTTER, PROMPT_HEAD, WARN_BG};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -46,85 +46,51 @@ fn cache_pct(total: &Usage) -> Option<u64> {
         .then(|| total.cache_read * 100 / read)
 }
 
-/// The status bar's text within `max_w` display columns: a *state* zone
-/// (left) and a *ledger* zone (right), pure — the spinner glyph and
-/// elapsed label come from the state (already deterministic given the
-/// ticks), so tests pin them directly.
+/// The status bar's text within `max_w` display columns: the session's
+/// ledger, flush right, pure — so tests pin it directly.
 ///
-/// The zones answer different questions at different cadences: state
-/// ("is it alive? which step?") is glanced every few seconds, so it sits
-/// where the eye lands and never sheds; the ledger ("who am I talking
-/// to, what have I spent, how much room is left") is checked
-/// occasionally, so it sheds instead — model first, then effort, then the
-/// cache rate, then the ctx gauge — with the totals pinned (a bar that
-/// hides the session's cost has stopped being a ledger). When both zones
-/// fit, the ledger flushes right and the gap between them breathes; when
-/// nothing unpinned is left to shed, the bar truncates, keeping its
-/// one-physical-row law.
+/// The ledger answers "who am I talking to, how much room is left" —
+/// checked occasionally, so it sheds as the pane narrows: model first
+/// (the banner already said it), then effort, then the cache rate, then
+/// the ctx gauge — with the browse hint pinned (in review, the user is
+/// reading history, not checking accounts — the hint is the one thing
+/// the bar must still say). When nothing unpinned is left to shed, the
+/// bar truncates, keeping its one-physical-row law.
 pub fn bar_text(app: &App, max_w: usize) -> String {
-    let (left, right) = bar_segs(app);
-    let l = left.join(" · ");
-    if l.is_empty() && right.is_empty() {
-        return String::new();
-    }
-    let mut right = right;
+    let mut segs = bar_segs(app);
     loop {
-        let r = right.iter().map(|s| s.content.clone()).collect::<Vec<_>>().join(" · ");
-        let (lw, rw) = (disp_width(&l), disp_width(&r));
-        let fits = if r.is_empty() {
-            lw <= max_w
-        } else if l.is_empty() {
-            rw <= max_w
-        } else {
-            lw + rw < max_w // strictly: at least one column of gap
-        };
-        if fits || right.is_empty() || right.iter().all(|s| s.pinned) {
-            if r.is_empty() {
-                return truncate_cols(&l, max_w);
-            }
-            if l.is_empty() {
-                // idle: the ledger alone, flush right — where it always sits
-                return if rw >= max_w { truncate_cols(&r, max_w) } else { format!("{}{r}", " ".repeat(max_w - rw)) };
-            }
-            if lw + rw < max_w {
-                return format!("{l}{}{r}", " ".repeat(max_w - lw - rw));
-            }
-            return truncate_cols(&format!("{l} · {r}"), max_w);
+        let r = segs.iter().map(|s| s.content.clone()).collect::<Vec<_>>().join(" · ");
+        if r.is_empty() {
+            return String::new();
         }
-        let i = right.iter().position(|s| !s.pinned).expect("an unpinned segment exists");
-        right.remove(i);
+        let rw = disp_width(&r);
+        if rw <= max_w || segs.iter().all(|s| s.pinned) {
+            // flush right: where the ledger has always sat
+            return if rw >= max_w { truncate_cols(&r, max_w) } else { format!("{}{r}", " ".repeat(max_w - rw)) };
+        }
+        let i = segs.iter().position(|s| !s.pinned).expect("an unpinned segment exists");
+        segs.remove(i);
     }
 }
 
 /// One ledger segment: its text, and whether it may be shed when the pane
-/// narrows. Pinned: the session totals, and the browse hint (in review,
-/// the user is reading history, not checking accounts — the hint is the
-/// one thing the bar must still say).
+/// narrows. Pinned: the browse hint (in review, the user is reading
+/// history, not checking accounts — the hint is the one thing the bar must
+/// still say).
 struct Seg {
     content: String,
     pinned: bool,
 }
 
-/// The bar's two zones (see [`bar_text`]). Segments appear as their data
-/// arrives: no traffic yet — no ledger; no task — no state; unknown
-/// limits (the default `Info`) — no step counter, no ctx gauge.
-fn bar_segs(app: &App) -> (Vec<String>, Vec<Seg>) {
+/// The bar's segments (see [`bar_text`]). They appear as their data
+/// arrives: no cache traffic — no cache rate; no request read yet — no
+/// ctx gauge; unknown limits (the default `Info`) — no ctx gauge either.
+fn bar_segs(app: &App) -> Vec<Seg> {
     let st = &app.status;
-    let mut left = vec![];
-    if let Some(t) = &st.task {
-        left.push(format!("{} {}", super::model::SPINNER[st.spin % super::model::SPINNER.len()], elapsed_str(t.elapsed)));
-        if app.info.max_turns > 0 {
-            // +1: the request in flight is the one being counted
-            left.push(format!("#{}/{}", st.turns + 1, app.info.max_turns));
-        }
-    }
     let i = &app.info;
     let mut right = vec![];
     if !i.model.is_empty() { right.push(Seg { content: i.model.clone(), pinned: false }); }
     if let Some(e) = &i.effort { right.push(Seg { content: format!("effort {e}"), pinned: false }); }
-    if !st.total.is_zero() {
-        right.push(Seg { content: format!("total in {} out {}", humanize(st.total.context_in()), humanize(st.total.output)), pinned: true });
-    }
     if let Some(p) = cache_pct(&st.total) {
         right.push(Seg { content: format!("cache {p}%"), pinned: false });
     }
@@ -134,7 +100,7 @@ fn bar_segs(app: &App) -> (Vec<String>, Vec<Seg>) {
     if app.mode == Mode::Browse {
         right.push(Seg { content: "browse: ↑↓ PgUp/PgDn g/G · Ctrl-O returns".into(), pinned: true });
     }
-    (left, right)
+    right
 }
 
 /// The inline pane: the only part of the primary screen jingwei draws.
@@ -144,7 +110,7 @@ fn bar_segs(app: &App) -> (Vec<String>, Vec<Seg>) {
 /// ───────────────────────────── rule
 /// jingwei ❯ the input, one row per line while composing
 /// ───────────────────────────── rule
-/// spinner · tokens · elapsed
+/// the ledger bar, flush right
 /// ```
 #[derive(Debug, Clone)]
 pub struct Pane {
@@ -182,13 +148,19 @@ fn rule(w: usize) -> Line<'static> {
 /// Render the pane `w` columns wide inside a screen `h` rows tall (the
 /// input block is capped to what fits). Row count varies with the state:
 /// the tail row appears while text streams, the input block grows one row
-/// per line being composed.
+/// per line being composed — and within a task the count only ever grows:
+/// blank padding holds the pane at its high-water mark
+/// ([`Status::pane_floor`](super::model::Status::pane_floor)), so the
+/// status bar keeps its row while folds swap tail rows for reserve.
 pub fn pane(app: &App, w: u16, h: u16) -> Pane {
     let w = w.max(8) as usize;
     let mut lines: Vec<Line<'static>> = vec![];
     think_tail(app, w, Lay::Flush, &mut lines);
     if !app.partial.is_empty() {
         lines.push(Line::from(truncate_cols(&app.partial, w)));
+    }
+    for _ in lines.len()..app.status.pane_floor {
+        lines.push(Line::from(""));
     }
     lines.push(rule(w));
 
@@ -485,12 +457,8 @@ fn fold_head(head: &str, expanded: bool, w: usize) -> Line<'static> {
     ])
 }
 
-/// How many body lines the *live* reasoning block shows — its tail, the
-/// part that is still moving. The pane owes the user motion, not bulk.
-pub const THINK_TAIL_SHOWN: usize = 3;
-
-/// The live reasoning block: reasoning streams for seconds, and a spinner
-/// alone cannot tell "thinking" from "hung". So the pane (and the review
+/// The live reasoning block: reasoning streams for seconds, and a frozen
+/// pane cannot tell "thinking" from "hung". So the pane (and the review
 /// overlay) show the block as it arrives — the number it will fold into,
 /// how long it has been running, and the tail that still moves. It never
 /// lands in the scrollback: ThinkEnd folds it once, with its final state.
@@ -529,7 +497,7 @@ fn guttered(l: &str, w: usize, lay: Lay, style: Style, out: &mut Vec<Line<'stati
     }
 }
 
-/// The status bar row: [`bar_text`]'s two zones, dim, truncated to one
+/// The status bar row: [`bar_text`]'s ledger, dim, truncated to one
 /// physical row. Empty string when there is nothing to say.
 fn status_row(app: &App, w: usize) -> Line<'static> {
     let bar = bar_text(app, w);
@@ -624,7 +592,6 @@ mod tests {
             model: "MiniMax-M3".into(),
             effort: Some("high".into()),
             context_limit: 1_000_000,
-            max_turns: 60,
         };
         a
     }
@@ -633,20 +600,21 @@ mod tests {
     fn bar_segments_appear_as_data_arrives() {
         // nothing known, nothing happening: the bar says nothing
         assert_eq!(bar_text(&App::new(), BAR_W), "");
-        // identity arrives with the frontend's facts — idle, the ledger
-        // flushes right and there is no state zone
+        // identity arrives with the frontend's facts — the ledger flushes
+        // right, and with no traffic yet it is all there is to say
         let mut a = App::new();
         informed(&mut a);
         assert_eq!(bar_text(&a, BAR_W), format!("{}MiniMax-M3 · effort high", " ".repeat(BAR_W - disp_width("MiniMax-M3 · effort high"))));
-        // traffic: totals first; no cache segment until cache traffic
-        // exists (a permanent "cache 0%" on non-caching endpoints is noise)
+        // traffic without cache: still no cache segment (a permanent
+        // "cache 0%" on non-caching endpoints is noise) — and the session
+        // totals are not bar material at all
         a.status.total = Usage { input: 4600, output: 336, ..Usage::default() };
-        assert!(bar_text(&a, BAR_W).contains("total in 4.6k out 336"), "{}", bar_text(&a, BAR_W));
         assert!(!bar_text(&a, BAR_W).contains("cache"), "{}", bar_text(&a, BAR_W));
+        assert!(!bar_text(&a, BAR_W).contains("total"), "{}", bar_text(&a, BAR_W));
         a.status.total = Usage { input: 26_156, output: 336, cache_read: 25_344, cache_write: 1188 };
         let bar = bar_text(&a, BAR_W);
-        assert!(bar.contains("total in 52.7k out 336"), "{bar}");
         assert!(bar.contains("cache 48%"), "25344/(26156+25344+1188) ≈ 48: {bar}");
+        assert!(!bar.contains("total"), "session totals left the bar: {bar}");
         // a finished request sizes the next one: the ctx gauge reads the
         // last request's context against the limit
         a.status.turn = Usage { input: 2000, cache_read: 43_000, ..Usage::default() };
@@ -654,64 +622,67 @@ mod tests {
     }
 
     #[test]
-    fn bar_state_zone_counts_steps_and_never_sheds() {
+    fn bar_sheds_identity_then_cache_then_ctx() {
         let mut a = App::new();
         informed(&mut a);
-        update(&mut a, Ev::Msg(Msg::TaskBegin("run".into())));
-        let bar = bar_text(&a, BAR_W);
-        assert!(bar.starts_with("⠋ 0s · #1/60"), "first request in flight: {bar}");
-        // one Done = one finished request: the counter advances
-        update(&mut a, Ev::Msg(Msg::Done));
-        assert!(bar_text(&a, BAR_W).contains("#2/60"), "{}", bar_text(&a, BAR_W));
-        // the budget is per task, not per session: a new task restarts it
-        update(&mut a, Ev::Msg(Msg::TaskEnd));
-        update(&mut a, Ev::Msg(Msg::TaskBegin("again".into())));
-        assert!(bar_text(&a, BAR_W).starts_with("⠋ 0s · #1/60"), "{}", bar_text(&a, BAR_W));
-        // idle: no step, no clock — the state zone is working-only
-        update(&mut a, Ev::Msg(Msg::TaskEnd));
-        assert!(!bar_text(&a, BAR_W).contains('#'), "{}", bar_text(&a, BAR_W));
-        // unknown limits (the default Info) omit the counter, not the clock
-        let mut bare = App::new();
-        update(&mut bare, Ev::Msg(Msg::TaskBegin("t".into())));
-        assert!(bar_text(&bare, BAR_W).starts_with("⠋ 0s"), "{}", bar_text(&bare, BAR_W));
-        assert!(!bar_text(&bare, BAR_W).contains('#'), "no counter without a known limit");
-    }
-
-    #[test]
-    fn bar_sheds_identity_then_cache_then_ctx_totals_pinned() {
-        let mut a = App::new();
-        informed(&mut a);
-        update(&mut a, Ev::Msg(Msg::TaskBegin("run".into())));
-        for _ in 0..25 { update(&mut a, Ev::Tick(super::super::model::TICK)); }
         a.status.turn = Usage { input: 45_000, output: 900, ..Usage::default() };
         a.status.total = Usage { input: 45_000, output: 900, cache_read: 20_000, ..Usage::default() };
 
-        // wide: everything, the ledger flush right with a gap between zones
+        // wide: everything, flush right
         let wide = bar_text(&a, 120);
         assert!(wide.contains("MiniMax-M3") && wide.contains("effort high")
-            && wide.contains("total in 65.0k out 900") && wide.contains("cache 30%")
-            && wide.contains("ctx 45.0k/1.0M"), "{wide}");
-        assert!(wide.contains("  "), "the zones are apart: {wide}");
+            && wide.contains("cache 30%") && wide.contains("ctx 45.0k/1.0M"), "{wide}");
+        assert!(wide.starts_with(' '), "flush right: {wide}");
 
         // narrower: identity sheds first — the banner already said it
-        let mid = bar_text(&a, 80);
+        let mid = bar_text(&a, 50);
         assert!(!mid.contains("MiniMax-M3"), "model shed: {mid}");
-        assert!(mid.contains("effort high"), "effort outlives model: {mid}");
-        assert!(mid.contains("total in 65.0k out 900"), "{mid}");
-        let narrower = bar_text(&a, 74);
-        assert!(!narrower.contains("effort"), "effort sheds next: {narrower}");
+        assert!(mid.contains("effort high") && mid.contains("cache 30%")
+            && mid.contains("ctx 45.0k/1.0M"), "{mid}");
 
-        // narrower still: the cache rate, then the ctx gauge — the totals
-        // never drop (a bar that hides the session's cost stopped being
-        // a ledger)
-        let tight = bar_text(&a, 46);
-        assert!(tight.contains("total in 65.0k out 900"), "totals pinned: {tight}");
-        assert!(!tight.contains("ctx"), "ctx shed before totals: {tight}");
+        // narrower still: effort, then the cache rate — the ctx gauge is
+        // the ledger's last survivor, the one reading that changes what
+        // you do next
+        let tighter = bar_text(&a, 35);
+        assert!(!tighter.contains("effort"), "effort sheds next: {tighter}");
+        assert!(tighter.contains("cache 30%") && tighter.contains("ctx"), "{tighter}");
+        let tight = bar_text(&a, 20);
+        assert!(!tight.contains("cache"), "cache sheds before ctx: {tight}");
+        assert!(tight.contains("ctx 45.0k/1.0M"), "{tight}");
+
+        // nothing left to shed: the bar says nothing rather than lie
+        assert_eq!(bar_text(&a, 10), "");
 
         // the one-physical-row law holds through every width
-        for w in [20, 40, 60, 80, 120] {
+        for w in [10, 20, 35, 50, 120] {
             assert!(disp_width(&truncate_cols(&bar_text(&a, w), w)) <= w, "w={w}");
         }
+    }
+
+    #[test]
+    fn pane_pads_to_its_floor_so_the_bar_holds_its_row_through_a_fold() {
+        let mut a = App::new();
+        update(&mut a, Ev::Msg(Msg::TaskBegin("t".into())));
+        update(&mut a, Ev::Msg(Msg::Think("l1\nl2\nl3\nl4".into())));
+        let streaming = texts_of(&pane(&a, 80, 24).lines);
+        assert_eq!(streaming.len(), 8, "head + 3 tail rows + the 4-row frame: {streaming:?}");
+        assert!(streaming[0].starts_with('◌'), "{streaming:?}");
+
+        // the fold swaps tail rows for blank padding: same height, the
+        // bar never moves — this is the fix for the blank line that used
+        // to open under the bar each time a thought folded
+        update(&mut a, Ev::Msg(Msg::ThinkEnd));
+        let folded = texts_of(&pane(&a, 80, 24).lines);
+        assert_eq!(folded.len(), 8, "padded to the floor: {folded:?}");
+        assert_eq!(&folded[..4], vec!["", "", "", ""], "blank reserve above the rule: {folded:?}");
+        assert!(folded[4].starts_with("─────"), "the frame follows: {folded:?}");
+
+        // idle keeps the padded pane (the bar keeps its row at the
+        // bottom); the next task starts tight again
+        update(&mut a, Ev::Msg(Msg::TaskEnd));
+        assert_eq!(pane(&a, 80, 24).lines.len(), 8, "idle keeps the reserve");
+        update(&mut a, Ev::Msg(Msg::TaskBegin("next".into())));
+        assert_eq!(pane(&a, 80, 24).lines.len(), 4, "each task starts tight");
     }
 
     #[test]
@@ -815,7 +786,7 @@ mod tests {
 
     #[test]
     fn pane_is_framed_by_rules_tail_input_bar() {
-        let mut a = seeded();
+        let mut a = App::new();
         let p = pane(&a, 80, 24);
         let texts = texts_of(&p.lines);
         assert_eq!(texts.len(), 4, "rule, input, rule, bar: {texts:?}");
@@ -885,22 +856,21 @@ mod tests {
     }
 
     #[test]
-    fn working_pane_bar_shows_state_and_ledger() {
+    fn pane_bar_is_the_ledger() {
         let mut a = seeded();
         informed(&mut a);
-        update(&mut a, Ev::Msg(Msg::TaskBegin("run".into())));
-        for _ in 0..25 {
-            update(&mut a, Ev::Tick(super::super::model::TICK));
-        }
         update(&mut a, Ev::Msg(Msg::Usage(Usage { input: 100, output: 7, ..Usage::default() })));
-        update(&mut a, Ev::Msg(Msg::Done));
         let texts = texts_of(&pane(&a, 80, 24).lines);
         let bar = texts.last().unwrap();
-        // one request already done (the Done that folded the ledger): the
-        // counter points at the second, being counted next
-        assert!(bar.contains("s · #2/60"), "elapsed and step present: {bar}");
-        assert!(bar.contains("total in 100 out 7"), "Done folds the turn into the ledger: {bar}");
-        assert!(bar.contains("ctx 100/1.0M"), "the live request sizes the gauge: {bar}");
+        assert!(bar.contains("ctx 100/1.0M"), "the finished request sizes the gauge: {bar}");
+        assert!(!bar.contains('#'), "no step counter: {bar}");
+        assert!(!bar.contains("total"), "session totals are not bar material: {bar}");
+        // the bar ignores task state entirely: working changes nothing it says
+        let before = bar.clone();
+        update(&mut a, Ev::Msg(Msg::TaskBegin("run".into())));
+        update(&mut a, Ev::Tick(super::super::model::TICK));
+        let after = texts_of(&pane(&a, 80, 24).lines).pop().unwrap();
+        assert_eq!(after, before, "a running task leaves the ledger alone");
     }
 
     #[test]

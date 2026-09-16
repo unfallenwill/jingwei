@@ -99,9 +99,6 @@ impl Usage {
         self.cache_read += o.cache_read;
         self.cache_write += o.cache_write;
     }
-    pub fn is_zero(&self) -> bool {
-        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
-    }
 }
 
 // ---- shared display vocabulary ---------------------------------------------

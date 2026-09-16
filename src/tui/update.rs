@@ -50,7 +50,6 @@ pub fn update(app: &mut App, ev: Ev) -> Action {
 fn tick(app: &mut App, dt: Duration) -> Action {
     if let Some(t) = &mut app.status.task {
         t.elapsed += dt;
-        app.status.spin = (app.status.spin + 1) % super::model::SPINNER.len();
     }
     Action::None
 }
@@ -60,10 +59,9 @@ fn msg(app: &mut App, m: Msg) -> Action {
         Msg::Banner(b) => app.rows.push(Row::Line(b)),
         Msg::TaskBegin(t) => {
             app.status.task = Some(Task { text: t.clone(), elapsed: Duration::ZERO });
-            app.status.spin = 0;
-            // the step counter is per task: --max-turns is each task's
-            // budget of API requests, not the session's
-            app.status.turns = 0;
+            // each task starts with a tight pane; the floor grows with
+            // its live rows and holds through the folds between
+            app.status.pane_floor = 0;
             app.cancel_sent = false;
             app.scroll = Scroll::Tail;
             app.flush_partial();
@@ -90,7 +88,6 @@ fn msg(app: &mut App, m: Msg) -> Action {
         Msg::OutTokens(n) => app.status.turn.output = n,
         Msg::Done => {
             app.status.total.add(&app.status.turn);
-            app.status.turns += 1;
             app.flush_partial();
             app.fold_thought();
         }
@@ -620,6 +617,25 @@ mod tests {
         assert_eq!(a.status.turn.output, 9);
         drive(&mut a, vec![Ev::Msg(Msg::Done)]);
         assert_eq!((a.status.total.input, a.status.total.output), (10, 9));
+    }
+
+    #[test]
+    fn pane_floor_is_a_high_water_mark_reset_per_task() {
+        let mut a = App::new();
+        drive(&mut a, vec![Ev::Msg(Msg::TaskBegin("t".into()))]);
+        assert_eq!(a.status.pane_floor, 0, "a task starts tight");
+        drive(&mut a, vec![Ev::Msg(Msg::Think("l1\nl2\nl3\nl4\nl5".into()))]);
+        assert_eq!(a.status.pane_floor, 4, "the head plus the capped tail");
+        drive(&mut a, vec![Ev::Msg(Msg::ThinkEnd)]);
+        assert_eq!(a.status.pane_floor, 4, "a fold does not lower the floor");
+        drive(&mut a, vec![Ev::Msg(Msg::Think("one line".into()))]);
+        assert_eq!(a.status.pane_floor, 4, "a smaller block does not either");
+        drive(&mut a, vec![Ev::Msg(Msg::Text("partial".into()))]);
+        assert_eq!(a.status.pane_floor, 4, "the partial row fits under the mark");
+        drive(&mut a, vec![Ev::Msg(Msg::TaskEnd)]);
+        assert_eq!(a.status.pane_floor, 4, "idle keeps it — the bar keeps its row");
+        drive(&mut a, vec![Ev::Msg(Msg::TaskBegin("next".into()))]);
+        assert_eq!(a.status.pane_floor, 0, "the next task starts tight again");
     }
 
     #[test]

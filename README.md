@@ -75,11 +75,12 @@ context.
 The interactive UI is an inline TUI (crossterm, with ratatui only for the
 review overlay) that owns a small framed pane — separator rules above and
 below the input row, a live status bar underneath — at the bottom of the
-screen you already had. The bar has two zones: state on the left (spinner,
-elapsed, `#request/max-turns` — glanced every few seconds, never shed),
-ledger on the right (model, effort tier, session token totals, cache hit
-rate, `ctx used/--context-size` — checked occasionally, shed in that
-reverse order as the pane narrows; the totals are pinned). Everything
+screen you already had. The bar is the session's ledger, flush right
+(model, effort tier, cache hit rate, `ctx used/--context-size` — checked
+occasionally, shed in that reverse order as the pane narrows). While a
+task runs the pane only ever grows — the live think tail's room stays
+reserved as blank padding when a block folds, so the status bar never
+walks between rows. Everything
 above is the terminal's own scrollback:
 finished lines are appended to it, so the mouse wheel, text selection, and
 whatever was on screen before jingwei started keep working; there is no
@@ -94,7 +95,7 @@ instead.
 
 Reasoning arrives *live and folded*: while a block streams, the pane shows
 it as it arrives (`◌ thought #2 · 4 lines · 12s` plus its moving tail) — a
-spinner alone cannot tell "thinking" from "hung". When it closes, it lands
+frozen pane cannot tell "thinking" from "hung". When it closes, it lands
 as one dim marker that previews its first line (`▸ thought #3 · checking
 Cargo.toml … +13`) instead of a wall of text. **Ctrl-O unfolds everything**
 — thoughts and tool-output tails alike — into a scrollable full-screen

@@ -313,7 +313,6 @@ pub async fn run(cfg: &Config) -> crate::Result<()> {
         model: cfg.model.clone(),
         effort: cfg.effort_label().map(str::to_owned),
         context_limit: cfg.context_size,
-        max_turns: cfg.max_turns,
     };
 
     let history = Arc::new(AsyncMutex::new(Vec::<serde_json::Value>::new()));
@@ -750,11 +749,13 @@ mod tests {
         // rows landed for the scrollback
         step(&mut a, Ev::Msg(Msg::Text("row\n".into())));
         assert!(needs_paint(true, Some(&painted), 80, 24, &view::pane(&a, 80, 24)));
-        // the animated bar: while a task runs, every tick moves the spinner
+        // the live thinking block's clock: a tick moves its "· 1s" label,
+        // so the pane still repaints while reasoning streams
         step(&mut a, Ev::Msg(Msg::TaskBegin("t".into())));
-        let busy = ((80u16, 24u16), view::pane(&a, 80, 24));
-        step(&mut a, Ev::Tick(model::TICK));
-        assert!(needs_paint(false, Some(&busy), 80, 24, &view::pane(&a, 80, 24)));
+        step(&mut a, Ev::Msg(Msg::Think("reasoning".into())));
+        let thinking = ((80u16, 24u16), view::pane(&a, 80, 24));
+        step(&mut a, Ev::Tick(model::TICK * 9));
+        assert!(needs_paint(false, Some(&thinking), 80, 24, &view::pane(&a, 80, 24)));
     }
 
     // ---- the scroll-and-paint plan: pure, and pinned -----------------------
