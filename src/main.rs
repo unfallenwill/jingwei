@@ -1,8 +1,10 @@
 // jingwei — 精卫填海. A minimal coding agent: speak a task, and a small agent
 // carries stones — one tool call at a time — until the sea is land.
 //
-// Wire protocols: Anthropic Messages or OpenAI Chat Completions. No built-in
-// providers; you bring the endpoint, key, and model.
+// Wire protocols: the Messages wire (minimax — whose compatible endpoint is
+// the recommended one, thinking blocks, interleaved reasoning, cache_control),
+// OpenAI Chat Completions, and DeepSeek. Vendors that live at one address
+// name it themselves; everything else you bring the endpoint for.
 //
 // Env: JINGWEI_API_KEY, JINGWEI_BASE_URL, JINGWEI_MODEL, JINGWEI_PROTOCOL,
 //      JINGWEI_CACHE, JINGWEI_THINKING, JINGWEI_NO_TUI, NO_COLOR
@@ -315,11 +317,12 @@ async fn run_tool(name: &str, input: &Value, token: &CancelToken) -> String {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 /// The wire protocol spoken to the endpoint — the provider port's only
-/// vocabulary word. Three speak the same internal history: anthropic
-/// (content blocks, tool_use/result pairs), openai (tool_calls, reasoning
-/// by convention unechoed), and deepseek — the OpenAI wire shape plus a
-/// thinking toggle and an echo rule of its own.
-enum Protocol { Anthropic, OpenAI, DeepSeek }
+/// vocabulary word. Three speak the same internal history: minimax (the
+/// Messages wire: content blocks, tool_use/result pairs, thinking with a
+/// signature, interleaved reasoning, cache_control breakpoints), openai
+/// (tool_calls, reasoning by convention unechoed), and deepseek — the
+/// OpenAI wire shape plus a thinking toggle and an echo rule of its own.
+enum Protocol { MiniMax, OpenAI, DeepSeek }
 
 impl Protocol {
     /// The endpoint a protocol names for itself when the user names none —
@@ -327,7 +330,17 @@ impl Protocol {
     /// vendor that lives at one address says so here; the rest stay None
     /// and the composition root keeps requiring --base-url.
     fn default_base(self) -> Option<&'static str> {
-        match self { Self::DeepSeek => Some("https://api.deepseek.com"), _ => None }
+        match self {
+            Self::MiniMax => Some("https://api.minimax.cn/anthropic"),
+            Self::DeepSeek => Some("https://api.deepseek.com"),
+            Self::OpenAI => None,
+        }
+    }
+    /// The model a protocol names for itself when the user names none —
+    /// only for a vendor with one flagship, never for a wire with many
+    /// speakers (openai) or a catalogue in flux (deepseek's flash/pro).
+    fn default_model(self) -> Option<&'static str> {
+        match self { Self::MiniMax => Some("MiniMax-M3"), _ => None }
     }
 }
 
@@ -341,11 +354,11 @@ enum Thinking { Preserve, Strip }
 /// means *say nothing on the wire* — the endpoint's own default rules, so
 /// existing setups see byte-identical requests.
 ///
-/// The two wires spell it differently: OpenAI takes a word
-/// (`reasoning_effort`), Anthropic a token budget (`thinking.
-/// budget_tokens`). `max` is not an OpenAI word — it is passed through
-/// verbatim and the endpoint decides; on the Anthropic wire it maps to
-/// "everything but a floor for the reply".
+/// The wires spell it differently: openai/deepseek take a word
+/// (`reasoning_effort`), the Messages wire a token budget
+/// (`thinking.budget_tokens`). `max` is not an OpenAI word — it is passed
+/// through verbatim and the endpoint decides; on the minimax wire it maps
+/// to "everything but a floor for the reply".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Effort { Low, Medium, High, Max }
 
@@ -353,9 +366,10 @@ impl Effort {
     fn label(self) -> &'static str {
         match self { Self::Low => "low", Self::Medium => "medium", Self::High => "high", Self::Max => "max" }
     }
-    /// The Anthropic budget for this tier, clamped into the wire's rules:
-    /// at least 1024, and strictly under `max_tokens` so the reply has
-    /// room (thinking enabled requires `max_tokens > budget_tokens`).
+    /// The Anthropic-style budget for this tier — the Messages wire's dial,
+    /// clamped into its rules: at least 1024, and strictly under
+    /// `max_tokens` so the reply has room (thinking enabled requires
+    /// `max_tokens > budget_tokens`).
     fn budget(self, max_tokens: u32) -> u32 {
         let nominal = match self {
             Self::Low => 1024,
@@ -482,7 +496,7 @@ fn build_config(args: &Args) -> Result<Config> {
         .or_else(|| env::var(var).ok())
         .ok_or_else(|| Error::Msg(format!("missing {what} (or env {var})")));
     let protocol = enum_of(&args.protocol, "JINGWEI_PROTOCOL", "protocol",
-        &[("anthropic", Protocol::Anthropic), ("openai", Protocol::OpenAI), ("deepseek", Protocol::DeepSeek)])?;
+        &[("minimax", Protocol::MiniMax), ("openai", Protocol::OpenAI), ("deepseek", Protocol::DeepSeek)])?;
     let cache = enum_of(&args.cache, "JINGWEI_CACHE", "cache",
         &[("auto", CacheMode::Auto), ("active", CacheMode::Active)])?;
     let thinking = enum_of(&args.thinking, "JINGWEI_THINKING", "thinking",
@@ -492,7 +506,7 @@ fn build_config(args: &Args) -> Result<Config> {
     // Wire rules live with their wires: each adapter owns what it can
     // serve, and the composition root only asks.
     match protocol {
-        Protocol::Anthropic => anthropic_accepts(cache, thinking, effort)?,
+        Protocol::MiniMax => minimax_accepts(cache, thinking, effort)?,
         Protocol::OpenAI => openai_accepts(cache, thinking, effort)?,
         Protocol::DeepSeek => deepseek_accepts(cache, thinking, effort)?,
     }
@@ -508,10 +522,16 @@ fn build_config(args: &Args) -> Result<Config> {
         .or_else(|| env::var("JINGWEI_BASE_URL").ok())
         .or_else(|| protocol.default_base().map(str::to_owned))
         .ok_or_else(|| Error::Msg("missing --base-url (or env JINGWEI_BASE_URL)".into()))?;
+    // A model, the same way: a vendor with one flagship names it; the rest
+    // keep requiring -m/--model, the user picking the speaker.
+    let model = args.model.clone()
+        .or_else(|| env::var("JINGWEI_MODEL").ok())
+        .or_else(|| protocol.default_model().map(str::to_owned))
+        .ok_or_else(|| Error::Msg("missing -m/--model (or env JINGWEI_MODEL)".into()))?;
     Ok(Config {
         api_key: req(&args.api_key, "JINGWEI_API_KEY", "--api-key")?,
         base_url,
-        model: req(&args.model, "JINGWEI_MODEL", "-m/--model")?,
+        model,
         protocol, cache, thinking, effort,
         max_tokens: args.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         context_size: args.context_size.unwrap_or(DEFAULT_CONTEXT_SIZE),
@@ -531,26 +551,29 @@ USAGE:
 
 CONNECTION:
     --base-url <URL>    endpoint base (JINGWEI_BASE_URL)
-                        anthropic: POST {base}/v1/messages · openai: POST {base}/chat/completions
-                        deepseek: POST {base}/chat/completions — base defaults to
-                        https://api.deepseek.com (the vendor's own endpoint)
+                        minimax: POST {base}/v1/messages — base defaults to
+                        https://api.minimax.cn/anthropic, model to MiniMax-M3
+                        openai: POST {base}/chat/completions
+                        deepseek: POST {base}/chat/completions — base defaults
+                        to https://api.deepseek.com
     --api-key <KEY>     API key (JINGWEI_API_KEY)
-    -m, --model <NAME>  model name (JINGWEI_MODEL)
-    --protocol <P>      anthropic (default) | openai | deepseek
+    -m, --model <NAME>  model name (JINGWEI_MODEL; minimax defaults MiniMax-M3)
+    --protocol <P>      minimax (default) | openai | deepseek
 
 BEHAVIOR:
     --max-tokens <N>    max output tokens per turn (default 131072)
     --max-turns <N>     stop the agent loop after N turns (default 60)
     --context-size <N>  trim history when estimated tokens exceed N (default 1000000)
-    --cache <MODE>      auto (default, passive server cache) | active (Anthropic cache_control)
+    --cache <MODE>      auto (default, passive server cache) | active (cache_control
+                        breakpoints on the Messages wire — minimax's own)
     --thinking <MODE>   preserve (default) | strip reasoning from sent history
     --effort <TIER>     low | medium | high | max — reasoning effort, when the
                         endpoint offers the knob (JINGWEI_EFFORT); unset (default)
                         sends nothing and the endpoint's default rules.
                         openai wire: reasoning_effort, passed verbatim (max only
-                        if the endpoint knows it) · anthropic wire: thinking
-                        budget_tokens (low 1024 · medium 8k · high 32k ·
-                        max = max-tokens minus a floor for the reply)
+                        if the endpoint knows it) · minimax wire: thinking
+                        adaptive + budget_tokens (low 1024 · medium 8k · high
+                        32k · max = max-tokens minus a floor for the reply)
                         deepseek wire: reasoning_effort (the wire maps medium
                         to high; low/high/max are its own words)
     -s, --stream        stream output token by token (default)
@@ -589,8 +612,10 @@ TUI (interactive, on a terminal):
     JINGWEI_NO_TUI=1    log-style REPL instead of the TUI
 
 EXAMPLES:
-    jingwei --base-url https://api.minimax.cn/anthropic -m MiniMax-M3 \"task\"
+    jingwei \"task\"                       # minimax · MiniMax-M3, endpoint known
+    jingwei --effort high --cache active \"task\"
     jingwei --protocol openai --base-url https://host/v1 -m glm-5.3 --max-tokens 16384 \"task\"
+    jingwei --protocol deepseek --thinking strip \"task\"
 ";
 
 fn print_help() {
@@ -754,7 +779,7 @@ async fn agent_turn(cfg: &Config, history: &mut Vec<Value>, token: &CancelToken)
 
 impl Config {
     fn protocol_label(&self) -> &'static str {
-        match self.protocol { Protocol::Anthropic => "anthropic", Protocol::OpenAI => "openai", Protocol::DeepSeek => "deepseek" }
+        match self.protocol { Protocol::MiniMax => "minimax", Protocol::OpenAI => "openai", Protocol::DeepSeek => "deepseek" }
     }
 
     /// The banner's identity tail: protocol · model [· effort] · base url.
@@ -968,7 +993,7 @@ fn drop_result_and_pair(history: &mut Vec<Value>, mi: usize, bi: usize) {
 /// invisible here. The core hands over the IR and gets the IR back.
 async fn call_api(cfg: &Config, history: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
     match cfg.protocol {
-        Protocol::Anthropic => anthropic_turn(cfg, history, schemas, token).await,
+        Protocol::MiniMax => minimax_turn(cfg, history, schemas, token).await,
         Protocol::OpenAI => openai_turn(cfg, history, schemas, token).await,
         Protocol::DeepSeek => deepseek_turn(cfg, history, schemas, token).await,
     }
@@ -1010,9 +1035,13 @@ fn http() -> ureq::Agent {
         .build()
 }
 
-fn post(api_key: &str, url: String, body: Value, anthropic: bool) -> Result<ureq::Response> {
+/// One POST. The Messages wire authenticates with `x-api-key` and its
+/// version header (Bearer rides along too); the chat-completions family
+/// with Bearer alone — the one difference in plumbing between the two wire
+/// families, and it lives here, below every vendor.
+fn post(api_key: &str, url: String, body: Value, messages_wire: bool) -> Result<ureq::Response> {
     let mut req = http().post(&url).set("Authorization", &format!("Bearer {api_key}"));
-    if anthropic {
+    if messages_wire {
         req = req.set("x-api-key", api_key).set("anthropic-version", "2023-06-01");
     }
     Ok(req.send_json(body)?)
@@ -1080,32 +1109,45 @@ fn append_str_field(block: &mut Value, key: &str, tail: &str) {
 // (The old "blank line before the reply" lead is the pane's job now: the
 // task echo already separates prompt from reply.)
 
-// ---- api: anthropic wire ---------------------------------------------------
+// ---- api: minimax vendor ---------------------------------------------------
+//
+// MiniMax lives on the Messages wire: content blocks, tool_use/result
+// pairs, thinking blocks that carry a signature, interleaved reasoning, and
+// cache_control breakpoints — plus a vocabulary of its own on top, all of
+// it staying here. (The Messages shape is also jingwei's internal history,
+// so this adapter's response translation is the identity — the dialect
+// *is* the IR. Probed live before this was written: `thinking: adaptive`
+// and the Anthropic `enabled` spelling both accepted, `disabled` honored
+// on M3, budget_tokens accepted beside either, and the docs' echo mandate
+// — full content back every turn, thinking and signature included — is
+// enforced leniently today; the adapter echoes anyway, the documented
+// contract being the safe side.)
 
-/// Policy the anthropic wire cannot serve — its own rules, kept where its
-/// translation lives. (`--cache active` is this wire's feature, so it is
-/// served here and rejected by the others, in their own words.)
-fn anthropic_accepts(_cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
+/// Policy the minimax wire cannot serve — its own rules, kept where its
+/// translation lives. `--cache active` is served here (the breakpoints are
+/// native: system + last tool, well under the wire's 4-breakpoint cap) and
+/// rejected by the other vendors in their own words.
+fn minimax_accepts(_cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
     if effort.is_some() && thinking == Thinking::Strip {
-        return Err(Error::Msg("--effort needs --thinking preserve on the anthropic protocol (enabled thinking requires the history's thinking blocks)".into()));
+        return Err(Error::Msg("--effort needs --thinking preserve on the minimax protocol (interleaved thinking requires the history's thinking blocks, signature and all)".into()));
     }
     Ok(())
 }
 
-/// The anthropic adapter's one entry into the provider port. Strip is a
+/// The minimax adapter's one entry into the provider port. Strip is a
 /// wire rule wearing a policy flag: this wire carries thinking blocks in
 /// its history verbatim, so stripping them is this adapter's job, never
 /// the core's.
-async fn anthropic_turn(cfg: &Config, history: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+async fn minimax_turn(cfg: &Config, history: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
     let messages = if cfg.thinking == Thinking::Strip { strip_thinking(history) } else { history.to_vec() };
     if cfg.streaming {
-        anthropic_streaming(cfg, &messages, schemas, token).await
+        minimax_streaming(cfg, &messages, schemas, token).await
     } else {
-        anthropic_blocking(cfg, &messages, schemas, token).await
+        minimax_blocking(cfg, &messages, schemas, token).await
     }
 }
 
-fn anthropic_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: bool) -> Value {
+fn minimax_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: bool) -> Value {
     let active = cfg.cache == CacheMode::Active;
     let system = if active {
         json!([{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}])
@@ -1119,15 +1161,22 @@ fn anthropic_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: b
     let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
         "system": system, "tools": tools, "messages": messages});
     body["stream"] = json!(stream);
-    if let Some(e) = cfg.effort {
-        body["thinking"] = json!({"type": "enabled", "budget_tokens": e.budget(cfg.max_tokens)});
-    }
+    // Thinking is this vendor's dial, spelled its way: `adaptive` turns it
+    // on (M3 ships thinking *off* by default — an agent wants it on),
+    // `disabled` is the honest strip (no reasoning generated at all, so
+    // nothing needs echoing back), and an effort tier rides the Messages
+    // budget beside the toggle — accepted on the live wire, probe-verified.
+    body["thinking"] = match (cfg.thinking, cfg.effort) {
+        (Thinking::Strip, _) => json!({"type": "disabled"}),
+        (Thinking::Preserve, Some(e)) => json!({"type": "adaptive", "budget_tokens": e.budget(cfg.max_tokens)}),
+        (Thinking::Preserve, None) => json!({"type": "adaptive"}),
+    };
     body
 }
 
-async fn anthropic_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+async fn minimax_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
     let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
-    let body = anthropic_body(cfg, messages, schemas, false);
+    let body = minimax_body(cfg, messages, schemas, false);
     let key = cfg.api_key.clone();
     let v = blocking(token, move || -> Result<Value> {
         let v: Value = post(&key, url, body, true)?.into_json()?;
@@ -1138,9 +1187,9 @@ async fn anthropic_blocking(cfg: &Config, messages: &[Value], schemas: &[Value],
     Ok((v, token.is_cancelled()))
 }
 
-async fn anthropic_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+async fn minimax_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
     let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
-    let body = anthropic_body(cfg, messages, schemas, true);
+    let body = minimax_body(cfg, messages, schemas, true);
     let key = cfg.api_key.clone();
     let resp = blocking(token, move || post(&key, url, body, true)).await?;
     let (mut content, mut usage) = (vec![], empty_usage());
@@ -1181,6 +1230,14 @@ async fn anthropic_streaming(cfg: &Config, messages: &[Value], schemas: &[Value]
                         if let Some(t) = d["thinking"].as_str() {
                             disp(Msg::Think(t.into()));
                             append_str_field(block, "thinking", t);
+                        }
+                    }
+                    // the wire stamps a signature on the block as it closes;
+                    // it rides the IR so the next request echoes the block
+                    // whole — the vendor's continuity rule, signature and all
+                    (Some("thinking"), Some("signature_delta")) => {
+                        if let Some(s) = d["signature"].as_str() {
+                            append_str_field(block, "signature", s);
                         }
                     }
                     (Some("tool_use"), Some("input_json_delta")) => {
@@ -1335,7 +1392,7 @@ async fn chat_streaming(cfg: &Config, body: Value, usage_of: fn(&Value) -> (Valu
     let mut usage = empty_usage();
     let mut interrupted = false;
     let mut lines = sse_channel(resp);
-    // Same contract as the anthropic consumer: one suspension point per line,
+    // Same contract as the minimax consumer: one suspension point per line,
     // raced against cancellation, partial answer kept on interrupt.
     while let Some(line) = tokio::select! {
         biased;
@@ -1403,7 +1460,7 @@ async fn chat_streaming(cfg: &Config, body: Value, usage_of: fn(&Value) -> (Valu
 /// thing it rejects is a breakpoint scheme it has no field for.
 fn openai_accepts(cache: CacheMode, _thinking: Thinking, _effort: Option<Effort>) -> Result<()> {
     if cache == CacheMode::Active {
-        return Err(Error::Msg("--cache active needs --protocol anthropic (it is Anthropic's cache_control scheme; this wire has no breakpoints)".into()));
+        return Err(Error::Msg("--cache active needs --protocol minimax (cache_control is the Messages wire's scheme; this wire has no breakpoints)".into()));
     }
     Ok(())
 }
@@ -1479,7 +1536,7 @@ async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], t
 /// would erase what must be echoed.
 fn deepseek_accepts(cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
     if cache == CacheMode::Active {
-        return Err(Error::Msg("--cache active needs --protocol anthropic (deepseek's disk cache is always on — nothing to request)".into()));
+        return Err(Error::Msg("--cache active needs --protocol minimax (deepseek's disk cache is always on — nothing to request)".into()));
     }
     if effort.is_some() && thinking == Thinking::Strip {
         return Err(Error::Msg("--effort needs --thinking preserve on the deepseek protocol (with tools present, the wire requires every past turn's reasoning_content back)".into()));
@@ -1573,7 +1630,7 @@ mod tests {
     fn cfg(base: String, streaming: bool) -> Config {
         Config {
             api_key: "test-key".into(), base_url: base, model: "test-model".into(),
-            protocol: Protocol::Anthropic, cache: CacheMode::Auto, thinking: Thinking::Preserve,
+            protocol: Protocol::MiniMax, cache: CacheMode::Auto, thinking: Thinking::Preserve,
             effort: None,
             max_tokens: 1024, context_size: DEFAULT_CONTEXT_SIZE, max_turns: DEFAULT_MAX_TURNS, streaming,
         }
@@ -1742,13 +1799,19 @@ mod tests {
         assert_eq!(default.context_size, DEFAULT_CONTEXT_SIZE);
         assert!(build_config(&flags(&["--api-key", "k", "--base-url", "https://x", "-m", "m",
             "--max-turns", "0"]).unwrap()).is_err());
-        // active cache is anthropic-only
+        // active cache belongs to the Messages wire — the chat-completions
+        // vendors reject it in their own words
         assert!(build_config(&flags(&["--api-key", "k", "--base-url", "https://x", "-m", "m",
             "--protocol", "openai", "--cache", "active"]).unwrap()).is_err());
-        // required fields
+        // required fields — and the one vendor that names its own endpoint
+        // and flagship: a key alone is a whole config
         assert!(build_config(&flags(&[]).unwrap()).is_err());
-        assert!(build_config(&flags(&["--api-key", "k"]).unwrap()).is_err());
-        assert!(build_config(&flags(&["--api-key", "k", "--base-url", "https://x"]).unwrap()).is_err());
+        let bare = build_config(&flags(&["--api-key", "k"]).unwrap()).unwrap();
+        assert_eq!((bare.protocol_label(), bare.base_url.as_str(), bare.model.as_str()),
+            ("minimax", "https://api.minimax.cn/anthropic", "MiniMax-M3"));
+        assert!(build_config(&flags(&["--api-key", "k", "--protocol", "openai"]).unwrap()).is_err());
+        assert!(build_config(&flags(&["--api-key", "k", "--protocol", "openai",
+            "--base-url", "https://x"]).unwrap()).is_err());
         // bad flags
         assert!(flags(&["--nope"]).is_err());
         assert!(flags(&["--max-tokens", "abc"]).is_err());
@@ -1982,13 +2045,13 @@ mod tests {
     fn effort_maps_to_the_wires_and_respects_their_rules() {
         let mut c = cfg("https://x".into(), true);
 
-        // anthropic: thinking budget, clamped under max_tokens
+        // minimax: adaptive thinking, the budget as its dial
         c.effort = Some(Effort::Low);
-        let body = anthropic_body(&c, &[], &[], true);
-        assert_eq!(body["thinking"], json!({"type": "enabled", "budget_tokens": 1024}));
+        let body = minimax_body(&c, &[], &[], true);
+        assert_eq!(body["thinking"], json!({"type": "adaptive", "budget_tokens": 1024}));
         c.effort = Some(Effort::Max);
         c.max_tokens = 4096;
-        assert_eq!(anthropic_body(&c, &[], &[], true)["thinking"]["budget_tokens"], json!(3072),
+        assert_eq!(minimax_body(&c, &[], &[], true)["thinking"]["budget_tokens"], json!(3072),
             "max = everything but a floor for the reply");
         c.max_tokens = 1024; // degenerate: the floor itself
         assert_eq!(Effort::High.budget(1024), 1024, "clamped to the wire minimum");
@@ -1998,27 +2061,30 @@ mod tests {
         c.effort = Some(Effort::High);
         assert_eq!(openai_body(&c, &[], &[], false)["reasoning_effort"], json!("high"));
 
-        // absent: nothing on the wire, byte-identical to before the knob
+        // effort absent: the word leaves the openai wire (byte-identical to
+        // before the knob); the minimax wire keeps its toggle — preserve
+        // means thinking on for an agent, with no dial attached
         c.effort = None;
         assert!(openai_body(&c, &[], &[], false).get("reasoning_effort").is_none());
-        assert!(anthropic_body(&c, &[], &[], true).get("thinking").is_none());
+        c.protocol = Protocol::MiniMax;
+        assert_eq!(minimax_body(&c, &[], &[], true)["thinking"], json!({"type": "adaptive"}));
 
-        // anthropic + strip: the wire forbids it (thinking continuity)
+        // minimax + strip: the wire forbids it (thinking continuity)
         let mut args = Args { effort: Some("high".into()), thinking: Some("strip".into()), ..Default::default() };
         std::env::remove_var("JINGWEI_EFFORT");
         std::env::remove_var("JINGWEI_THINKING");
-        assert!(build_config(&args).is_err(), "effort + strip on anthropic is rejected");
+        assert!(build_config(&args).is_err(), "effort + strip on minimax is rejected");
         args.protocol = Some("openai".into());
         // the openai wire has no thinking-continuity rule; but the rest of
         // the config is incomplete here, so only probe the guard itself
         let probe = |p: Protocol| {
             let mut a = Args { effort: Some("high".into()), thinking: Some("strip".into()),
-                protocol: Some(if p == Protocol::OpenAI { "openai".into() } else { "anthropic".into() }),
+                protocol: Some(if p == Protocol::OpenAI { "openai".into() } else { "minimax".into() }),
                 ..Default::default() };
             a.api_key = Some("k".into()); a.base_url = Some("https://x".into()); a.model = Some("m".into());
             build_config(&a)
         };
-        assert!(probe(Protocol::Anthropic).is_err());
+        assert!(probe(Protocol::MiniMax).is_err());
         assert!(probe(Protocol::OpenAI).is_ok(), "the openai wire keeps strip + effort");
         // the env var spells it too
         std::env::set_var("JINGWEI_EFFORT", "max");
@@ -2028,11 +2094,32 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_body_marks_cache_breakpoints_only_when_active() {
+    fn minimax_body_thinking_toggle_and_verbatim_echo() {
+        let mut c = cfg("https://x".into(), true);
+        // preserve: adaptive — this vendor ships M3 thinking *off* by
+        // default; an agent's default is reasoning on
+        assert_eq!(minimax_body(&c, &[], &[], false)["thinking"], json!({"type": "adaptive"}));
+        // strip: the honest off — no reasoning generated, so none needs
+        // echoing back (the strip of history blocks happens in the entry)
+        c.thinking = Thinking::Strip;
+        assert_eq!(minimax_body(&c, &[], &[], true)["thinking"], json!({"type": "disabled"}));
+        // history rides the wire verbatim — signature and all, the vendor's
+        // continuity rule for interleaved thinking
+        c.thinking = Thinking::Preserve;
+        let history = vec![json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "step", "signature": "sig1"},
+            {"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]})];
+        let body = minimax_body(&c, &history, &[], false);
+        assert_eq!(body["messages"][0]["content"][0]["signature"], json!("sig1"));
+        assert_eq!(body["messages"][0]["content"][1]["id"], json!("t1"));
+    }
+
+    #[test]
+    fn minimax_body_marks_cache_breakpoints_only_when_active() {
         let schemas = vec![json!({"name": "a"}), json!({"name": "b"}), json!({"name": "c"})];
         let mut c = cfg("https://x".into(), true);
         c.cache = CacheMode::Active;
-        let body = anthropic_body(&c, &[], &schemas, true);
+        let body = minimax_body(&c, &[], &schemas, true);
         assert_eq!(body["system"][0]["text"], json!(SYSTEM));
         assert_eq!(body["system"][0]["cache_control"]["type"], json!("ephemeral"));
         let tools = body["tools"].as_array().unwrap();
@@ -2044,7 +2131,7 @@ mod tests {
         // auto mode: plain string system, no breakpoints anywhere
         let mut c = cfg("https://x".into(), false);
         c.cache = CacheMode::Auto;
-        let body = anthropic_body(&c, &[], &schemas, false);
+        let body = minimax_body(&c, &[], &schemas, false);
         assert_eq!(body["system"], json!(SYSTEM));
         assert!(body["tools"].as_array().unwrap().iter().all(|t| t.get("cache_control").is_none()));
         assert_eq!(body["stream"], json!(false));
@@ -2052,7 +2139,8 @@ mod tests {
 
     #[test]
     fn wire_paths_and_auth_headers_per_protocol() {
-        // anthropic: /v1/messages with x-api-key + anthropic-version + bearer
+        // minimax: /v1/messages with x-api-key + the Messages-wire version
+        // header + bearer (the endpoint honors both auth styles)
         let (port, reqs) = mock_seq(vec![(200, r#"{"content":[],"usage":{}}"#.into())]);
         block_on(call_api(&cfg(format!("http://127.0.0.1:{port}"), false), &[], &[], &CancelToken::new())).unwrap();
         let req = reqs.lock().unwrap()[0].to_lowercase();
@@ -2078,7 +2166,7 @@ mod tests {
     // ---- api over local mocks ----
 
     #[test]
-    fn anthropic_blocking_roundtrip_and_error() {
+    fn minimax_blocking_roundtrip_and_error() {
         let port = mock(r#"{"content":[{"type":"text","text":"hi from mock"}],"usage":{"input_tokens":7,"output_tokens":3}}"#, 200, false);
         let (resp, cut) = block_on(call_api(&cfg(format!("http://127.0.0.1:{port}"), false), &[], &[], &CancelToken::new())).unwrap();
         assert_eq!(resp["content"][0]["text"], "hi from mock");
@@ -2136,10 +2224,13 @@ mod tests {
         assert!(!ok(CacheMode::Active, Thinking::Preserve, None), "the disk cache is always on — no breakpoints to request");
         assert!(!ok(CacheMode::Auto, Thinking::Strip, Some(Effort::Low)), "effort cannot pair with strip");
         assert!(ok(CacheMode::Auto, Thinking::Strip, None), "strip alone is the toggle off");
-        // the vendor names its own endpoint; the wires stay unnamed
+        // the vendor names its own endpoint (and flagship, when it has
+        // one); the wires stay unnamed
         assert_eq!(Protocol::DeepSeek.default_base(), Some("https://api.deepseek.com"));
+        assert_eq!(Protocol::MiniMax.default_base(), Some("https://api.minimax.cn/anthropic"));
+        assert_eq!(Protocol::MiniMax.default_model(), Some("MiniMax-M3"));
         assert_eq!(Protocol::OpenAI.default_base(), None);
-        assert_eq!(Protocol::Anthropic.default_base(), None);
+        assert_eq!(Protocol::DeepSeek.default_model(), None, "flash or pro is the user's call");
     }
 
     #[test]
@@ -2219,11 +2310,15 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_streaming_assembles_blocks() {
+    fn minimax_streaming_assembles_blocks() {
+        // shapes from the live wire: a thinking block stamped with its
+        // signature as it closes (the vendor's echo rule wants the block
+        // back whole), then text, then a tool_use arriving as partial JSON
         let events = concat!(
             r#"data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}"#, "\n\n",
             r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#, "\n\n",
             r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"step"}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"c8b7a9218aec"}}"#, "\n\n",
             r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
             r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#, "\n\n",
             r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello world"}}"#, "\n\n",
@@ -2232,20 +2327,22 @@ mod tests {
             r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"comma"}}"#, "\n\n",
             r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"nd\":\"ls\"}"}}"#, "\n\n",
             r#"data: {"type":"content_block_stop","index":2}"#, "\n\n",
-            r#"data: {"type":"message_delta","usage":{"output_tokens":2}}"#, "\n\n",
+            r#"data: {"type":"message_delta","usage":{"output_tokens":2,"cache_read_input_tokens":203}}"#, "\n\n",
             r#"data: {"type":"message_stop"}"#, "\n\n");
         let mut c = cfg(format!("http://127.0.0.1:{}", mock(events, 200, true)), true);
         c.streaming = true;
         let (resp, cut) = block_on(call_api(&c, &[], &[], &CancelToken::new())).unwrap();
         assert!(!cut);
         assert_eq!(resp["content"][0]["thinking"], json!("step"));
+        assert_eq!(resp["content"][0]["signature"], json!("c8b7a9218aec"));
         assert_eq!(resp["content"][1]["text"], json!("hello world"));
         assert_eq!(resp["content"][2]["input"]["command"], json!("ls"));
         assert_eq!(resp["usage"]["output_tokens"], json!(2));
+        assert_eq!(resp["usage"]["cache_read_input_tokens"], json!(203));
     }
 
     #[test]
-    fn anthropic_streaming_surfaces_error_events() {
+    fn minimax_streaming_surfaces_error_events() {
         let events = concat!(
             r#"data: {"type":"error","error":{"type":"overloaded","message":"server overloaded"}}"#, "\n\n");
         let mut c = cfg(format!("http://127.0.0.1:{}", mock(events, 200, true)), true);

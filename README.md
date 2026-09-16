@@ -6,11 +6,13 @@
 **jingwei** is a minimal coding agent. Give it a task and it carries stones —
 one command, one edit at a time — until the sea is land.
 
-**No built-in providers.** You bring an endpoint and pick the wire protocol;
-jingwei speaks Anthropic Messages, OpenAI Chat Completions, and DeepSeek
-(the Chat Completions dialect plus DeepSeek's thinking toggle — where
-`--protocol deepseek` also knows the vendor's own endpoint, so
-`--base-url` is optional).
+**Providers live behind a port.** Pick the wire protocol and jingwei speaks
+it: minimax (default — the Messages wire, where the vendor names both its
+endpoint `https://api.minimax.cn/anthropic` and its flagship `MiniMax-M3`,
+so a key alone is a whole config), openai (Chat Completions), and deepseek
+(the Chat Completions dialect plus a thinking toggle; it names its own
+endpoint too). Every other Messages- or Chat-Completions-compatible
+endpoint still works by pointing `--base-url` at it.
 
 Model/view/update TUI on ratatui + crossterm; agent core speaks the wire.
 Cross-platform (Linux / macOS / Windows). Release binary ~2 MB.
@@ -23,8 +25,8 @@ export JINGWEI_API_KEY=<your-api-key>
 export JINGWEI_BASE_URL=...
 export JINGWEI_MODEL=...
 # Defaults: --max-tokens 131072 · --context-size 1000000 · --max-turns 60
-export JINGWEI_PROTOCOL=anthropic    # or openai, or deepseek (base-url optional there)
-export JINGWEI_CACHE=auto            # or active (anthropic protocol only)
+export JINGWEI_PROTOCOL=minimax     # or openai, or deepseek
+export JINGWEI_CACHE=auto           # or active (minimax's cache_control breakpoints)
 export JINGWEI_THINKING=preserve     # or strip
 export JINGWEI_EFFORT=high           # low | medium | high | max — reasoning effort knob
 export NO_COLOR=1                    # disable colors, both frontends (JINGWEI_NO_COLOR too)
@@ -52,19 +54,15 @@ cargo build --release --target x86_64-pc-windows-gnu
 # DeepSeek's own endpoint (deepseek protocol knows it — no --base-url needed)
 jingwei --protocol deepseek -m deepseek-flash "count *.rs files"
 
+# MiniMax — the default; endpoint and flagship known, active cache + effort
+jingwei --cache active --effort high "count *.rs files"
+
 # DeepSeek, thinking off (the wire's honest strip: thinking disabled)
 jingwei --protocol deepseek --thinking strip "quick question"
-
-# Anthropic-protocol endpoint (MiniMax)
-jingwei --base-url https://api.minimax.cn/anthropic -m MiniMax-M3 "count *.rs files"
 
 # OpenAI-protocol endpoint (GLM native API), bigger output budget + context trim
 jingwei --protocol openai --base-url https://open.bigmodel.cn/api/paas/v4 \
         -m glm-5.3 --context-size 100000 "refactor this"
-
-# Anthropic-protocol endpoint (GLM), active prompt caching + preserved thinking
-jingwei --base-url https://open.bigmodel.cn/api/anthropic -m glm-5.3 \
-        --cache active --thinking preserve "quick question"
 
 jingwei    # interactive REPL
 jingwei -c            # resume the newest session from this project
@@ -175,10 +173,12 @@ Providers sit behind a port of their own. The core speaks one internal
 history and asks the composition root which wire to hand it to; each wire
 is a self-contained adapter that owns its translation *and* its rules —
 what a vendor accepts (`deepseek` rejects `--cache active`: its disk cache
-is always on; `--effort` cannot pair with `--thinking strip`: the wire
-requires every past turn's reasoning back once tools are in play), how a
-policy flag becomes wire fields (`--thinking strip` is an erasure on the
-anthropic wire, a `thinking: disabled` toggle on deepseek), and how the
+is always on; minimax and deepseek both refuse `--effort` with
+`--thinking strip`: their wires require every past turn's reasoning back
+once tools are in play), how a policy flag becomes wire fields
+(`--thinking strip` erases history blocks on minimax and parks the model
+at `thinking: disabled` on deepseek — and on minimax, `preserve` spells
+the toggle `adaptive`, M3 shipping thinking-off by default), and how the
 usage ledger maps back. Vendors that share the Chat Completions dialect
 share its neutral machinery (message translation, SSE assembly) — the
 dialect names no vendor, so no vendor's details can leak into another's.
@@ -188,8 +188,8 @@ dialect names no vendor, so no vendor's details can leak into another's.
 | Knob | Layer | What it controls |
 | --- | --- | --- |
 | `--thinking preserve\|strip` | client policy | whether reasoning blocks from earlier turns stay in the history you send back |
-| `--effort low\|medium\|high\|max` | request | reasoning effort, when the endpoint offers the knob: `reasoning_effort` on the openai wire (verbatim — the endpoint decides its vocabulary), a `thinking.budget_tokens` tier on the anthropic wire (low 1024 · medium 8k · high 32k · max = max-tokens minus a floor for the reply), `reasoning_effort` on the deepseek wire (low/high/max are its words; it maps medium→high itself). Unset sends nothing — the endpoint's default rules |
-| `--cache auto\|active` | cost/latency | `auto`: rely on the server's passive cache. `active`: mark Anthropic `cache_control` breakpoints (system + last tool) — anthropic protocol only. DeepSeek's disk cache needs no switch: always on, reported in usage, and the status bar's cache% reads it natively |
+| `--effort low\|medium\|high\|max` | request | reasoning effort, when the endpoint offers the knob: `reasoning_effort` on the openai wire (verbatim — the endpoint decides its vocabulary), `thinking` `adaptive` + a `budget_tokens` tier on the minimax wire (low 1024 · medium 8k · high 32k · max = max-tokens minus a floor for the reply), `reasoning_effort` on the deepseek wire (low/high/max are its words; it maps medium→high itself). Unset sends nothing — the endpoint's default rules |
+| `--cache auto\|active` | cost/latency | `auto`: rely on the server's passive cache (minimax and deepseek both report their hits in `usage` — the bar's cache% is real on both). `active`: mark `cache_control` breakpoints (system + last tool) — minimax's Messages wire, natively. DeepSeek's disk cache needs no switch at all |
 | interleaved thinking | model capability | whether the model can reason between tool calls within a turn — not a client switch; jingwei just keeps turn structure intact so it can happen |
 
 They interact (preserved thinking makes the cached prefix longer and more
@@ -213,25 +213,26 @@ even 精卫 has a budget.
 
 ## How it works
 
-1. POST `{base}/v1/messages` (anthropic) or `{base}/chat/completions`
-   (openai, deepseek — the latter defaulting base to
-   `https://api.deepseek.com`) with `model`, `system`, `tools`,
+1. POST `{base}/v1/messages` (minimax — base defaulting to
+   `https://api.minimax.cn/anthropic`, model to `MiniMax-M3`) or
+   `{base}/chat/completions` (openai, deepseek — the latter defaulting
+   base to `https://api.deepseek.com`) with `model`, `system`, `tools`,
    `messages` — streaming by default (`-S` to block).
 2. Each turn the model returns content. Text is printed as it streams, tool
    calls are executed, results go back in the next request. Reasoning blocks
    are preserved or stripped per `--thinking`. Every assistant turn — including
    the final answer — is kept in history, so follow-up questions keep context.
 3. Caching: `--cache auto` relies on the server's passive prefix cache;
-   `--cache active` adds Anthropic `cache_control` breakpoints (system + last
-   tool). DeepSeek's disk cache is neither: always on, no breakpoints, its
-   hit/miss reported in every response's `usage` (`prompt_cache_hit_tokens`)
-   and folded into the cache% the bar shows. Cache stats are printed from
-   each response's `usage`.
+   `--cache active` adds `cache_control` breakpoints (system + last tool)
+   on the Messages wire. DeepSeek's disk cache is neither: always on, no
+   breakpoints, its hit/miss reported in every response's `usage`
+   (`prompt_cache_hit_tokens`) and folded into the cache% the bar shows.
+   Cache stats are printed from each response's `usage`.
 
 ## Tests
 
 ```sh
-cargo test            # 125 unit tests + 6 integration tests
+cargo test            # 126 unit tests + 6 integration tests
 cargo clippy --all-targets
 ```
 
