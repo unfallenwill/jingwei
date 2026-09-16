@@ -202,27 +202,18 @@ impl Stage {
         Ok(me)
     }
 
-    /// Reconcile with the terminal's size. Resize events nudge this
-    /// immediately; the per-frame size poll (below) is the same fallback
-    /// ratatui's own autoresize performs per draw. A scroll this performs
-    /// is staged into the frame — safe because a size change also forces
-    /// the repaint ([`needs_paint`] compares the painted size), and the
-    /// repaint is what sends the frame.
-    fn ensure_size(&mut self, w: u16, h: u16) -> io::Result<()> {
-        let w = w.max(8);
-        let h = h.max(1);
-        if w == self.width && h == self.screen {
-            return Ok(());
-        }
-        self.width = w;
-        self.screen = h;
-        self.height = self.height.min(self.screen);
-        if self.top + self.height > self.screen {
-            let s = self.top + self.height - self.screen;
-            self.scroll(s)?;
-            self.top = self.screen - self.height;
-        }
-        Ok(())
+    /// Adopt a new terminal size and re-anchor for a resize redraw. The
+    /// screen has just reflowed our rows (and our pane) on its own — an
+    /// event we cannot undo and must not try to reason about, so a resize is
+    /// never a scroll: the caller clears the screen and reprints the visible
+    /// tail from the top instead (see the event loop). This only records the
+    /// new geometry and puts the pen at the top; the flush after it lands the
+    /// tail there, the pane right below, exactly as a fresh screen would.
+    fn begin_resize(&mut self, w: u16, h: u16, pane_h: u16) {
+        self.width = w.max(8);
+        self.screen = h.max(1);
+        self.height = pane_h.clamp(1, self.screen);
+        self.top = 0;
     }
 
     /// Grow or shrink the pane. Growth scrolls the screen (old transcript
@@ -475,15 +466,31 @@ pub async fn run(cfg: &Config, convo: Convo, banners: Vec<String>) -> crate::Res
                     stage.put(crossterm::terminal::LeaveAlternateScreen);
                     painted = None;
                 }
-                if let Ok((sw, sh)) = crossterm::terminal::size() {
-                    stage.ensure_size(sw, sh)?;
-                }
-                let w = stage.width;
-                let h = stage.screen;
-                let lines = view::flush_lines(&app, w as usize, flushed);
+                // The terminal's size, polled each frame (the same fallback
+                // ratatui's autoresize runs per draw). On a change the screen
+                // has already reflowed our rows and our pane by its own rules
+                // — a width change rewraps everything, a height change adds or
+                // drops rows — so we do not reuse the old geometry: we clear
+                // and reprint the visible tail at the new width, the pane
+                // re-anchored to the bottom.
+                let (sw, sh) = crossterm::terminal::size().unwrap_or((stage.width, stage.screen));
+                let w = sw.max(8);
+                let h = sh.max(1);
+                let resized = (w, h) != (stage.width, stage.screen);
+                let p = view::pane(&app, w, h);
+                let lines = if resized {
+                    // Reprint only what fits, and no more than what was on
+                    // screen before — rows that already rode into the
+                    // scrollback must not be shown a second time.
+                    let was_visible = stage.screen.saturating_sub(stage.height);
+                    let count = was_visible.min(h.saturating_sub(p.lines.len() as u16));
+                    stage.begin_resize(w, h, p.lines.len() as u16);
+                    view::transcript_tail(&app, w as usize, count as usize)
+                } else {
+                    view::flush_lines(&app, w as usize, flushed)
+                };
                 let grew = !lines.is_empty();
                 flushed = app.rows.len();
-                let p = view::pane(&app, w, h);
                 if needs_paint(grew, painted.as_ref(), w, h, &p) {
                     // The whole frame is composed first and sent as one
                     // synchronized burst (see [`Stage::send`]): scrolls,
@@ -496,6 +503,12 @@ pub async fn run(cfg: &Config, convo: Convo, banners: Vec<String>) -> crate::Res
                     // caret only exists once the rows are in place, so it
                     // is shown then, where it belongs.
                     stage.open_frame();
+                    if resized {
+                        // wipe the terminal's own reflow of the old rows
+                        // before reprinting ours over it (the scrollback is
+                        // untouched — only the screen clears)
+                        stage.put(Clear(ClearType::All));
+                    }
                     stage.flush(&lines)?;
                     stage.set_height(p.lines.len() as u16)?;
                     stage.paint(&p.lines)?;
@@ -544,17 +557,12 @@ pub async fn run(cfg: &Config, convo: Convo, banners: Vec<String>) -> crate::Res
                         crossterm::event::Event::Paste(p) => {
                             handle(step(&mut app, Ev::Paste(p)), cfg, &convo, &mut agent, &sink);
                         }
-                        // a resize lands immediately: re-fit the pane and
-                        // force the next frame to repaint at the new size —
-                        // unless the overlay owns the screen, when escapes
-                        // would land on the alternate screen it shows. The
-                        // Input arm's size poll reconciles in the very
-                        // iteration that closes the overlay, after the mode
-                        // switch is staged into the frame.
-                        crossterm::event::Event::Resize(w, h) if overlay.is_none() => {
-                            let _ = stage.ensure_size(w, h);
-                            painted = None;
-                        }
+                        // a resize needs no arm of its own: the Input arm
+                        // polls the size every frame and redraws the viewport
+                        // when it changed, so the event just wakes the loop —
+                        // which also covers the resize that happened while
+                        // the overlay held the screen (that one reconciles on
+                        // the iteration that closes the overlay).
                         _ => {}
                     },
                     None => done = true, // stdin gone
@@ -1011,5 +1019,25 @@ mod tests {
     #[test]
     fn flush_plan_zero_lines_paints_nothing() {
         assert_eq!(flush_plan(20, 4, 24, 0), vec![(0, 20, 0)]);
+    }
+
+    /// The invariant a resize reprint rests on: reprinting the visible tail
+    /// from the top (`top = 0`, `count` rows, pane below) never scrolls. That
+    /// is what makes the clear-and-reprint safe — no row is pushed into the
+    /// scrollback, so rows that already rode there are not shown twice.
+    #[test]
+    fn resize_reprint_plan_never_scrolls() {
+        for screen in [3u16, 10, 24, 60] {
+            for pane_h in 1..=screen {
+                for count in 0..=(screen - pane_h) {
+                    let plan = flush_plan(0, pane_h, screen, count as usize);
+                    let scrolled: u16 = plan.iter().map(|(s, _, _)| *s).sum();
+                    assert_eq!(scrolled, 0, "screen={screen} pane={pane_h} count={count}: {plan:?}");
+                    // and the pane lands right below the reprinted tail
+                    let end = plan.last().map(|(_, at, c)| at + *c as u16).unwrap_or(0);
+                    assert_eq!(end, count, "screen={screen} pane={pane_h} count={count}: {plan:?}");
+                }
+            }
+        }
     }
 }

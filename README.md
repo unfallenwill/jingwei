@@ -117,7 +117,12 @@ refolds. Folded bodies hang from a `│` gutter — structure, not color, so
 the hierarchy survives NO_COLOR and DIM-blind terminals. Long lines wrap:
 the scrollback wraps at the width each row was flushed with (the wrap is
 baked, the way a shell's own output is), and the review overlay re-wraps
-at the live width as the terminal is resized. Only the pane's live rows —
+at the live width as the terminal is resized. The pane itself is resized
+by clearing the screen and reprinting the visible tail at the new width —
+the pane lands right below it, and no row that already rode into the
+scrollback is reprinted — because the terminal's own reflow of a width
+change is not something we try to preserve, only to overwrite. Only the
+pane's live rows —
 the streaming tail, the status bar — stay one physical row each. There are
 no display switches: folding is simply how reasoning is shown, in the TUI
 and in the plain log alike.

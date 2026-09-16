@@ -299,6 +299,22 @@ pub fn flush_lines(app: &App, w: usize, from: usize) -> Vec<Line<'static>> {
     out
 }
 
+/// The last `n` rendered transcript lines at width `w` — the visible tail a
+/// resize redraw reprints. Only committed rows: the live block (streaming
+/// text, the thinking tail) is the pane's, drawn above its rules, and must
+/// not be doubled here.
+pub fn transcript_tail(app: &App, w: usize, n: usize) -> Vec<Line<'static>> {
+    let mut out = vec![];
+    for row in &app.rows {
+        row_lines(row, w, &mut out, Lay::Flush);
+    }
+    if out.len() > n {
+        out.split_off(out.len() - n)
+    } else {
+        out
+    }
+}
+
 /// Render the Ctrl-O overlay `w`×`h`: every fold open, the window over the
 /// rendered rows offset by the scroll position, the hint bar at the bottom.
 pub fn browse(app: &App, w: u16, h: u16) -> Screen {
@@ -762,6 +778,22 @@ mod tests {
         assert!(title.style.add_modifier.contains(ratatui::style::Modifier::BOLD), "title is a header");
         let meta = row.spans.iter().map(|s| s.content.clone()).collect::<String>();
         assert!(meta.contains("1 line · 3s"), "singular, with duration: {meta}");
+    }
+
+    #[test]
+    fn transcript_tail_takes_the_last_rows_at_the_new_width() {
+        let mut a = App::new();
+        for i in 0..30 {
+            update(&mut a, Ev::Msg(Msg::Text(format!("row {i}\n"))));
+        }
+        // the newest `n` rows, in order
+        assert_eq!(texts_of(&transcript_tail(&a, 40, 4)), vec!["row 26", "row 27", "row 28", "row 29"]);
+        // more asked than there is: the whole transcript
+        assert_eq!(transcript_tail(&a, 40, 999).len(), 30);
+        // at a width that wraps, the tail is a suffix of the *wrapped* rows
+        let wrapped = texts_of(&transcript_tail(&a, 4, 3));
+        assert_eq!(wrapped.len(), 3);
+        assert!(wrapped.iter().all(|t| disp_width(t) <= 4), "{wrapped:?}");
     }
 
     #[test]
