@@ -741,26 +741,57 @@ fn est_tokens(history: &[Value]) -> u64 {
 }
 
 /// Shrink history until the estimate fits `limit`, trimming the oldest
-/// tool_result first so tool_use/result pairing stays valid.
+/// tool_result first. Both shrinks keep tool_use/result pairing valid: an
+/// in-place cut touches only the result's text, and a minimal result leaves
+/// together with its paired tool_use (an orphaned tool_use is a 400 on the
+/// next request), along with any message left holding no blocks.
 fn fit_context(history: &mut Vec<Value>, limit: u64) -> bool {
     let mut changed = false;
     while est_tokens(history) > limit {
-        let Some((mi, bi)) = history.iter().enumerate().find_map(|(mi, m)| {
-            (m["role"] == "user").then_some(m["content"].as_array()).flatten()
-                .and_then(|a| a.iter().enumerate().find(|(_, b)| b["type"] == "tool_result").map(|(bi, _)| (mi, bi)))
-        }) else { break };
-        let slot = &mut history[mi]["content"][bi];
-        let s = slot["content"].as_str().unwrap_or("");
+        let Some((mi, bi)) = oldest_tool_result(history) else { break };
+        let s = history[mi]["content"][bi]["content"].as_str().unwrap_or("").to_owned();
         if s.chars().count() > 200 {
             let cut: String = s.chars().take(200).collect();
-            slot["content"] = json!(format!("{cut}…[trimmed to fit context]"));
+            history[mi]["content"][bi]["content"] = json!(format!("{cut}…[trimmed to fit context]"));
             changed = true;
-        } else if history.len() > 1 {
-            history.remove(mi);
-            changed = true;
-        } else { break; }
+            continue;
+        }
+        drop_result_and_pair(history, mi, bi);
+        changed = true;
     }
     changed
+}
+
+/// The first (oldest) tool_result in the history, as (message, block) indices.
+fn oldest_tool_result(history: &[Value]) -> Option<(usize, usize)> {
+    history.iter().enumerate().find_map(|(mi, m)| {
+        (m["role"] == "user").then_some(m["content"].as_array()).flatten()
+            .and_then(|a| a.iter().enumerate().find(|(_, b)| b["type"] == "tool_result").map(|(bi, _)| (mi, bi)))
+    })
+}
+
+/// Delete the tool_result at (mi, bi) and its tool_use — which sits in the
+/// assistant message just before — so neither survives unpaired. A thinking
+/// block that only led up to that call goes too; messages emptied of blocks
+/// are removed outright (an empty content array is its own API error).
+fn drop_result_and_pair(history: &mut Vec<Value>, mi: usize, bi: usize) {
+    let id = history[mi]["content"][bi]["tool_use_id"].as_str().map(str::to_owned);
+    history[mi]["content"].as_array_mut().unwrap().remove(bi);
+    if mi > 0 && history[mi - 1]["role"] == "assistant" {
+        if let Some(blocks) = history[mi - 1]["content"].as_array_mut() {
+            blocks.retain(|b| b["type"] != "tool_use" || b["id"].as_str() != id.as_deref());
+            // thinking whose tool_use is gone: nothing left to reason towards
+            if blocks.iter().all(|b| b["type"] == "thinking") { blocks.clear(); }
+        }
+    }
+    if history[mi]["content"].as_array().is_some_and(|a| a.is_empty()) {
+        history.remove(mi);
+        if mi > 0 && history[mi - 1]["role"] == "assistant"
+            && history[mi - 1]["content"].as_array().is_some_and(|a| a.is_empty())
+        {
+            history.remove(mi - 1);
+        }
+    }
 }
 
 // ---- api: shared dispatch --------------------------------------------------
@@ -1423,14 +1454,60 @@ mod tests {
     fn fit_context_drops_short_tool_result_messages_when_still_over() {
         let mut history = vec![
             json!({"role": "user", "content": "go"}),
-            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]}),
+            json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "one call, one thought"},
+                {"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]}),
             json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}), // too short to trim in place
             json!({"role": "assistant", "content": [{"type": "text", "text": "padding to keep the estimate high"}]}),
         ];
         let limit = est_tokens(&history) - 1; // guarantee the first pass is over
         assert!(fit_context(&mut history, limit));
-        assert_eq!(history.len(), 3); // the whole tool_result message is gone
+        // the whole exchange is gone — the assistant message held only the call
+        assert_eq!(history.len(), 2);
         assert!(!serde_json::to_string(&history).unwrap().contains("tool_result"));
+        assert_pairing(&history);
+    }
+
+    #[test]
+    fn fit_context_keeps_unpaired_blocks_of_partially_dropped_batches() {
+        // a batch of two calls where only the first result is minimal: the
+        // second call/result pair must survive the first one's removal
+        let mut history = vec![
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "plan: run two"},
+                {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "true"}},
+                {"type": "tool_use", "id": "t2", "name": "read_file", "input": {"path": "x"}}]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},        // minimal → dropped with t1
+                {"type": "tool_result", "tool_use_id": "t2", "content": "y".repeat(500)}]}), // trimmed in place
+            json!({"role": "assistant", "content": [{"type": "text", "text": "padding to keep the estimate high"}]}),
+        ];
+        let limit = est_tokens(&history) - 1;
+        assert!(fit_context(&mut history, limit));
+        assert_pairing(&history);
+        let body = serde_json::to_string(&history).unwrap();
+        assert!(!body.contains("\"id\": \"t1\""), "t1's tool_use must not survive its result: {body}");
+        assert!(body.contains("t2"), "t2's pair must both survive: {body}");
+        assert!(body.contains("thinking"), "thinking led up to t2 as well — it stays: {body}");
+    }
+
+    /// Every tool_use keeps exactly one tool_result and vice versa, and no
+    /// message is left with an empty content array.
+    fn assert_pairing(history: &[Value]) {
+        let ids = |ty: &str, key: &str| -> Vec<String> {
+            history.iter().filter(|m| m["content"].is_array())
+                .filter_map(|m| m["content"].as_array())
+                .flatten().filter(|b| b["type"] == ty)
+                .filter_map(|b| b[key].as_str().map(str::to_owned)).collect()
+        };
+        let uses = ids("tool_use", "id");
+        let results = ids("tool_result", "tool_use_id");
+        for u in &uses { assert!(results.contains(u), "tool_use {u} lost its tool_result"); }
+        for r in &results { assert!(uses.contains(r), "tool_result {r} lost its tool_use"); }
+        for m in history.iter().filter(|m| m["content"].is_array()) {
+            assert!(!m["content"].as_array().unwrap().is_empty(), "empty message left behind");
+        }
     }
 
     // ---- openai wire conversion ----
