@@ -58,6 +58,9 @@ jingwei --base-url https://open.bigmodel.cn/api/anthropic -m glm-5.3 \
         --cache active --thinking preserve "quick question"
 
 jingwei    # interactive REPL
+jingwei -c            # resume the newest session from this project
+jingwei --resume 20260916-1156    # resume by id prefix
+jingwei --list        # this project's sessions (--all: every project's)
 jingwei --help    # full flag list
 ```
 
@@ -107,6 +110,31 @@ mode wraps where the scrollback truncates: what is flushed is immutable and
 renders once, what is reviewed re-renders every frame and owes the reader
 the whole line. There are no display switches: folding is simply how
 reasoning is shown, in the TUI and in the plain log alike.
+
+### Sessions
+
+Interactive conversations persist across processes, one subdirectory per
+project: `~/.jingwei/projects/<project>/<id>.jsonl`,
+where `<project>` is the working directory's canonical path flattened to
+`-`. The file's header records the true `cwd`, model, and protocol; every
+following line is one message of the internal history, appended **at run
+boundaries only** (so the file never ends mid-run: an interrupted run
+leaves it at its last complete run, a hard kill never corrupts what came
+before, and a history the context trim shrank is rewritten atomically).
+`-c`/`--continue` resumes **this project's** newest session; `--resume
+<ID>` resumes by id prefix within the project; `--list` shows this
+project's sessions (newest first), `--list --all` every project's (with a
+DIR column). One-shot runs stay ephemeral unless resumed. Sessions store
+the internal history, not any vendor's wire format, so a session resumes
+on a different model, protocol, or endpoint than it started with (the
+banner notes a model change). History round-trips **byte-identically** —
+canonical JSON — so resuming with the same binary and flags keeps provider
+prefix caches warm. Two
+wrinkles of the encoding are accepted: a literal `-` in a directory name
+collides with a separator (`/a-b` and `/a/b` share a project — the
+header's cwd still tells them apart, and resuming across the clash notes
+that the tree moved), and renaming a project directory starts a new
+namespace (the old files stay where they were).
 
 ## Architecture
 
@@ -173,7 +201,7 @@ even 精卫 has a budget.
 ## Tests
 
 ```sh
-cargo test            # 95 unit tests + 2 REPL integration tests
+cargo test            # 119 unit tests + 6 integration tests
 cargo clippy --all-targets
 ```
 

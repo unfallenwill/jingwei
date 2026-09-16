@@ -9,6 +9,7 @@
 
 mod display;
 mod plain;
+mod session;
 mod tui;
 
 use display::{disp, Msg, Sev, Usage};
@@ -26,6 +27,11 @@ const MAX_TOOL_OUTPUT: usize = 50_000;
 const DEFAULT_MAX_TOKENS: u32 = 131_072;
 const DEFAULT_CONTEXT_SIZE: u64 = 1_000_000;
 const DEFAULT_MAX_TURNS: u32 = 60;
+/// Version of the internal history payload as it lands in session files —
+/// owned here, beside the shape it versions; session.rs embeds it in the
+/// header as an opaque integer and never interprets it. Bump it the day
+/// the payload's *semantics* change; older files migrate at load.
+const HISTORY_FORMAT: u32 = 1;
 type Result<T> = std::result::Result<T, Error>;
 
 // ---- error -----------------------------------------------------------------
@@ -374,12 +380,33 @@ struct Args {
     context_size: Option<u64>,
     max_turns: Option<u32>,
     streaming: bool,
+    resume: Option<String>,
+    cont: bool,
+    list: bool,
+    all: bool,
     prompt: Vec<String>,
 }
 
-fn parse_from<I: Iterator<Item = String>>(mut it: I) -> Result<Args> {
+impl Args {
+    /// Did the user ask for a saved conversation (`-c` or `--resume`)?
+    fn resuming(&self) -> bool {
+        self.cont || self.resume.is_some()
+    }
+}
+
+fn parse_from<I: Iterator<Item = String>>(it: I) -> Result<Args> {
+    let mut it = it.peekable();
     let mut a = Args { streaming: true, ..Default::default() };
     while let Some(arg) = it.next() {
+        // `--resume`'s value is optional: take the next word only when it
+        // is not itself a flag; bare `--resume` means the newest, like -c
+        if arg == "--resume" {
+            a.resume = it.next_if(|v| !is_flag(v));
+            if a.resume.is_none() {
+                a.cont = true;
+            }
+            continue;
+        }
         let mut val = || it.next().ok_or_else(|| Error::Msg(format!("{arg} needs a value")));
         match arg.as_str() {
             "-s" | "--stream" => a.streaming = true,
@@ -394,14 +421,23 @@ fn parse_from<I: Iterator<Item = String>>(mut it: I) -> Result<Args> {
             "--max-tokens" => a.max_tokens = Some(val()?.parse().map_err(|_| Error::Msg("--max-tokens expects a number".into()))?),
             "--context-size" => a.context_size = Some(val()?.parse().map_err(|_| Error::Msg("--context-size expects a number (tokens)".into()))?),
             "--max-turns" => a.max_turns = Some(val()?.parse().map_err(|_| Error::Msg("--max-turns expects a number".into()))?),
+            "-c" | "--continue" => a.cont = true,
+            "--list" => a.list = true,
+            "--all" => a.all = true,
             "-h" | "--help" => { print_help(); std::process::exit(0); }
-            x if x.starts_with('-') && x.len() > 1 => {
+            x if is_flag(x) => {
                 return Err(Error::Msg(format!("unknown flag: {x}\ntry --help")));
             }
             _ => a.prompt.push(arg),
         }
     }
     Ok(a)
+}
+
+/// Does this word look like a flag? The one test both the unknown-flag arm
+/// and `--resume`'s optional value ask of a word.
+fn is_flag(s: &str) -> bool {
+    s.starts_with('-') && s.len() > 1
 }
 
 /// Resolve an enum from flag or env, case-insensitive, defaulting to the
@@ -497,6 +533,19 @@ BEHAVIOR:
     -S, --no-stream     wait for each turn to finish before printing
     -h, --help          this help
 
+SESSIONS:
+    interactive runs persist the conversation to
+    ~/.jingwei/projects/<project>/<id>.jsonl — one subdirectory per
+    project (the working directory's canonical path flattened to '-'),
+    one JSON message per line, written at run boundaries (Ctrl-C keeps
+    the runs before it); the header records cwd, model, protocol.
+    One-shot runs stay ephemeral unless resumed.
+    -c, --continue      resume the newest session from this project
+    --resume [ID]       resume a session by id prefix; without an ID, like
+                        -c. New turns append to the same file
+    --list              list this project's saved sessions (newest first)
+    --list --all        list every project's sessions
+
 TUI (interactive, on a terminal):
     the transcript lives in the terminal's own scrollback — scroll with
     the mouse wheel or the terminal's keys; what was on screen before
@@ -560,20 +609,93 @@ const SYSTEM: &str = "You are jingwei (精卫), a coding agent with these tools:
 
 async fn run() -> Result<()> {
     let args = parse_from(env::args().skip(1))?;
+    // --list answers from the disk alone — no credentials needed
+    if args.list {
+        return session::print_list(args.all);
+    }
     let cfg = build_config(&args)?;
-    if args.prompt.is_empty() {
+    let interactive = args.prompt.is_empty();
+    let (mut convo, banners) = begin_session(&args, &cfg, interactive)?;
+    if interactive {
         // A terminal gets the TUI; pipes, tests, and one-shots get the log.
-        return if tui::wanted() { tui::run(&cfg).await } else { plain::plain_repl(&cfg).await };
+        return if tui::wanted() {
+            tui::run(&cfg, convo, banners).await
+        } else {
+            plain::plain_repl(&cfg, convo, banners).await
+        };
     }
     // One-shot: always the plain frontend — its output must stay in the
     // terminal after the process exits, and an alt-screen would take it.
     let prompt = args.prompt.join(" ");
+    for b in &banners {
+        disp(Msg::Banner(b.clone()));
+    }
     disp(Msg::TaskBegin(prompt.clone()));
-    let mut history = vec![json!({"role": "user", "content": prompt})];
+    convo.history.push(user_message(&prompt));
+    convo.persist();
     let token = CancelToken::new();
-    let res = agent_turn(&cfg, &mut history, &token).await;
+    let res = agent_turn(&cfg, &mut convo.history, &token).await;
+    convo.persist();
     disp(Msg::TaskEnd);
     res
+}
+
+/// The conversation this process runs on, and the banner lines that say
+/// which (the frontend shows them beside its own). Policy lives here, at
+/// the composition root — mechanism is session.rs's, and the agent core
+/// knows none of it. A one-shot stays ephemeral; a resumed one persists,
+/// to the file it came from.
+fn begin_session(args: &Args, cfg: &Config, interactive: bool) -> Result<(session::Convo, Vec<String>)> {
+    if !args.resuming() {
+        if !interactive {
+            return Ok((session::Convo::ephemeral(), vec![]));
+        }
+        let prov = session::Provenance {
+            model: cfg.model.clone(),
+            protocol: cfg.protocol_label().into(),
+            base_url: cfg.base_url.clone(),
+        };
+        let s = session::Session::new(&prov, HISTORY_FORMAT);
+        let banner = match s.path() {
+            Some(p) => format!("session {} · the conversation persists to {}", s.id(), p.display()),
+            None => format!("session {} · no home directory: this conversation stays in memory", s.id()),
+        };
+        return Ok((session::Convo::persistent(s, vec![]), vec![banner]));
+    }
+    let here = session::current_dir_string();
+    // Scoping comes from the layout: the project subdirectory is the
+    // filter, so `-c` (and a bare --resume) means "this project's newest"
+    // and an explicit id resolves within this project too.
+    let explicit = args.resume.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let (s, history) = session::Session::load(explicit)?;
+    let mut banners = vec![format!(
+        "resumed session {} · {} {} · started {}",
+        s.id(),
+        history.len(),
+        session::msg_word(history.len()),
+        session::utc(s.created())
+    )];
+    if s.model() != cfg.model {
+        // a different model is a different request — and a prefix cache
+        // that starts cold; the header says which model wrote the session
+        banners.push(format!("session was written by {} — now on {}", s.model(), cfg.model));
+    }
+    if !session::same_dir(s.cwd(), &here) {
+        // the history speaks of files relative to another tree
+        banners.push(format!(
+            "session started in {} — tools now run from {}",
+            session::dir_tail(s.cwd()),
+            session::dir_tail(&here)
+        ));
+    }
+    Ok((session::Convo::persistent(s, history), banners))
+}
+
+/// The one constructor of a user task message. The internal history shape
+/// belongs to the agent core — so its constructor does too, and no
+/// frontend spells the shape by hand.
+fn user_message(text: &str) -> Value {
+    json!({"role": "user", "content": text})
 }
 
 /// Drive one agent run as an interruptible coroutine.
@@ -1439,6 +1561,30 @@ mod tests {
         assert!(flags(&["--base-url"]).is_err());
         assert!(flags(&["--context-size"]).is_err());
         assert!(flags(&["-s"]).unwrap().streaming); // -s is the explicit default
+    }
+
+    #[test]
+    fn session_flags_parse_with_optional_resume_value() {
+        // -c and a bare --resume both mean "the newest session"
+        assert!(flags(&["-c"]).unwrap().resuming());
+        assert!(flags(&["--continue"]).unwrap().resuming());
+        assert!(flags(&["--resume"]).unwrap().resuming());
+        assert_eq!(flags(&["--resume"]).unwrap().resume, None);
+        // a value is an id-prefix selector
+        assert_eq!(flags(&["--resume", "20250916"]).unwrap().resume.as_deref(), Some("20250916"));
+        // the optional value never swallows a flag that follows it
+        let a = flags(&["--resume", "--model", "m"]).unwrap();
+        assert_eq!(a.resume, None);
+        assert_eq!(a.model.as_deref(), Some("m"));
+        // --list is a mode of its own
+        assert!(flags(&["--list"]).unwrap().list);
+        assert!(!flags(&["--list"]).unwrap().resuming());
+        assert!(!flags(&["task", "words"]).unwrap().resuming(), "a task alone resumes nothing");
+    }
+
+    #[test]
+    fn user_message_is_the_single_spelling_of_a_task() {
+        assert_eq!(user_message("count files"), json!({"role": "user", "content": "count files"}));
     }
 
     #[test]

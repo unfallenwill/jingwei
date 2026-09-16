@@ -39,7 +39,8 @@ pub mod update;
 pub mod view;
 
 use crate::display::{self, Msg, Sev};
-use crate::{agent_turn, home_dir, CancelToken, Config, Error};
+use crate::session::Convo;
+use crate::{agent_turn, home_dir, user_message, CancelToken, Config, Error};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::style::Print;
 use crossterm::event::{
@@ -398,7 +399,9 @@ fn needs_paint(
 }
 
 /// Open the TUI: terminal setup, the event loop, guaranteed restore.
-pub async fn run(cfg: &Config) -> crate::Result<()> {
+/// `convo` is the conversation to run on (history + its session); the
+/// banners come from the composition root and land beside ours.
+pub async fn run(cfg: &Config, convo: Convo, banners: Vec<String>) -> crate::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     display::install_chan(tx);
     display::disp(Msg::Banner(format!(
@@ -406,6 +409,9 @@ pub async fn run(cfg: &Config) -> crate::Result<()> {
         cfg.identity())));
     display::disp(Msg::Banner(
         "type a task · Ctrl-J / Shift-Enter breaks the line · Ctrl-O unfolds · Ctrl-C interrupts (twice exits) · /exit or Ctrl-D rests".into()));
+    for b in banners {
+        display::disp(Msg::Banner(b));
+    }
 
     let mut app = App::new();
     app.input.history = load_history();
@@ -415,7 +421,7 @@ pub async fn run(cfg: &Config) -> crate::Result<()> {
         context_limit: cfg.context_size,
     };
 
-    let history = Arc::new(AsyncMutex::new(Vec::<serde_json::Value>::new()));
+    let convo = Arc::new(AsyncMutex::new(convo));
     let mut agent: Option<Agent> = None;
 
     // Raw mode, bracketed paste, and the kitty keyboard protocol (which
@@ -533,10 +539,10 @@ pub async fn run(cfg: &Config) -> crate::Result<()> {
                 match maybe {
                     Some(ev) => match ev {
                         crossterm::event::Event::Key(k) => {
-                            handle(step(&mut app, Ev::Key(k)), cfg, &history, &mut agent);
+                            handle(step(&mut app, Ev::Key(k)), cfg, &convo, &mut agent);
                         }
                         crossterm::event::Event::Paste(p) => {
-                            handle(step(&mut app, Ev::Paste(p)), cfg, &history, &mut agent);
+                            handle(step(&mut app, Ev::Paste(p)), cfg, &convo, &mut agent);
                         }
                         // a resize lands immediately: re-fit the pane and
                         // force the next frame to repaint at the new size —
@@ -545,11 +551,9 @@ pub async fn run(cfg: &Config) -> crate::Result<()> {
                         // Input arm's size poll reconciles in the very
                         // iteration that closes the overlay, after the mode
                         // switch is staged into the frame.
-                        crossterm::event::Event::Resize(w, h) => {
-                            if overlay.is_none() {
-                                let _ = stage.ensure_size(w, h);
-                                painted = None;
-                            }
+                        crossterm::event::Event::Resize(w, h) if overlay.is_none() => {
+                            let _ = stage.ensure_size(w, h);
+                            painted = None;
                         }
                         _ => {}
                     },
@@ -615,7 +619,7 @@ fn draw_overlay(term: &mut ratatui::Terminal<Backend>, app: &App) -> io::Result<
 fn handle(
     action: Action,
     cfg: &Config,
-    history: &Arc<AsyncMutex<Vec<serde_json::Value>>>,
+    convo: &Arc<AsyncMutex<Convo>>,
     agent: &mut Option<Agent>,
 ) {
     match action {
@@ -627,18 +631,20 @@ fn handle(
         }
         Action::Submit(line) => {
             let cfg = cfg.clone();
-            let history = history.clone();
+            let convo = convo.clone();
             let token = Arc::new(CancelToken::new());
             let tok = token.clone();
             display::disp(Msg::TaskBegin(line.clone()));
             let job = tokio::spawn(async move {
-                let mut h = history.lock().await;
-                h.push(serde_json::json!({"role": "user", "content": line}));
-                match agent_turn(&cfg, &mut h, &tok).await {
+                let mut c = convo.lock().await;
+                c.history.push(user_message(&line));
+                c.persist(); // the task is on disk before the first stone moves
+                match agent_turn(&cfg, &mut c.history, &tok).await {
                     Err(Error::Interrupted) => {}
                     Err(e) => display::disp(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
                     Ok(()) => {}
                 }
+                c.persist(); // run boundary: the file never ends mid-run
                 display::disp(Msg::TaskEnd);
             });
             *agent = Some(Agent { token, job });

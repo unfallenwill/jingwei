@@ -118,12 +118,18 @@ impl Plain {
 ///
 /// No editor here, so no input-history file: recall is a TUI feature; this
 /// path keeps the shell's own history (up-arrow) and line editing.
-pub async fn plain_repl(cfg: &crate::Config) -> crate::Result<()> {
+pub async fn plain_repl(
+    cfg: &crate::Config,
+    mut convo: crate::session::Convo,
+    banners: Vec<String>,
+) -> crate::Result<()> {
     use crate::{agent_turn, CancelToken};
     let tty = std::io::stdin().is_terminal();
     display::disp(Msg::Banner("jingwei — 精卫填海，一石一石 · type a task, /exit or Ctrl-D rests, Ctrl-C interrupts".into()));
     disp(Msg::Banner(cfg.identity()));
-    let mut history: Vec<serde_json::Value> = vec![];
+    for b in banners {
+        disp(Msg::Banner(b));
+    }
     let stdin = std::io::stdin();
     loop {
         if tty {
@@ -150,14 +156,16 @@ pub async fn plain_repl(cfg: &crate::Config) -> crate::Result<()> {
         if display::is_exit(&line) {
             break;
         }
-        history.push(serde_json::json!({"role": "user", "content": line}));
+        convo.history.push(crate::user_message(&line));
+        convo.persist(); // the task is on disk before the first stone moves
         disp(Msg::TaskBegin(line));
         let token = CancelToken::new();
-        match agent_turn(cfg, &mut history, &token).await {
+        match agent_turn(cfg, &mut convo.history, &token).await {
             Err(crate::Error::Interrupted) => {}
             Err(e) => disp(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
             Ok(()) => {}
         }
+        convo.persist(); // run boundary: the file never ends mid-run
         disp(Msg::TaskEnd);
     }
     Ok(())

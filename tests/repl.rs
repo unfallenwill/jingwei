@@ -6,7 +6,15 @@ use std::process::{Command, Stdio};
 
 fn spawn_repl() -> std::process::Child {
     let bin = env!("CARGO_BIN_EXE_jingwei");
+    // Sessions live under the home directory — sandbox it so the test
+    // never touches the real one.
+    let mut home = std::env::temp_dir();
+    home.push(format!("jingwei_repl_it_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
     Command::new(bin)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
         .env("JINGWEI_API_KEY", "dummy")
         .env("JINGWEI_BASE_URL", "http://127.0.0.1:1") // never reached
         .env("JINGWEI_MODEL", "dummy")
