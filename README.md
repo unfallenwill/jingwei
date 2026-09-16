@@ -9,7 +9,8 @@ one command, one edit at a time — until the sea is land.
 **Providers live behind a port.** Pick the wire protocol and jingwei speaks
 it: minimax (default — the Messages wire, where the vendor names both its
 endpoint `https://api.minimax.cn/anthropic` and its flagship `MiniMax-M3`,
-so a key alone is a whole config), openai (Chat Completions), and deepseek
+so a key alone is a whole config), zai (Chat Completions with preserved
+thinking — endpoint and flagship `glm-5.3-flash` named too), and deepseek
 (the Chat Completions dialect plus a thinking toggle; it names its own
 endpoint too). Every other Messages- or Chat-Completions-compatible
 endpoint still works by pointing `--base-url` at it.
@@ -25,7 +26,7 @@ export JINGWEI_API_KEY=<your-api-key>
 export JINGWEI_BASE_URL=...
 export JINGWEI_MODEL=...
 # Defaults: --max-tokens 131072 · --context-size 1000000 · --max-turns 60
-export JINGWEI_PROTOCOL=minimax     # or openai, or deepseek
+export JINGWEI_PROTOCOL=minimax     # or zai, or deepseek
 export JINGWEI_CACHE=auto           # or active (minimax's cache_control breakpoints)
 export JINGWEI_THINKING=preserve     # or strip
 export JINGWEI_EFFORT=high           # low | medium | high | max — reasoning effort knob
@@ -57,12 +58,11 @@ jingwei --protocol deepseek -m deepseek-flash "count *.rs files"
 # MiniMax — the default; endpoint and flagship known, active cache + effort
 jingwei --cache active --effort high "count *.rs files"
 
+# Zai (智谱) — endpoint and flagship known; preserved thinking on by default
+jingwei --protocol zai --effort high "count *.rs files"
+
 # DeepSeek, thinking off (the wire's honest strip: thinking disabled)
 jingwei --protocol deepseek --thinking strip "quick question"
-
-# OpenAI-protocol endpoint (GLM native API), bigger output budget + context trim
-jingwei --protocol openai --base-url https://open.bigmodel.cn/api/paas/v4 \
-        -m glm-5.3 --context-size 100000 "refactor this"
 
 jingwei    # interactive REPL
 jingwei -c            # resume the newest session from this project
@@ -172,24 +172,29 @@ gate (`NO_COLOR` honored everywhere; `JINGWEI_COLOR=always` forces it on).
 Providers sit behind a port of their own. The core speaks one internal
 history and asks the composition root which wire to hand it to; each wire
 is a self-contained adapter that owns its translation *and* its rules —
-what a vendor accepts (`deepseek` rejects `--cache active`: its disk cache
-is always on; minimax and deepseek both refuse `--effort` with
-`--thinking strip`: their wires require every past turn's reasoning back
-once tools are in play), how a policy flag becomes wire fields
-(`--thinking strip` erases history blocks on minimax and parks the model
-at `thinking: disabled` on deepseek — and on minimax, `preserve` spells
-the toggle `adaptive`, M3 shipping thinking-off by default), and how the
-usage ledger maps back. Vendors that share the Chat Completions dialect
-share its neutral machinery (message translation, SSE assembly) — the
-dialect names no vendor, so no vendor's details can leak into another's.
+what a vendor accepts (`deepseek` and `zai` reject `--cache active`: their
+caches are implicit, nothing to mark; all three refuse `--effort` with
+`--thinking strip`: their wires want every past turn's reasoning back once
+tools are in play), how a policy flag becomes wire fields (`--thinking
+strip` erases history blocks on minimax and parks the model at `thinking:
+disabled` on deepseek; on zai it is simply *not kept* — the flagship
+thinks whether asked or not, `disabled` is a hard 400 — while `preserve`
+there spells `clear_thinking: false`, *preserved thinking*, the vendor's
+own recommendation for agents because the echoed reasoning rides the
+cached prefix), and how the usage ledger maps back (each vendor's cache
+fields folded into the one internal "input is non-cached input" contract
+the ctx gauge and cache% read). Vendors that share the Chat Completions
+dialect share its neutral machinery (message translation, SSE assembly) —
+the dialect names no vendor, so no vendor's details can leak into
+another's.
 
 ## The three knobs people confuse
 
 | Knob | Layer | What it controls |
 | --- | --- | --- |
 | `--thinking preserve\|strip` | client policy | whether reasoning blocks from earlier turns stay in the history you send back |
-| `--effort low\|medium\|high\|max` | request | reasoning effort, when the endpoint offers the knob: `reasoning_effort` on the openai wire (verbatim — the endpoint decides its vocabulary), `thinking` `adaptive` + a `budget_tokens` tier on the minimax wire (low 1024 · medium 8k · high 32k · max = max-tokens minus a floor for the reply), `reasoning_effort` on the deepseek wire (low/high/max are its words; it maps medium→high itself). Unset sends nothing — the endpoint's default rules |
-| `--cache auto\|active` | cost/latency | `auto`: rely on the server's passive cache (minimax and deepseek both report their hits in `usage` — the bar's cache% is real on both). `active`: mark `cache_control` breakpoints (system + last tool) — minimax's Messages wire, natively. DeepSeek's disk cache needs no switch at all |
+| `--effort low\|medium\|high\|max` | request | reasoning effort, when the endpoint offers the knob: `reasoning_effort` on the zai wire (low/high/max are its words; medium folds into high — the word is a hard 400 there), `thinking` `adaptive` + a `budget_tokens` tier on the minimax wire (low 1024 · medium 8k · high 32k · max = max-tokens minus a floor for the reply), `reasoning_effort` on the deepseek wire (low/high/max are its words; it maps medium→high itself). Unset sends nothing — the endpoint's default rules |
+| `--cache auto\|active` | cost/latency | `auto`: rely on the server's implicit cache — minimax, zai and deepseek all report their hits in `usage`, so the bar's cache% and the ctx gauge read true on every wire. `active`: mark `cache_control` breakpoints (system + last tool) — minimax's Messages wire, natively. zai's and deepseek's caches need no switch at all |
 | interleaved thinking | model capability | whether the model can reason between tool calls within a turn — not a client switch; jingwei just keeps turn structure intact so it can happen |
 
 They interact (preserved thinking makes the cached prefix longer and more
@@ -215,9 +220,10 @@ even 精卫 has a budget.
 
 1. POST `{base}/v1/messages` (minimax — base defaulting to
    `https://api.minimax.cn/anthropic`, model to `MiniMax-M3`) or
-   `{base}/chat/completions` (openai, deepseek — the latter defaulting
-   base to `https://api.deepseek.com`) with `model`, `system`, `tools`,
-   `messages` — streaming by default (`-S` to block).
+   `{base}/chat/completions` (zai — base defaulting to
+   `https://open.bigmodel.cn/api/paas/v4`, model to `glm-5.3-flash` — and
+   deepseek, base defaulting to `https://api.deepseek.com`) with `model`,
+   `system`, `tools`, `messages` — streaming by default (`-S` to block).
 2. Each turn the model returns content. Text is printed as it streams, tool
    calls are executed, results go back in the next request. Reasoning blocks
    are preserved or stripped per `--thinking`. Every assistant turn — including
@@ -232,7 +238,7 @@ even 精卫 has a budget.
 ## Tests
 
 ```sh
-cargo test            # 126 unit tests + 6 integration tests
+cargo test            # 128 unit tests + 6 integration tests
 cargo clippy --all-targets
 ```
 

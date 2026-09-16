@@ -3,8 +3,9 @@
 //
 // Wire protocols: the Messages wire (minimax — whose compatible endpoint is
 // the recommended one, thinking blocks, interleaved reasoning, cache_control),
-// OpenAI Chat Completions, and DeepSeek. Vendors that live at one address
-// name it themselves; everything else you bring the endpoint for.
+// the Chat Completions dialect (zai, deepseek — each with a thinking story of
+// its own). Vendors that live at one address name it themselves; everything
+// else you bring the endpoint for.
 //
 // Env: JINGWEI_API_KEY, JINGWEI_BASE_URL, JINGWEI_MODEL, JINGWEI_PROTOCOL,
 //      JINGWEI_CACHE, JINGWEI_THINKING, JINGWEI_NO_TUI, NO_COLOR
@@ -319,10 +320,11 @@ async fn run_tool(name: &str, input: &Value, token: &CancelToken) -> String {
 /// The wire protocol spoken to the endpoint — the provider port's only
 /// vocabulary word. Three speak the same internal history: minimax (the
 /// Messages wire: content blocks, tool_use/result pairs, thinking with a
-/// signature, interleaved reasoning, cache_control breakpoints), openai
-/// (tool_calls, reasoning by convention unechoed), and deepseek — the
-/// OpenAI wire shape plus a thinking toggle and an echo rule of its own.
-enum Protocol { MiniMax, OpenAI, DeepSeek }
+/// signature, interleaved reasoning, cache_control breakpoints), zai
+/// (chat-completions with preserved thinking and an always-on flagship
+/// reasoner), and deepseek (chat-completions plus a thinking toggle and an
+/// echo rule of its own).
+enum Protocol { MiniMax, Zai, DeepSeek }
 
 impl Protocol {
     /// The endpoint a protocol names for itself when the user names none —
@@ -332,15 +334,15 @@ impl Protocol {
     fn default_base(self) -> Option<&'static str> {
         match self {
             Self::MiniMax => Some("https://api.minimax.cn/anthropic"),
+            Self::Zai => Some("https://open.bigmodel.cn/api/paas/v4"),
             Self::DeepSeek => Some("https://api.deepseek.com"),
-            Self::OpenAI => None,
         }
     }
     /// The model a protocol names for itself when the user names none —
     /// only for a vendor with one flagship, never for a wire with many
-    /// speakers (openai) or a catalogue in flux (deepseek's flash/pro).
+    /// speakers or a catalogue in flux (deepseek's flash/pro).
     fn default_model(self) -> Option<&'static str> {
-        match self { Self::MiniMax => Some("MiniMax-M3"), _ => None }
+        match self { Self::MiniMax => Some("MiniMax-M3"), Self::Zai => Some("glm-5.3-flash"), Self::DeepSeek => None }
     }
 }
 
@@ -354,10 +356,10 @@ enum Thinking { Preserve, Strip }
 /// means *say nothing on the wire* — the endpoint's own default rules, so
 /// existing setups see byte-identical requests.
 ///
-/// The wires spell it differently: openai/deepseek take a word
+/// The wires spell it differently: zai/deepseek take a word
 /// (`reasoning_effort`), the Messages wire a token budget
-/// (`thinking.budget_tokens`). `max` is not an OpenAI word — it is passed
-/// through verbatim and the endpoint decides; on the minimax wire it maps
+/// (`thinking.budget_tokens`). `max` is not every wire's word — each
+/// vendor folds or passes the tiers its own way; on the minimax wire it maps
 /// to "everything but a floor for the reply".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Effort { Low, Medium, High, Max }
@@ -496,7 +498,7 @@ fn build_config(args: &Args) -> Result<Config> {
         .or_else(|| env::var(var).ok())
         .ok_or_else(|| Error::Msg(format!("missing {what} (or env {var})")));
     let protocol = enum_of(&args.protocol, "JINGWEI_PROTOCOL", "protocol",
-        &[("minimax", Protocol::MiniMax), ("openai", Protocol::OpenAI), ("deepseek", Protocol::DeepSeek)])?;
+        &[("minimax", Protocol::MiniMax), ("zai", Protocol::Zai), ("deepseek", Protocol::DeepSeek)])?;
     let cache = enum_of(&args.cache, "JINGWEI_CACHE", "cache",
         &[("auto", CacheMode::Auto), ("active", CacheMode::Active)])?;
     let thinking = enum_of(&args.thinking, "JINGWEI_THINKING", "thinking",
@@ -507,7 +509,7 @@ fn build_config(args: &Args) -> Result<Config> {
     // serve, and the composition root only asks.
     match protocol {
         Protocol::MiniMax => minimax_accepts(cache, thinking, effort)?,
-        Protocol::OpenAI => openai_accepts(cache, thinking, effort)?,
+        Protocol::Zai => zai_accepts(cache, thinking, effort)?,
         Protocol::DeepSeek => deepseek_accepts(cache, thinking, effort)?,
     }
     let max_turns = args.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
@@ -553,12 +555,15 @@ CONNECTION:
     --base-url <URL>    endpoint base (JINGWEI_BASE_URL)
                         minimax: POST {base}/v1/messages — base defaults to
                         https://api.minimax.cn/anthropic, model to MiniMax-M3
-                        openai: POST {base}/chat/completions
+                        zai: POST {base}/chat/completions — base defaults to
+                        https://open.bigmodel.cn/api/paas/v4, model to
+                        glm-5.3-flash
                         deepseek: POST {base}/chat/completions — base defaults
                         to https://api.deepseek.com
     --api-key <KEY>     API key (JINGWEI_API_KEY)
-    -m, --model <NAME>  model name (JINGWEI_MODEL; minimax defaults MiniMax-M3)
-    --protocol <P>      minimax (default) | openai | deepseek
+    -m, --model <NAME>  model name (JINGWEI_MODEL; minimax defaults MiniMax-M3,
+                        zai defaults glm-5.3-flash)
+    --protocol <P>      minimax (default) | zai | deepseek
 
 BEHAVIOR:
     --max-tokens <N>    max output tokens per turn (default 131072)
@@ -570,10 +575,11 @@ BEHAVIOR:
     --effort <TIER>     low | medium | high | max — reasoning effort, when the
                         endpoint offers the knob (JINGWEI_EFFORT); unset (default)
                         sends nothing and the endpoint's default rules.
-                        openai wire: reasoning_effort, passed verbatim (max only
-                        if the endpoint knows it) · minimax wire: thinking
-                        adaptive + budget_tokens (low 1024 · medium 8k · high
-                        32k · max = max-tokens minus a floor for the reply)
+                        minimax wire: thinking adaptive + budget_tokens (low
+                        1024 · medium 8k · high 32k · max = max-tokens minus
+                        a floor for the reply)
+                        zai wire: reasoning_effort (low/high/max its words;
+                        medium folds into high — the wire rejects the word)
                         deepseek wire: reasoning_effort (the wire maps medium
                         to high; low/high/max are its own words)
     -s, --stream        stream output token by token (default)
@@ -614,7 +620,7 @@ TUI (interactive, on a terminal):
 EXAMPLES:
     jingwei \"task\"                       # minimax · MiniMax-M3, endpoint known
     jingwei --effort high --cache active \"task\"
-    jingwei --protocol openai --base-url https://host/v1 -m glm-5.3 --max-tokens 16384 \"task\"
+    jingwei --protocol zai --effort high \"task\"      # glm-5.3-flash, endpoint known
     jingwei --protocol deepseek --thinking strip \"task\"
 ";
 
@@ -779,7 +785,7 @@ async fn agent_turn(cfg: &Config, history: &mut Vec<Value>, token: &CancelToken)
 
 impl Config {
     fn protocol_label(&self) -> &'static str {
-        match self.protocol { Protocol::MiniMax => "minimax", Protocol::OpenAI => "openai", Protocol::DeepSeek => "deepseek" }
+        match self.protocol { Protocol::MiniMax => "minimax", Protocol::Zai => "zai", Protocol::DeepSeek => "deepseek" }
     }
 
     /// The banner's identity tail: protocol · model [· effort] · base url.
@@ -994,7 +1000,7 @@ fn drop_result_and_pair(history: &mut Vec<Value>, mi: usize, bi: usize) {
 async fn call_api(cfg: &Config, history: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
     match cfg.protocol {
         Protocol::MiniMax => minimax_turn(cfg, history, schemas, token).await,
-        Protocol::OpenAI => openai_turn(cfg, history, schemas, token).await,
+        Protocol::Zai => zai_turn(cfg, history, schemas, token).await,
         Protocol::DeepSeek => deepseek_turn(cfg, history, schemas, token).await,
     }
 }
@@ -1279,13 +1285,14 @@ async fn minimax_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], 
 
 // ---- api: the chat-completions wire family --------------------------------
 //
-// OpenAI's Chat Completions is less a vendor than a *dialect*: several
-// providers speak its request/response/SSE shapes and differ only in the
-// field vocabularies layered on top (thinking toggles, effort spellings,
-// usage ledgers). This section is that shared dialect — and deliberately
-// nameless: no vendor appears here, so no vendor's details can leak into
-// another's. The vendors (openai, deepseek, …) are thin sections below,
-// each owning its body extras, its usage translation, and its rules.
+// The Chat Completions dialect is less a vendor than a *lingua franca*:
+// several providers speak its request/response/SSE shapes and differ only
+// in the field vocabularies layered on top (thinking objects, effort
+// spellings, usage ledgers). This section is that shared dialect — and
+// deliberately nameless: no vendor appears here, so no vendor's details
+// can leak into another's. The vendors (zai, deepseek, …) are thin
+// sections below, each owning its body extras, its usage translation, and
+// its rules.
 
 /// Where this family posts. Every speaker of the dialect agrees on the
 /// path; only the host varies.
@@ -1296,7 +1303,7 @@ fn chat_url(cfg: &Config) -> String {
 /// Internal history → the dialect's messages. Reasoning rides assistant
 /// turns as `reasoning_content` when the policy preserves it — whether the
 /// endpoint *requires* that echo (deepseek with tools), merely accepts it,
-/// or ignores it (openai) is a vendor fact, and the dialect serves the
+/// or ignores it — the vendor decides — is a vendor fact, and the dialect serves the
 /// strictest reading: echo unless told to strip.
 fn chat_messages(system: &str, history: &[Value], cfg: &Config) -> Vec<Value> {
     let mut out = vec![json!({"role": "system", "content": system})];
@@ -1453,50 +1460,82 @@ async fn chat_streaming(cfg: &Config, body: Value, usage_of: fn(&Value) -> (Valu
     Ok((json!({"content": content, "usage": usage}), interrupted))
 }
 
-// ---- api: openai vendor ----------------------------------------------------
+// ---- api: zai vendor -------------------------------------------------------
+//
+// Zhipu's zai speaks the chat-completions dialect with a vocabulary of its
+// own on top, all of it staying here. Probed live before this was written:
+// the flagship (glm-5.3-flash) *always* thinks — `thinking: disabled` and
+// any reasoning_effort outside low/high/max are hard 400s ("该模型始终思考，
+// 不支持关闭思考") — reasoning streams as reasoning_content beside content,
+// usage carries prompt_tokens_details.cached_tokens from an implicit cache
+// that needs no breakpoints, and `clear_thinking: false` keeps prior
+// assistant turns' reasoning in context: preserved thinking, recommended
+// for coding/agents precisely because the echoed reasoning is part of the
+// cached prefix.
 
-/// Policy the openai wire cannot serve. Its cache is passive (nothing to
-/// mark) and its reasoning has no echo rule (nothing to keep) — the one
-/// thing it rejects is a breakpoint scheme it has no field for.
-fn openai_accepts(cache: CacheMode, _thinking: Thinking, _effort: Option<Effort>) -> Result<()> {
+/// Policy the zai wire cannot serve, in its own words. Its cache is
+/// implicit — nothing to mark, hits reported in usage. Its reasoning
+/// cannot be turned off (the flagship thinks whether asked or not), so
+/// strip never means "off" here — and effort, the dial that turns
+/// reasoning up, cannot pair with a strip that would drop what the wire's
+/// interleaved-thinking rule says to carry back.
+fn zai_accepts(cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
     if cache == CacheMode::Active {
-        return Err(Error::Msg("--cache active needs --protocol minimax (cache_control is the Messages wire's scheme; this wire has no breakpoints)".into()));
+        return Err(Error::Msg("--cache active needs --protocol minimax (zai's cache is implicit — hits are automatic, nothing to mark)".into()));
+    }
+    if effort.is_some() && thinking == Thinking::Strip {
+        return Err(Error::Msg("--effort needs --thinking preserve on the zai protocol (interleaved thinking asks for the history's reasoning back with every tool result)".into()));
     }
     Ok(())
 }
 
-/// The openai vendor's one entry into the provider port.
-async fn openai_turn(cfg: &Config, history: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+/// The zai vendor's one entry into the provider port.
+async fn zai_turn(cfg: &Config, history: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
     if cfg.streaming {
-        openai_streaming(cfg, history, schemas, token).await
+        zai_streaming(cfg, history, schemas, token).await
     } else {
-        openai_blocking(cfg, history, schemas, token).await
+        zai_blocking(cfg, history, schemas, token).await
     }
 }
 
-/// The openai request body; `stream` adds the usage-bearing stream options.
-/// Effort, when set, is the wire's own word — the endpoint decides its
-/// vocabulary.
-fn openai_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: bool) -> Value {
+/// The effort word this wire understands — its vocabulary, not the knob's:
+/// low/high/max are its own words, and `medium` (a word it rejects with a
+/// 400 on the flagship) folds into `high`, the tier the vendor itself
+/// maps it to on models that do accept it.
+fn zai_effort_word(e: Effort) -> &'static str {
+    match e { Effort::Low => "low", Effort::Medium | Effort::High => "high", Effort::Max => "max" }
+}
+
+/// The zai request body: the dialect's shape plus the thinking object.
+/// Preserve is *preserved thinking* here — `clear_thinking: false`, the
+/// vendor's own recommendation for coding/agents, keeping prior turns'
+/// reasoning in the context (and in the cached prefix). Strip sends no
+/// thinking object at all: the flagship cannot stop thinking (`disabled`
+/// is a hard 400), so strip on this wire means "not kept", never "off" —
+/// the history blocks drop in the dialect's message translation.
+fn zai_body(cfg: &Config, messages: &[Value], schemas: &[Value], stream: bool) -> Value {
     let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
         "messages": chat_messages(SYSTEM, messages, cfg), "tools": chat_tools(schemas)});
+    if cfg.thinking == Thinking::Preserve {
+        body["thinking"] = json!({"type": "enabled", "clear_thinking": false});
+    }
+    if let Some(e) = cfg.effort {
+        body["reasoning_effort"] = json!(zai_effort_word(e));
+    }
     if stream {
         body["stream"] = json!(true);
         body["stream_options"] = json!({"include_usage": true});
     }
-    if let Some(e) = cfg.effort {
-        body["reasoning_effort"] = json!(e.label());
-    }
     body
 }
 
-/// OpenAI usage → internal shape + display usage, in one place so both
-/// consumers stay identical. Normalizes a wire asymmetry: OpenAI's
-/// `prompt_tokens` *includes* `cached_tokens`, while the internal ledger's
-/// `input_tokens` excludes cache traffic — so `input` here becomes
-/// "non-cached input", and `context_in()` (input + cache read + write)
-/// reads true on the wire.
-fn openai_usage(u: &Value) -> (Value, Usage) {
+/// Zai usage → internal shape + display usage, in one place so both
+/// consumers stay identical. Normalizes a wire asymmetry: this wire's
+/// `prompt_tokens` *includes* the implicit cache's `cached_tokens`, while
+/// the internal ledger's `input_tokens` excludes cache traffic — so
+/// `input` here becomes "non-cached input", and `context_in()` (input +
+/// cache read + write) reads true on the wire.
+fn zai_usage(u: &Value) -> (Value, Usage) {
     let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
     let cached = u["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
     let fresh = prompt.saturating_sub(cached);
@@ -1509,16 +1548,16 @@ fn openai_usage(u: &Value) -> (Value, Usage) {
 
 /// OpenAI response → internal {content, usage}: the dialect's walk, this
 /// vendor's ledger.
-fn openai_to_internal(v: &Value) -> Value {
-    chat_to_internal(v, openai_usage)
+fn zai_to_internal(v: &Value) -> Value {
+    chat_to_internal(v, zai_usage)
 }
 
-async fn openai_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
-    chat_blocking(cfg, openai_body(cfg, messages, schemas, false), openai_to_internal, token).await
+async fn zai_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+    chat_blocking(cfg, zai_body(cfg, messages, schemas, false), zai_to_internal, token).await
 }
 
-async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
-    chat_streaming(cfg, openai_body(cfg, messages, schemas, true), openai_usage, token).await
+async fn zai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
+    chat_streaming(cfg, zai_body(cfg, messages, schemas, true), zai_usage, token).await
 }
 
 // ---- api: deepseek vendor --------------------------------------------------
@@ -1780,13 +1819,13 @@ mod tests {
     #[test]
     fn flags_parse_and_validate() {
         let a = flags(&["--base-url", "https://x/v1", "--api-key", "k", "-m", "m1",
-            "--protocol", "openai", "--cache", "auto", "--thinking", "strip",
+            "--protocol", "zai", "--cache", "auto", "--thinking", "strip",
             "--max-tokens", "4096", "--context-size", "100000", "--max-turns", "5",
             "-S", "do", "stuff"]).unwrap();
         assert_eq!(a.prompt, vec!["do", "stuff"]);
         assert!(!a.streaming);
         let cfg = build_config(&a).unwrap();
-        assert_eq!(cfg.protocol, Protocol::OpenAI);
+        assert_eq!(cfg.protocol, Protocol::Zai);
         assert_eq!(cfg.cache, CacheMode::Auto);
         assert_eq!(cfg.thinking, Thinking::Strip);
         assert_eq!(cfg.max_tokens, 4096);
@@ -1802,16 +1841,16 @@ mod tests {
         // active cache belongs to the Messages wire — the chat-completions
         // vendors reject it in their own words
         assert!(build_config(&flags(&["--api-key", "k", "--base-url", "https://x", "-m", "m",
-            "--protocol", "openai", "--cache", "active"]).unwrap()).is_err());
+            "--protocol", "zai", "--cache", "active"]).unwrap()).is_err());
         // required fields — and the one vendor that names its own endpoint
         // and flagship: a key alone is a whole config
         assert!(build_config(&flags(&[]).unwrap()).is_err());
         let bare = build_config(&flags(&["--api-key", "k"]).unwrap()).unwrap();
         assert_eq!((bare.protocol_label(), bare.base_url.as_str(), bare.model.as_str()),
             ("minimax", "https://api.minimax.cn/anthropic", "MiniMax-M3"));
-        assert!(build_config(&flags(&["--api-key", "k", "--protocol", "openai"]).unwrap()).is_err());
-        assert!(build_config(&flags(&["--api-key", "k", "--protocol", "openai",
-            "--base-url", "https://x"]).unwrap()).is_err());
+        // every vendor names its endpoint now, but deepseek leaves the
+        // model to the user — flash or pro is a choice, not a default
+        assert!(build_config(&flags(&["--api-key", "k", "--protocol", "deepseek"]).unwrap()).is_err());
         // bad flags
         assert!(flags(&["--nope"]).is_err());
         assert!(flags(&["--max-tokens", "abc"]).is_err());
@@ -1851,7 +1890,7 @@ mod tests {
             ["--api-key", "k", "--base-url", "https://x", "-m", "m"].iter()
                 .chain(extra.iter()).map(|s| s.to_string())).unwrap();
         // spellings are case-insensitive in every position
-        assert_eq!(build_config(&parse(&["--protocol", "OPENAI"])).unwrap().protocol, Protocol::OpenAI);
+        assert_eq!(build_config(&parse(&["--protocol", "ZAI"])).unwrap().protocol, Protocol::Zai);
         let cfg = build_config(&parse(&["--cache", "Active", "--thinking", "STRIP"])).unwrap();
         assert_eq!(cfg.cache, CacheMode::Active);
         assert_eq!(cfg.thinking, Thinking::Strip);
@@ -1950,10 +1989,10 @@ mod tests {
         }
     }
 
-    // ---- openai wire conversion ----
+    // ---- zai vendor: dialect conversion ----
 
     #[test]
-    fn openai_conversion_maps_all_message_shapes() {
+    fn zai_conversion_maps_all_message_shapes() {
         let history = vec![
             json!({"role": "user", "content": "go"}),
             json!({"role": "assistant", "content": [
@@ -1977,7 +2016,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_conversion_assistant_shapes_and_tool_schemas() {
+    fn zai_conversion_assistant_shapes_and_tool_schemas() {
         // text-only assistant keeps a plain string content
         let history = vec![json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})];
         let msgs = chat_messages("sys", &history, &cfg("https://x".into(), false));
@@ -1999,14 +2038,14 @@ mod tests {
     }
 
     #[test]
-    fn openai_response_normalizes_to_internal_shape() {
+    fn zai_response_normalizes_to_internal_shape() {
         let v = json!({"choices": [{"message": {
             "reasoning_content": "thinking", "content": "answer",
             "tool_calls": [{"id": "t9", "type": "function",
                 "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}}]}}],
             "usage": {"prompt_tokens": 11, "completion_tokens": 7,
                 "prompt_tokens_details": {"cached_tokens": 4}}});
-        let n = openai_to_internal(&v);
+        let n = zai_to_internal(&v);
         assert_eq!(n["content"][0]["type"], json!("thinking"));
         assert_eq!(n["content"][1]["text"], json!("answer"));
         assert_eq!(n["content"][2]["input"]["command"], json!("ls"));
@@ -2014,7 +2053,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_streaming_assembles_deltas() {
+    fn zai_streaming_assembles_deltas() {
         let events = concat!(
             r#"data: {"choices":[{"delta":{"content":"hel"}}]}"#, "\n\n",
             r#"data: {"choices":[{"delta":{"reasoning_content":"think"}}]}"#, "\r\n\r\n", // CRLF is legal SSE framing
@@ -2024,7 +2063,7 @@ mod tests {
             r#"data: {"usage":{"prompt_tokens":9,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":2}}}"#, "\n\n",
             r#"data: [DONE]"#, "\n\n");
         let mut c = cfg(format!("http://127.0.0.1:{}", mock(events, 200, true)), true);
-        c.protocol = Protocol::OpenAI;
+        c.protocol = Protocol::Zai;
         c.streaming = true;
         let (resp, cut) = block_on(call_api(&c, &[json!({"role": "user", "content": "hey"})], &[], &CancelToken::new())).unwrap();
         assert!(!cut);
@@ -2056,16 +2095,27 @@ mod tests {
         c.max_tokens = 1024; // degenerate: the floor itself
         assert_eq!(Effort::High.budget(1024), 1024, "clamped to the wire minimum");
 
-        // openai: the word, verbatim — the endpoint decides its vocabulary
-        c.protocol = Protocol::OpenAI;
+        // zai: the word in its own vocabulary — medium folds into high
+        c.protocol = Protocol::Zai;
         c.effort = Some(Effort::High);
-        assert_eq!(openai_body(&c, &[], &[], false)["reasoning_effort"], json!("high"));
+        assert_eq!(zai_body(&c, &[], &[], false)["reasoning_effort"], json!("high"));
+        c.effort = Some(Effort::Medium);
+        assert_eq!(zai_body(&c, &[], &[], false)["reasoning_effort"], json!("high"),
+            "medium is not a word this wire accepts — the vendor's own fold");
+        c.effort = Some(Effort::Max);
+        assert_eq!(zai_body(&c, &[], &[], false)["reasoning_effort"], json!("max"));
 
-        // effort absent: the word leaves the openai wire (byte-identical to
-        // before the knob); the minimax wire keeps its toggle — preserve
-        // means thinking on for an agent, with no dial attached
+        // effort absent: the word leaves the wire (byte-identical to before
+        // the knob); preserve keeps the vendor's recommended default —
+        // preserved thinking, the reasoning kept in context and in the
+        // cached prefix
         c.effort = None;
-        assert!(openai_body(&c, &[], &[], false).get("reasoning_effort").is_none());
+        assert!(zai_body(&c, &[], &[], false).get("reasoning_effort").is_none());
+        assert_eq!(zai_body(&c, &[], &[], false)["thinking"], json!({"type": "enabled", "clear_thinking": false}));
+        c.thinking = Thinking::Strip;
+        assert!(zai_body(&c, &[], &[], false).get("thinking").is_none(),
+            "the flagship cannot stop thinking — strip sends no object, it just isn't kept");
+        c.thinking = Thinking::Preserve;
         c.protocol = Protocol::MiniMax;
         assert_eq!(minimax_body(&c, &[], &[], true)["thinking"], json!({"type": "adaptive"}));
 
@@ -2078,14 +2128,16 @@ mod tests {
         // the openai wire has no thinking-continuity rule; but the rest of
         // the config is incomplete here, so only probe the guard itself
         let probe = |p: Protocol| {
+            let word = match p { Protocol::MiniMax => "minimax", Protocol::Zai => "zai", Protocol::DeepSeek => "deepseek" };
             let mut a = Args { effort: Some("high".into()), thinking: Some("strip".into()),
-                protocol: Some(if p == Protocol::OpenAI { "openai".into() } else { "minimax".into() }),
+                protocol: Some(word.into()),
                 ..Default::default() };
             a.api_key = Some("k".into()); a.base_url = Some("https://x".into()); a.model = Some("m".into());
             build_config(&a)
         };
         assert!(probe(Protocol::MiniMax).is_err());
-        assert!(probe(Protocol::OpenAI).is_ok(), "the openai wire keeps strip + effort");
+        assert!(probe(Protocol::Zai).is_err(), "zai keeps its reasoning: strip + effort is refused");
+        assert!(probe(Protocol::DeepSeek).is_err());
         // the env var spells it too
         std::env::set_var("JINGWEI_EFFORT", "max");
         let a = Args { api_key: Some("k".into()), base_url: Some("https://x".into()), model: Some("m".into()), ..Default::default() };
@@ -2155,7 +2207,7 @@ mod tests {
         // openai: /chat/completions with bearer only
         let (port, reqs) = mock_seq(vec![(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#.into())]);
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
-        c.protocol = Protocol::OpenAI;
+        c.protocol = Protocol::Zai;
         block_on(call_api(&c, &[json!({"role": "user", "content": "hi"})], &[], &CancelToken::new())).unwrap();
         let req = reqs.lock().unwrap()[0].to_lowercase();
         assert!(req.contains("post /chat/completions http/1.1"), "{req}");
@@ -2177,13 +2229,50 @@ mod tests {
     }
 
     #[test]
-    fn openai_blocking_roundtrip() {
+    fn zai_blocking_roundtrip() {
         let port = mock(r#"{"choices":[{"message":{"content":"mock says hi"}}],"usage":{"prompt_tokens":5,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":1}}}"#, 200, false);
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
-        c.protocol = Protocol::OpenAI;
+        c.protocol = Protocol::Zai;
         let (resp, _) = block_on(call_api(&c, &[json!({"role": "user", "content": "hey"})], &[], &CancelToken::new())).unwrap();
         assert_eq!(resp["content"][0]["text"], "mock says hi");
         assert_eq!(resp["usage"]["cache_read_input_tokens"], json!(1));
+    }
+
+    #[test]
+    fn zai_rules_and_defaults_live_with_the_vendor() {
+        let ok = |cache, thinking, effort| zai_accepts(cache, thinking, effort).is_ok();
+        assert!(ok(CacheMode::Auto, Thinking::Preserve, Some(Effort::High)));
+        assert!(!ok(CacheMode::Active, Thinking::Preserve, None), "the cache is implicit — nothing to mark");
+        assert!(!ok(CacheMode::Auto, Thinking::Strip, Some(Effort::Low)), "effort cannot pair with strip");
+        assert!(ok(CacheMode::Auto, Thinking::Strip, None),
+            "strip alone is 'not kept', never 'off' — the flagship cannot stop thinking");
+        // the vendor names endpoint and flagship; a key alone reaches it
+        std::env::remove_var("JINGWEI_BASE_URL");
+        std::env::remove_var("JINGWEI_MODEL");
+        let args = Args { protocol: Some("zai".into()), api_key: Some("k".into()), ..Default::default() };
+        let c = match build_config(&args) {
+            Ok(c) => c,
+            Err(e) => panic!("zai names its endpoint and flagship: {e}"),
+        };
+        assert_eq!((c.protocol_label(), c.base_url.as_str(), c.model.as_str()),
+            ("zai", "https://open.bigmodel.cn/api/paas/v4", "glm-5.3-flash"));
+    }
+
+    #[test]
+    fn zai_usage_reads_the_implicit_cache_ledger() {
+        // the live wire's shape: prompt includes the implicit cache's hits,
+        // reported as cached_tokens (verified against open.bigmodel.cn)
+        let (ir, shown) = zai_usage(&json!({"prompt_tokens": 210, "completion_tokens": 14,
+            "prompt_tokens_details": {"cached_tokens": 128}, "total_tokens": 224}));
+        assert_eq!(ir, json!({"input_tokens": 82, "output_tokens": 14,
+            "cache_read_input_tokens": 128, "cache_creation_input_tokens": 0}));
+        assert_eq!((shown.input, shown.cache_read), (82, 128));
+        // reasoning rides completion_tokens_details, not the ledger — the
+        // ctx gauge reads inputs, the reasoning is the output's business
+        let (ir, _) = zai_usage(&json!({"prompt_tokens": 19, "completion_tokens": 66,
+            "completion_tokens_details": {"reasoning_tokens": 61}}));
+        assert_eq!(ir["input_tokens"], json!(19));
+        assert_eq!(ir["output_tokens"], json!(66));
     }
 
     // ---- deepseek vendor ----
@@ -2229,7 +2318,8 @@ mod tests {
         assert_eq!(Protocol::DeepSeek.default_base(), Some("https://api.deepseek.com"));
         assert_eq!(Protocol::MiniMax.default_base(), Some("https://api.minimax.cn/anthropic"));
         assert_eq!(Protocol::MiniMax.default_model(), Some("MiniMax-M3"));
-        assert_eq!(Protocol::OpenAI.default_base(), None);
+        assert_eq!(Protocol::Zai.default_base(), Some("https://open.bigmodel.cn/api/paas/v4"));
+        assert_eq!(Protocol::Zai.default_model(), Some("glm-5.3-flash"));
         assert_eq!(Protocol::DeepSeek.default_model(), None, "flash or pro is the user's call");
     }
 
