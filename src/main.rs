@@ -307,7 +307,11 @@ impl Ui {
     }
 
     /// Draw the whole pane — rule, input row, rule, bar — starting at the
-    /// cursor row, col 0.
+    /// cursor row, col 0. Each row is homed and cleared before it is drawn:
+    /// the pane is re-rendered over the *previous* pane's rows, and a short
+    /// row (the locked task, the bar) would otherwise keep whatever the old
+    /// longer row left there — a half rule riding beside the task, stale bar
+    /// text beside the prompt.
     fn render_pane(&mut self) {
         let input = match &self.state {
             PaneState::Working { task, .. } => self.styled(&format!("{}{task}", prompt_str()), Style::Dim),
@@ -315,7 +319,13 @@ impl Ui {
         };
         let rule = self.styled(&rule_str(), Style::Dim);
         let bar = self.bar_line();
-        self.raw(&format!("{rule}\n{input}\n{rule}\n{bar}"));
+        self.raw(&rule);
+        self.raw("\r\n\x1b[K");
+        self.raw(&input);
+        self.raw("\r\n\x1b[K");
+        self.raw(&rule);
+        self.raw("\r\n\x1b[K");
+        self.raw(&bar);
     }
 
     /// One finished transcript line. Pane protocol: clear the pane's top row
@@ -331,7 +341,7 @@ impl Ui {
         }
         self.raw("\x1b[3A\r\x1b[K"); // clear the rule above the input row
         let s = self.styled(line, style);
-        self.raw(&format!("{s}\n"));
+        self.land_line(&s);
         self.render_pane();
     }
 
@@ -344,8 +354,26 @@ impl Ui {
         }
         self.raw("\r\x1b[K");
         let s = self.styled(line, style);
-        self.raw(&format!("{s}\n"));
+        self.land_line(&s);
         self.render_pane();
+    }
+
+    /// Print one transcript line at the cursor row (col 0, already cleared),
+    /// leaving the cursor at col 0 of the row below for render_pane. A line
+    /// wide enough to wrap rides over the pane's own rows — which still hold
+    /// the previous render (a locked task, rule dashes, the bar) — so each
+    /// row the tail will reach is wiped first; beyond the pane the line's
+    /// newlines scroll the screen, and scrolling supplies blank rows by
+    /// itself. The wipe never steps below the bar row, so it cannot clamp
+    /// against the screen bottom and desync the return move.
+    fn land_line(&mut self, s: &str) {
+        let wraps = (disp_width(s) / term_cols()).min(3);
+        for _ in 0..wraps {
+            self.raw("\x1b[B\r\x1b[K"); // wipe a pane row the tail covers
+        }
+        if wraps > 0 { self.raw(&format!("\x1b[{wraps}A")); }
+        self.raw(s);
+        self.raw("\r\n");
     }
 
     /// A warning scrolls with the transcript, not in the pane. Plain mode
@@ -2509,10 +2537,42 @@ mod tests {
         let mut u = ui_buf();
         u.transcript_line("hello", Style::Plain);
         // clear the rule above the input row, print the line, then the pane
-        // (rule, empty input row, rule, empty bar) with the cursor parked at
-        // the bar's end — no newline.
+        // (rule, empty input row, rule, empty bar) with each row homed and
+        // cleared — no stale dashes beside a shorter row — and the cursor
+        // parked at the bar's end, no trailing newline.
         let rule = rule_str();
-        assert_eq!(drain(&mut u), format!("\x1b[3A\r\x1b[Khello\n{rule}\n\n{rule}\n"));
+        assert_eq!(drain(&mut u),
+            format!("\x1b[3A\r\x1b[Khello\r\n{rule}\r\n\x1b[K\r\n\x1b[K{rule}\r\n\x1b[K"));
+    }
+
+    #[test]
+    fn pane_renders_over_a_previous_pane_without_leftovers() {
+        let mut u = ui_buf();
+        let rule = rule_str();
+        // a working pane with a long locked task …
+        u.begin_task("a task long enough to leave columns behind");
+        u.transcript_line("A", Style::Plain);
+        let _ = drain(&mut u);
+        // … then a short one re-renders the same rows: the row under a rule
+        // must be cleared before the task lands, or the previous pane's
+        // longer rule keeps its dashes beside the new, shorter row
+        u.begin_task("hi");
+        u.transcript_line("B", Style::Plain);
+        let out = drain(&mut u);
+        assert!(out.contains(&format!("{rule}\r\n\x1b[Kjingwei> hi")),
+            "the task row is drawn onto a cleared row: {out:?}");
+    }
+
+    #[test]
+    fn pane_wipes_rows_a_wrapped_line_rides_over() {
+        let mut u = ui_buf();
+        // a line wider than the terminal wraps onto the rows below — the
+        // pane's own rows — which must be wiped before the tail lands there
+        let wide = "x".repeat(200); // 200 cols → 2 extra rows at 80
+        u.transcript_line(&wide, Style::Plain);
+        let out = drain(&mut u);
+        assert!(out.contains("\x1b[B\r\x1b[K\x1b[B\r\x1b[K\x1b[2A"), "rows below wiped, cursor returned: {out:?}");
+        assert!(out.contains(&wide), "the whole line still lands: {out:?}");
     }
 
     #[test]
@@ -2521,7 +2581,8 @@ mod tests {
         u.begin_task("refactor me");
         u.transcript_line("A", Style::Plain);
         let rule = rule_str();
-        assert_eq!(drain(&mut u), format!("\x1b[3A\r\x1b[KA\n{rule}\njingwei> refactor me\n{rule}\n⠋ 0s"));
+        assert_eq!(drain(&mut u),
+            format!("\x1b[3A\r\x1b[KA\r\n{rule}\r\n\x1b[Kjingwei> refactor me\r\n\x1b[K{rule}\r\n\x1b[K⠋ 0s"));
         // message_start: the turn jumps onto the bar, in place
         u.bump_usage(&json!({"input_tokens": 100, "output_tokens": 0}));
         assert_eq!(drain(&mut u), "\r\x1b[K⠋ 0s · turn in 100 out 0");
@@ -2546,14 +2607,14 @@ mod tests {
         assert_eq!(drain(&mut u), "", "a partial line stays in the buffer");
         u.stream_text("lo\nwor");
         let out = drain(&mut u);
-        assert!(out.contains("hello\n") && !out.contains("wor"), "{out:?}");
+        assert!(out.contains("hello\r\n") && !out.contains("wor"), "{out:?}");
         u.stream_close();
         assert!(drain(&mut u).contains("wor"), "close lands the partial line");
         // style switch (thinking → text) flushes the pending line first
         u.stream_thinking("th");
         u.stream_text("an");
         let out = drain(&mut u);
-        assert!(out.contains("th\n") && !out.contains("an"), "thinking lands, text buffers: {out:?}");
+        assert!(out.contains("th\r\n") && !out.contains("an"), "thinking lands, text buffers: {out:?}");
     }
 
     #[test]
