@@ -14,7 +14,8 @@ use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 
 const MAX_TOOL_OUTPUT: usize = 50_000;
@@ -85,10 +86,422 @@ fn paint(s: &str, bg: (u8, u8, u8), white: bool) -> String {
     }
 }
 
-fn print_text(t: &str) { print!("{t}"); }
+// ---- ui: transcript + fixed pane (input row + status bar) ------------------
+//
+// The screen is a scrolling transcript with a two-row pane pinned beneath it:
+// the input row (idle: the rustyline prompt; working: the locked task) and a
+// status bar with live usage. The pane is not glued to the physical bottom —
+// it is always the last thing printed, so the terminal's normal scrolling
+// carries old transcript into scrollback and the pane rides along. No scroll
+// regions, no absolute cursor addressing: one invariant does all the work —
+// after every Ui operation the cursor sits at the end of the bar row.
+//
+// Streaming text lands line-buffered (a partial line stays in `pend`) because
+// the cursor may only be moved when it is parked. Non-terminals (pipes,
+// tests, Windows) get plain pass-through that matches the classic behavior.
 
-fn print_thinking(t: &str) {
-    if color_on() { eprint!("\x1b[2m{t}\x1b[22m"); } else { eprint!("{t}"); }
+/// Token usage of one API request — or session totals.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Usage {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+}
+
+impl Usage {
+    /// From an internal-shape usage object (Anthropic keys, or OpenAI mapped).
+    fn from_value(v: &Value) -> Self {
+        let g = |k: &str| v[k].as_u64().unwrap_or(0);
+        Self {
+            input: g("input_tokens"),
+            output: g("output_tokens"),
+            cache_read: g("cache_read_input_tokens"),
+            cache_write: g("cache_creation_input_tokens"),
+        }
+    }
+    /// Everything the model read this request: plain input plus cache traffic.
+    fn context_in(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write
+    }
+    fn add(&mut self, o: &Usage) {
+        self.input += o.input;
+        self.output += o.output;
+        self.cache_read += o.cache_read;
+        self.cache_write += o.cache_write;
+    }
+    fn is_zero(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
+    }
+}
+
+/// 26156 → "26.2k"; small counts stay exact.
+fn humanize(n: u64) -> String {
+    if n < 1000 { format!("{n}") } else { format!("{:.1}k", n as f64 / 1000.0) }
+}
+
+/// Rough display width: ASCII is 1 column, everything else (CJK) is 2.
+fn disp_width(s: &str) -> usize {
+    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
+
+/// Cut to `max` display columns, marking the cut with an ellipsis.
+fn truncate_cols(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = if c.is_ascii() { 1 } else { 2 };
+        if w + cw > max.saturating_sub(2) {
+            out.push('…');
+            return out;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out
+}
+
+/// The status bar's content. Pure — the spinner glyph and elapsed label are
+/// passed in already rendered so tests can pin them. Segments appear as
+/// their data arrives; when the row gets too wide, cache goes first, then
+/// the turn — session totals and the spinner never do.
+fn bar_text(working: Option<(&str, &str)>, turn: &Usage, total: &Usage) -> String {
+    let head: Vec<String> = working.map(|(g, e)| vec![format!("{g} {e}")]).unwrap_or_default();
+    let turn_seg = (!turn.is_zero())
+        .then(|| format!("turn in {} out {}", humanize(turn.context_in()), humanize(turn.output)));
+    let total_seg = (!total.is_zero())
+        .then(|| format!("total in {} out {}", humanize(total.context_in()), humanize(total.output)));
+    let assemble = |with_turn: bool| {
+        let mut segs = head.clone();
+        if with_turn { if let Some(t) = &turn_seg { segs.push(t.clone()) } }
+        if let Some(t) = &total_seg { segs.push(t.clone()) }
+        segs.join(" · ")
+    };
+    let mut out = assemble(true);
+    if disp_width(&out) > BAR_MAX && turn_seg.is_some() {
+        out = assemble(false);
+    }
+    let cache = if total.cache_write > 0 {
+        format!("cache {}+{}", humanize(total.cache_read), humanize(total.cache_write))
+    } else if total.cache_read > 0 {
+        format!("cache {}", humanize(total.cache_read))
+    } else {
+        String::new()
+    };
+    if !cache.is_empty() && disp_width(&out) + 3 + disp_width(&cache) <= BAR_MAX {
+        out = if out.is_empty() { cache } else { format!("{out} · {cache}") };
+    }
+    out
+}
+
+fn elapsed_str(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 { format!("{s}s") } else { format!("{}m{:02}s", s / 60, s % 60) }
+}
+
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Pane rows must fit one physical line each — the protocol only ever moves
+/// the cursor within the pane, so a wrapped pane row would desync it.
+const BAR_MAX: usize = 76;
+const TASK_MAX: usize = 60;
+
+#[derive(PartialEq, Clone, Copy)]
+enum Style { Plain, Dim, Head }
+
+enum PaneState {
+    Idle,
+    Working { task: String, started: Instant, spin: usize },
+}
+
+enum Sink {
+    Stdout,
+    /// Test captures: pane-protocol assertions without a terminal.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Buf(Vec<u8>),
+}
+
+struct Ui {
+    /// Layout on (both streams are terminals); plain pass-through off.
+    pane: bool,
+    color: bool,
+    state: PaneState,
+    /// The latest request's usage (persists after it finishes, for display).
+    turn: Usage,
+    /// Session totals: every completed request, folded in as they finish.
+    total: Usage,
+    /// Partial streamed line, held back so the cursor stays parked.
+    pend: String,
+    pend_dim: bool,
+    /// Plain mode: which stream has an unterminated streamed line.
+    open_out: bool,
+    open_err: bool,
+    sink: Sink,
+}
+
+static UI: OnceLock<Mutex<Ui>> = OnceLock::new();
+
+/// Run `f` against the process-wide Ui. Sync only — never hold it across an
+/// await; every method parks the cursor before returning.
+fn ui<R>(f: impl FnOnce(&mut Ui) -> R) -> R {
+    f(&mut UI.get_or_init(|| Mutex::new(Ui::stdout())).lock().unwrap())
+}
+
+impl Ui {
+    fn stdout() -> Self {
+        let pane = io::stdout().is_terminal() && io::stderr().is_terminal();
+        Self {
+            pane,
+            color: color_on(),
+            state: PaneState::Idle,
+            turn: Usage::default(),
+            total: Usage::default(),
+            pend: String::new(),
+            pend_dim: false,
+            open_out: false,
+            open_err: false,
+            sink: Sink::Stdout,
+        }
+    }
+
+    fn raw(&mut self, s: &str) {
+        match &mut self.sink {
+            Sink::Stdout => {
+                let mut o = io::stdout();
+                let _ = o.write_all(s.as_bytes());
+                let _ = o.flush();
+            }
+            Sink::Buf(b) => b.extend_from_slice(s.as_bytes()),
+        }
+    }
+
+    fn styled(&self, line: &str, style: Style) -> String {
+        if !self.color {
+            line.into()
+        } else {
+            match style {
+                Style::Plain => line.into(),
+                Style::Dim => format!("\x1b[2m{line}\x1b[22m"),
+                Style::Head => format!("\x1b[1;33m{line}\x1b[0m"),
+            }
+        }
+    }
+
+    fn bar_line(&self) -> String {
+        let bar = match &self.state {
+            PaneState::Working { started, spin, .. } => {
+                let glyph = SPINNER[spin % SPINNER.len()];
+                bar_text(Some((glyph, &elapsed_str(started.elapsed()))), &self.turn, &self.total)
+            }
+            PaneState::Idle => bar_text(None, &self.turn, &self.total),
+        };
+        let bar = truncate_cols(&bar, BAR_MAX);
+        if self.color && !bar.is_empty() { format!("\x1b[2m{bar}\x1b[22m") } else { bar }
+    }
+
+    /// Redraw the bar in place. Requires the parked cursor (on the bar row).
+    fn refresh_bar(&mut self) {
+        if !self.pane { return }
+        self.raw("\r\x1b[K");
+        self.raw(&self.bar_line());
+    }
+
+    /// Draw the whole pane (input row + bar) starting at the cursor row, col 0.
+    fn render_pane(&mut self) {
+        let input = match &self.state {
+            PaneState::Working { task, .. } => self.styled(&format!("{}{task}", prompt_str()), Style::Dim),
+            PaneState::Idle => String::new(),
+        };
+        let bar = self.bar_line();
+        self.raw(&format!("{input}\n{bar}"));
+    }
+
+    /// One finished transcript line. Pane protocol: clear the old input row,
+    /// print the line, re-render the pane beneath — the screen scrolls only
+    /// when the terminal itself runs out of rows, which is what keeps
+    /// scrollback intact. Parks the cursor at the end of the bar row.
+    fn transcript_line(&mut self, line: &str, style: Style) {
+        if !self.pane {
+            let s = self.styled(line, style);
+            println!("{s}");
+            return;
+        }
+        self.raw("\x1b[1A\r\x1b[K"); // clear the input row
+        let s = self.styled(line, style);
+        self.raw(&format!("{s}\n"));
+        self.render_pane();
+    }
+
+    /// Transcript a line from an unknown cursor position: never moves up
+    /// (that could erase transcript content), just anchors the pane here.
+    fn fresh_line(&mut self, line: &str, style: Style) {
+        if !self.pane {
+            self.transcript_line(line, style);
+            return;
+        }
+        self.raw("\r\x1b[K");
+        let s = self.styled(line, style);
+        self.raw(&format!("{s}\n"));
+        self.render_pane();
+    }
+
+    /// A warning scrolls with the transcript, not in the pane. Plain mode
+    /// keeps it on stderr like the classic behavior.
+    fn warn(&mut self, msg: &str) {
+        if !self.pane {
+            eprintln!("{}", paint(msg, WARN_BG, false));
+            return;
+        }
+        self.transcript_line(&paint(msg, WARN_BG, false), Style::Plain);
+    }
+
+    /// Same, for an uncertain cursor position (readline errors).
+    fn warn_fresh(&mut self, msg: &str) {
+        if !self.pane {
+            eprintln!("{}", paint(msg, WARN_BG, false));
+            return;
+        }
+        self.fresh_line(&paint(msg, WARN_BG, false), Style::Plain);
+    }
+
+    fn error(&mut self, msg: &str) {
+        if !self.pane {
+            eprintln!("{}", paint(msg, ERR_BG, true));
+            return;
+        }
+        self.transcript_line(&paint(msg, ERR_BG, true), Style::Plain);
+    }
+
+    /// Streamed text deltas. Pane mode buffers the partial line so the
+    /// cursor stays parked; complete lines land in the transcript.
+    fn stream_text(&mut self, t: &str) {
+        if !self.pane {
+            print!("{t}");
+            let _ = io::stdout().flush();
+            self.open_out = true;
+            return;
+        }
+        if self.pend_dim && !self.pend.is_empty() { self.flush_pend(); } // style switch
+        self.pend_dim = false;
+        self.pend.push_str(t);
+        self.flush_complete_lines();
+    }
+
+    fn stream_thinking(&mut self, t: &str) {
+        if !self.pane {
+            if self.color { eprint!("\x1b[2m{t}\x1b[22m") } else { eprint!("{t}") }
+            let _ = io::stderr().flush();
+            self.open_err = true;
+            return;
+        }
+        if !self.pend_dim && !self.pend.is_empty() { self.flush_pend(); } // style switch
+        self.pend_dim = true;
+        self.pend.push_str(t);
+        self.flush_complete_lines();
+    }
+
+    fn flush_complete_lines(&mut self) {
+        while let Some(i) = self.pend.find('\n') {
+            let line: String = self.pend.drain(..=i).collect();
+            let style = if self.pend_dim { Style::Dim } else { Style::Plain };
+            self.transcript_line(line.trim_end_matches('\n'), style);
+        }
+    }
+
+    fn flush_pend(&mut self) {
+        if self.pend.is_empty() { return }
+        let line = std::mem::take(&mut self.pend);
+        let style = if self.pend_dim { Style::Dim } else { Style::Plain };
+        self.transcript_line(&line, style);
+    }
+
+    /// Close the streamed line: land any partial text; plain mode terminates
+    /// the line on whichever stream was left open.
+    fn stream_close(&mut self) {
+        if !self.pane {
+            if self.open_err { eprintln!(); self.open_err = false }
+            if self.open_out { println!(); self.open_out = false }
+            return;
+        }
+        self.flush_pend();
+    }
+
+    /// A request's usage arrived (message_start / usage chunk / blocking
+    /// response): it becomes the live turn, and the bar jumps immediately.
+    fn bump_usage(&mut self, v: &Value) {
+        self.turn = Usage::from_value(v);
+        self.refresh_bar();
+    }
+
+    /// Streaming output count (message_delta): ticks up while text flows.
+    fn bump_output(&mut self, n: u64) {
+        self.turn.output = n;
+        self.refresh_bar();
+    }
+
+    /// The request finished: fold the turn into session totals.
+    fn finish_request(&mut self) {
+        self.total.add(&self.turn);
+        self.refresh_bar();
+    }
+
+    fn begin_task(&mut self, task: &str) {
+        self.state = PaneState::Working {
+            task: truncate_cols(task, TASK_MAX),
+            started: Instant::now(),
+            spin: 0,
+        };
+    }
+
+    fn end_task(&mut self) {
+        self.state = PaneState::Idle;
+    }
+
+    /// Spinner heartbeat, driven by a 120ms ticker while a task runs.
+    fn tick(&mut self) {
+        if !self.pane { return }
+        let spin = match &mut self.state {
+            PaneState::Working { spin, .. } => spin,
+            PaneState::Idle => return,
+        };
+        *spin = (*spin + 1) % SPINNER.len();
+        self.refresh_bar();
+    }
+
+    /// Draw the idle prompt row with the bar beneath it, leaving the cursor
+    /// just after the prompt for readline (which owns that row from here on).
+    /// `parked`: the cursor is on the bar row (normal cycle); otherwise draw
+    /// at the cursor row (recovery after readline errors).
+    fn paint_idle(&mut self, parked: bool) {
+        if !self.pane {
+            print!("{}", prompt_str());
+            let _ = io::stdout().flush();
+            return;
+        }
+        if parked { self.raw("\x1b[1A") }
+        self.raw("\r\x1b[K");
+        self.raw(prompt_str());
+        self.raw("\x1b7");           // remember the editing position
+        self.raw("\x1b[1B\r\x1b[K"); // step onto the bar row
+        self.raw(&self.bar_line());
+        self.raw("\x1b8");           // back to just after the prompt
+    }
+
+    fn tool_lines(&mut self, name: &str, input: &Value, output: &str) {
+        for (i, line) in tool_call_lines(name, input, output).into_iter().enumerate() {
+            if !self.pane {
+                if !self.color {
+                    eprintln!("  {line}");
+                } else if i == 0 {
+                    eprintln!("  \x1b[1;33m{line}\x1b[0m");
+                } else {
+                    eprintln!("  \x1b[2m{line}\x1b[22m");
+                }
+            } else {
+                let style = if i == 0 { Style::Head } else { Style::Dim };
+                self.transcript_line(&format!("  {line}"), style);
+            }
+        }
+    }
 }
 
 /// One-line summary of a tool call's arguments: the command, the path, …
@@ -117,17 +530,9 @@ fn tool_call_lines(name: &str, input: &Value, output: &str) -> Vec<String> {
     lines
 }
 
-/// Echo a tool call to the terminal so the human sees what the agent is doing.
+/// Echo a tool call to the transcript so the human sees what the agent is doing.
 fn print_tool_call(name: &str, input: &Value, output: &str) {
-    for (i, line) in tool_call_lines(name, input, output).into_iter().enumerate() {
-        if !color_on() {
-            eprintln!("  {line}");
-        } else if i == 0 {
-            eprintln!("  \x1b[1;33m{line}\x1b[0m");
-        } else {
-            eprintln!("  \x1b[2m{line}\x1b[22m");
-        }
-    }
+    ui(|u| u.tool_lines(name, input, output));
 }
 
 // ---- tools -----------------------------------------------------------------
@@ -531,8 +936,13 @@ async fn run() -> Result<()> {
     let args = parse_from(env::args().skip(1))?;
     let cfg = build_config(&args)?;
     if args.prompt.is_empty() { repl(&cfg).await } else {
-        let mut history = vec![json!({"role": "user", "content": args.prompt.join(" ")})];
-        agent_turn(&cfg, &mut history).await
+        let prompt = args.prompt.join(" ");
+        ui(|u| { u.begin_task(&prompt); if u.pane { u.transcript_line("", Style::Plain); } });
+        let mut history = vec![json!({"role": "user", "content": prompt})];
+        let res = agent_turn(&cfg, &mut history).await;
+        // The final bar render is the run's summary — totals stay on screen.
+        ui(|u| { u.end_task(); u.refresh_bar(); });
+        res
     }
 }
 
@@ -540,30 +950,42 @@ async fn repl(cfg: &Config) -> Result<()> {
     let mut history: Vec<Value> = vec![];
     let mut rl = rustyline::DefaultEditor::new().map_err(|e| Error::Msg(format!("readline init: {e}")))?;
     if let Some(dir) = home_dir() { let _ = rl.load_history(&dir.join(".jingwei_history")); }
-    eprintln!("{}", paint(" 精卫 ", BANNER_BG, true));
-    println!("\x1b[1mjingwei\x1b[0m — 精卫填海，一石一石 · type a task, Ctrl-C interrupts, Ctrl-D rests");
-    println!("\x1b[2m{} · {} · {}{}\x1b[22m", cfg.protocol_label(), cfg.model, cfg.base_url,
-        if cfg.show_thinking { " · thinking on" } else { "" });
+    ui(|u| {
+        u.transcript_line(&paint(" 精卫 ", BANNER_BG, true), Style::Plain);
+        u.transcript_line("\x1b[1mjingwei\x1b[0m — 精卫填海，一石一石 · type a task, Ctrl-C interrupts, Ctrl-D rests", Style::Plain);
+        u.transcript_line(&format!("\x1b[2m{} · {} · {}{}\x1b[22m", cfg.protocol_label(), cfg.model, cfg.base_url,
+            if cfg.show_thinking { " · thinking on" } else { "" }), Style::Plain);
+    });
     loop {
-        let line = match rl.readline(prompt_str()) {
+        ui(|u| u.paint_idle(true));
+        let line = match rl.readline("") {
             Ok(l) => l,
-            Err(rustyline::error::ReadlineError::Interrupted) => continue,
+            // Cursor position after an interrupt is rustyline's business;
+            // re-anchor the pane from wherever it landed.
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                ui(|u| u.fresh_line("", Style::Plain));
+                continue;
+            }
             Err(rustyline::error::ReadlineError::Eof) => break,
-            Err(e) => { eprintln!("{}", paint(&format!("warning: readline ({e})"), WARN_BG, false)); continue; }
+            Err(e) => { ui(|u| u.warn_fresh(&format!("warning: readline ({e})"))); continue; }
         };
         let line = line.trim();
         if line.is_empty() { continue; }
         let _ = rl.add_history_entry(line);
         history.push(json!({"role": "user", "content": line}));
+        // The task is echoed into the transcript (the pane's input row only
+        // holds the *current* task) and locked into the pane.
+        ui(|u| u.begin_task(line));
+        ui(|u| u.transcript_line(&format!("{}{line}", prompt_str()), Style::Plain));
         // The agent runs as an interruptible coroutine: Ctrl-C during the run
         // cancels it (reported by `agent_turn` itself) while the history —
         // and this prompt — survive for the next task.
         match agent_turn(cfg, &mut history).await {
             Err(Error::Interrupted) => {}
-            Err(e) => eprintln!("{}", paint(&format!(" error: {e} "), ERR_BG, true)),
+            Err(e) => ui(|u| u.error(&format!(" error: {e} "))),
             Ok(()) => {}
         }
-        println!(); // blank line between interactions
+        ui(|u| { u.end_task(); u.transcript_line("", Style::Plain); });
     }
     if let Some(dir) = home_dir() { let _ = rl.save_history(&dir.join(".jingwei_history")); }
     Ok(())
@@ -579,10 +1001,16 @@ async fn repl(cfg: &Config) -> Result<()> {
 /// even graceful is too slow.
 async fn agent_turn(cfg: &Config, history: &mut Vec<Value>) -> Result<()> {
     let token = CancelToken::new();
+    // Spinner & elapsed clock for the pane's status bar. A cheap no-op when
+    // there is no pane or no task running.
+    let ticker = tokio::spawn(async {
+        let mut iv = tokio::time::interval(Duration::from_millis(120));
+        loop { iv.tick().await; ui(|u| u.tick()); }
+    });
     let agent = agent_loop(cfg, history, &token);
     tokio::pin!(agent);
     tokio::select! {
-        res = &mut agent => return res,
+        res = &mut agent => { ticker.abort(); return res }
         _ = tokio::signal::ctrl_c() => token.cancel(),
     }
     let res = tokio::select! {
@@ -592,8 +1020,9 @@ async fn agent_turn(cfg: &Config, history: &mut Vec<Value>) -> Result<()> {
             std::process::exit(130);
         }
     };
+    ticker.abort();
     if let Err(Error::Interrupted) = &res {
-        eprintln!("{}", paint(" interrupted — stopped at a safe point; history kept ", WARN_BG, false));
+        ui(|u| u.warn(" interrupted — stopped at a safe point; history kept "));
     }
     res
 }
@@ -678,7 +1107,7 @@ async fn agent_loop(cfg: &Config, history: &mut Vec<Value>, token: &CancelToken)
     for turn in 0..cfg.max_turns {
         if token.is_cancelled() { return Err(Error::Interrupted); }
         if fit_context(history, cfg.context_size) {
-            eprintln!("{}", paint(" trimmed history to fit --context-size ", WARN_BG, false));
+            ui(|u| u.warn(" trimmed history to fit --context-size "));
         }
         let (resp, interrupted) = call_api(cfg, history, &schemas, token).await?;
         let content = resp["content"].as_array().cloned().unwrap_or_default();
@@ -722,7 +1151,7 @@ async fn agent_loop(cfg: &Config, history: &mut Vec<Value>, token: &CancelToken)
         if stopped { return Err(Error::Interrupted); }
 
         if turn + 1 == cfg.max_turns {
-            eprintln!("{}", paint(&format!(" warning: hit --max-turns={}, stopping ", cfg.max_turns), WARN_BG, false));
+            ui(|u| u.warn(&format!(" warning: hit --max-turns={}, stopping ", cfg.max_turns)));
         }
     }
     Ok(())
@@ -809,21 +1238,23 @@ async fn call_api(cfg: &Config, history: &[Value], schemas: &[Value], token: &Ca
         if let Some(blocks) = v["content"].as_array() {
             for block in blocks {
                 match block["type"].as_str() {
-                    Some("text") => println!("\n{}", block["text"].as_str().unwrap_or("")),
-                    Some("thinking") if cfg.show_thinking => {
-                        eprintln!();
-                        print_thinking(block["thinking"].as_str().unwrap_or(""));
-                        eprintln!();
-                    }
+                    Some("text") => ui(|u| {
+                        u.transcript_line("", Style::Plain);
+                        u.stream_text(block["text"].as_str().unwrap_or(""));
+                        u.stream_close();
+                    }),
+                    Some("thinking") if cfg.show_thinking => ui(|u| {
+                        u.stream_thinking(block["thinking"].as_str().unwrap_or(""));
+                        u.stream_close();
+                    }),
                     _ => {}
                 }
             }
         }
+        // Streaming paths report usage event-by-event themselves; blocking
+        // responses get the whole picture at once.
+        ui(|u| { u.bump_usage(&v["usage"]); u.finish_request(); });
     }
-    eprintln!("[usage] in={} out={} cache_read={} cache_write={}",
-        v["usage"]["input_tokens"], v["usage"]["output_tokens"],
-        v["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0),
-        v["usage"]["cache_creation_input_tokens"].as_u64().unwrap_or(0));
     Ok((v, interrupted))
 }
 
@@ -910,13 +1341,8 @@ fn append_str_field(block: &mut Value, key: &str, tail: &str) {
     }
 }
 
-/// Blank line separating the prompt from the agent's reply — printed once.
-fn lead_nl(lead: &mut bool, stderr: bool) {
-    if !*lead {
-        if stderr { eprintln!() } else { println!() }
-        *lead = true;
-    }
-}
+// (The old "blank line before the reply" lead is the pane's job now: the
+// task echo already separates prompt from reply.)
 
 // ---- api: anthropic wire ---------------------------------------------------
 
@@ -954,8 +1380,7 @@ async fn anthropic_streaming(cfg: &Config, messages: &[Value], schemas: &[Value]
     let body = anthropic_body(cfg, messages, schemas, true);
     let key = cfg.api_key.clone();
     let resp = blocking(token, move || post(&key, url, body, true)).await?;
-    let (mut content, mut usage, mut lead, mut thinking_open, mut text_open) =
-        (vec![], empty_usage(), false, false, false);
+    let (mut content, mut usage) = (vec![], empty_usage());
     let mut interrupted = false;
     let mut lines = sse_channel(resp);
     // Consume the stream as a coroutine: each line is one suspension point,
@@ -970,7 +1395,10 @@ async fn anthropic_streaming(cfg: &Config, messages: &[Value], schemas: &[Value]
         if data == "[DONE]" { break }
         let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
         match v["type"].as_str() {
-            Some("message_start") => merge_usage(&mut usage, v["message"]["usage"].as_object()),
+            Some("message_start") => {
+                merge_usage(&mut usage, v["message"]["usage"].as_object());
+                ui(|u| u.bump_usage(&v["message"]["usage"])); // the bar jumps at stream start
+            }
             Some("content_block_start") => {
                 let i = v["index"].as_u64().unwrap_or(0) as usize;
                 while content.len() <= i { content.push(Value::Null); }
@@ -982,20 +1410,13 @@ async fn anthropic_streaming(cfg: &Config, messages: &[Value], schemas: &[Value]
                 match (block["type"].as_str(), d["type"].as_str()) {
                     (Some("text"), Some("text_delta")) => {
                         if let Some(t) = d["text"].as_str() {
-                            if thinking_open { println!(); thinking_open = false; } // close the thinking line
-                            lead_nl(&mut lead, false);
-                            print_text(t); let _ = io::stdout().flush();
-                            text_open = true;
+                            ui(|u| u.stream_text(t)); // a pending thinking line closes itself
                             append_str_field(block, "text", t);
                         }
                     }
                     (Some("thinking"), Some("thinking_delta")) => {
                         if let Some(t) = d["thinking"].as_str() {
-                            if cfg.show_thinking {
-                                lead_nl(&mut lead, true);
-                                print_thinking(t); let _ = io::stderr().flush();
-                                thinking_open = true;
-                            }
+                            if cfg.show_thinking { ui(|u| u.stream_thinking(t)); }
                             append_str_field(block, "thinking", t);
                         }
                     }
@@ -1016,13 +1437,18 @@ async fn anthropic_streaming(cfg: &Config, messages: &[Value], schemas: &[Value]
                     }
                 }
             }
-            Some("message_delta") => merge_usage(&mut usage, v["usage"].as_object()),
+            Some("message_delta") => {
+                merge_usage(&mut usage, v["usage"].as_object());
+                if let Some(n) = v["usage"]["output_tokens"].as_u64() {
+                    ui(|u| u.bump_output(n)); // output count ticks while text flows
+                }
+            }
             Some("message_stop") => break,
             Some("error") => return Err(Error::Msg(v["error"].to_string())),
             _ => {}
         }
     }
-    if thinking_open || text_open { println!(); } // terminate the streamed line before [usage] lands
+    ui(|u| { u.stream_close(); u.finish_request(); });
     content.retain(|v| !v.is_null());
     Ok((json!({"content": content, "usage": usage}), interrupted))
 }
@@ -1111,12 +1537,12 @@ async fn openai_blocking(cfg: &Config, messages: &[Value], schemas: &[Value], to
 async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], token: &CancelToken) -> Result<(Value, bool)> {
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens, "stream": true,
+        "stream_options": {"include_usage": true},
         "messages": to_openai_messages(SYSTEM, messages, cfg), "tools": openai_tools(schemas)});
     let key = cfg.api_key.clone();
     let resp = blocking(token, move || post(&key, url, body, false)).await?;
     let (mut text, mut reasoning, mut tool_calls) = (String::new(), String::new(), vec![]);
-    let (mut usage, mut lead, mut thinking_open, mut text_open) =
-        (empty_usage(), false, false, false);
+    let mut usage = empty_usage();
     let mut interrupted = false;
     let mut lines = sse_channel(resp);
     // Same contract as the anthropic consumer: one suspension point per line,
@@ -1133,22 +1559,20 @@ async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], t
             usage["input_tokens"] = v["usage"]["prompt_tokens"].clone();
             usage["output_tokens"] = v["usage"]["completion_tokens"].clone();
             usage["cache_read_input_tokens"] = v["usage"]["prompt_tokens_details"]["cached_tokens"].clone();
+            ui(|u| u.bump_usage(&json!({
+                "input_tokens": v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+                "output_tokens": v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+                "cache_read_input_tokens": v["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
+                "cache_creation_input_tokens": 0 })));
         }
         let Some(delta) = v["choices"][0]["delta"].as_object() else { continue };
         let delta = Value::Object(delta.clone());
         if let Some(t) = delta["content"].as_str().filter(|t| !t.is_empty()) {
-            if thinking_open { println!(); thinking_open = false; }
-            lead_nl(&mut lead, false);
-            print_text(t); let _ = io::stdout().flush();
-            text_open = true;
+            ui(|u| u.stream_text(t));
             text.push_str(t);
         }
         if let Some(r) = delta["reasoning_content"].as_str().filter(|r| !r.is_empty()) {
-            if cfg.show_thinking {
-                lead_nl(&mut lead, true);
-                print_thinking(r); let _ = io::stderr().flush();
-                thinking_open = true;
-            }
+            if cfg.show_thinking { ui(|u| u.stream_thinking(r)); }
             reasoning.push_str(r);
         }
         for tc in delta["tool_calls"].as_array().into_iter().flatten() {
@@ -1163,7 +1587,7 @@ async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], t
             }
         }
     }
-    if thinking_open || text_open { println!(); } // terminate the streamed line before [usage] lands
+    ui(|u| { u.stream_close(); u.finish_request(); });
     let mut content = vec![];
     if !reasoning.is_empty() { content.push(json!({"type": "thinking", "thinking": reasoning})); }
     if !text.is_empty() { content.push(json!({"type": "text", "text": text})); }
@@ -1171,7 +1595,6 @@ async fn openai_streaming(cfg: &Config, messages: &[Value], schemas: &[Value], t
         content.push(json!({"type": "tool_use", "id": tc["id"], "name": tc["name"],
             "input": serde_json::from_str::<Value>(tc["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}))}));
     }
-    if lead { println!(); }
     Ok((json!({"content": content, "usage": usage}), interrupted))
 }
 
@@ -1879,5 +2302,166 @@ mod tests {
         assert_eq!(Error::Api(429, "limited".into()).to_string(), "api 429: limited");
         assert_eq!(Error::Msg("bad".into()).to_string(), "bad");
         assert_eq!(Error::Interrupted.to_string(), "interrupted");
+    }
+
+    // ---- ui: status bar & pane protocol ----
+
+    fn ui_buf() -> Ui {
+        Ui {
+            pane: true,
+            color: false,
+            state: PaneState::Idle,
+            turn: Usage::default(),
+            total: Usage::default(),
+            pend: String::new(),
+            pend_dim: false,
+            open_out: false,
+            open_err: false,
+            sink: Sink::Buf(Vec::new()),
+        }
+    }
+
+    /// Drain the captured pane output (test sinks only).
+    fn drain(u: &mut Ui) -> String {
+        let mut s = String::new();
+        if let Sink::Buf(b) = &mut u.sink {
+            s = String::from_utf8_lossy(b).into_owned();
+            b.clear();
+        }
+        s
+    }
+
+    #[test]
+    fn humanize_small_exact_rest_one_decimal_k() {
+        assert_eq!(humanize(0), "0");
+        assert_eq!(humanize(4), "4");
+        assert_eq!(humanize(999), "999");
+        assert_eq!(humanize(1000), "1.0k");
+        assert_eq!(humanize(26156), "26.2k");
+        assert_eq!(humanize(1_048_576), "1048.6k");
+    }
+
+    #[test]
+    fn bar_text_segments_appear_as_data_arrives() {
+        let z = Usage::default();
+        assert_eq!(bar_text(None, &z, &z), "");
+        let turn = Usage { input: 4600, output: 120, ..Usage::default() };
+        assert_eq!(bar_text(None, &turn, &z), "turn in 4.6k out 120");
+        assert_eq!(bar_text(Some(("⠋", "3s")), &turn, &z), "⠋ 3s · turn in 4.6k out 120");
+        let total = Usage { input: 26_156, output: 336, cache_read: 25_344, cache_write: 1188 };
+        assert_eq!(bar_text(None, &turn, &total),
+            "turn in 4.6k out 120 · total in 52.7k out 336 · cache 25.3k+1.2k");
+        // zero cache write: a single figure, no dangling +
+        let total2 = Usage { input: 1, output: 1, cache_read: 500, ..Usage::default() };
+        assert_eq!(bar_text(None, &z, &total2), "total in 501 out 1 · cache 500");
+    }
+
+    #[test]
+    fn bar_text_drops_turn_to_fit_and_reattaches_cache_when_room() {
+        let huge = Usage { input: 9_999_999, output: 9_999_999, cache_read: 9_999_999, cache_write: 9_999_999 };
+        let bar = bar_text(Some(("⠋", "999m59s")), &huge, &huge);
+        // all three segments don't fit; the turn is the one that goes…
+        assert!(!bar.contains("turn"), "turn is the segment that goes: {bar}");
+        assert!(bar.contains("total"), "session totals never drop: {bar}");
+        // …and with it gone, cache fits again
+        assert!(bar.contains("cache"), "{bar}");
+        assert!(disp_width(&bar) <= BAR_MAX, "bar must stay one physical row: {bar}");
+    }
+
+    #[test]
+    fn usage_maps_internal_shape_and_folds_totals() {
+        let v = json!({"input_tokens": 10, "output_tokens": 0,
+            "cache_read_input_tokens": 5, "cache_creation_input_tokens": 2});
+        let mut u = Usage::from_value(&v);
+        assert_eq!(u.context_in(), 17); // the model read all of it
+        u.output = 3;
+        let mut total = Usage::default();
+        total.add(&u);
+        total.add(&u);
+        assert_eq!((total.input, total.output, total.cache_read, total.cache_write), (20, 6, 10, 4));
+    }
+
+    #[test]
+    fn elapsed_str_minutes_and_seconds() {
+        assert_eq!(elapsed_str(Duration::from_secs(3)), "3s");
+        assert_eq!(elapsed_str(Duration::from_secs(59)), "59s");
+        assert_eq!(elapsed_str(Duration::from_secs(63)), "1m03s");
+    }
+
+    #[test]
+    fn truncate_cols_respects_wide_chars() {
+        assert_eq!(truncate_cols("abc", 10), "abc");
+        assert_eq!(truncate_cols("精卫填海", 5), "精…");
+        let long = "x".repeat(80);
+        let t = truncate_cols(&long, 60);
+        assert!(t.ends_with('…') && t.chars().count() == 59, "cut to ~60 columns: {t}");
+    }
+
+    #[test]
+    fn pane_transcript_clears_input_row_and_parks_on_bar() {
+        let mut u = ui_buf();
+        u.transcript_line("hello", Style::Plain);
+        // clear the input row, print the line, then the pane (empty input row,
+        // empty bar) with the cursor parked at the bar's end — no newline.
+        assert_eq!(drain(&mut u), "\x1b[1A\r\x1b[Khello\n\n");
+    }
+
+    #[test]
+    fn pane_shows_locked_task_and_live_bar_while_working() {
+        let mut u = ui_buf();
+        u.begin_task("refactor me");
+        u.transcript_line("A", Style::Plain);
+        assert_eq!(drain(&mut u), "\x1b[1A\r\x1b[KA\njingwei> refactor me\n⠋ 0s");
+        // message_start: the turn jumps onto the bar, in place
+        u.bump_usage(&json!({"input_tokens": 100, "output_tokens": 0}));
+        assert_eq!(drain(&mut u), "\r\x1b[K⠋ 0s · turn in 100 out 0");
+        // spinner advances in place on the same row
+        u.tick();
+        u.tick();
+        assert!(drain(&mut u).starts_with("\r\x1b[K⠙"), "spinner frame 2");
+        // request done: totals fold in, the turn stays on display
+        u.finish_request();
+        let out = drain(&mut u);
+        assert!(out.contains("turn in 100") && out.contains("total in 100"), "{out}");
+        // run ends: the bar drops the spinner segment
+        u.end_task();
+        u.refresh_bar();
+        assert_eq!(drain(&mut u), "\r\x1b[Kturn in 100 out 0 · total in 100 out 0");
+    }
+
+    #[test]
+    fn pane_streams_line_buffered_text() {
+        let mut u = ui_buf();
+        u.stream_text("hel");
+        assert_eq!(drain(&mut u), "", "a partial line stays in the buffer");
+        u.stream_text("lo\nwor");
+        let out = drain(&mut u);
+        assert!(out.contains("hello\n") && !out.contains("wor"), "{out:?}");
+        u.stream_close();
+        assert!(drain(&mut u).contains("wor"), "close lands the partial line");
+        // style switch (thinking → text) flushes the pending line first
+        u.stream_thinking("th");
+        u.stream_text("an");
+        let out = drain(&mut u);
+        assert!(out.contains("th\n") && !out.contains("an"), "thinking lands, text buffers: {out:?}");
+    }
+
+    #[test]
+    fn pane_paint_idle_draws_prompt_bar_below_and_returns_cursor() {
+        let mut u = ui_buf();
+        u.paint_idle(true);
+        assert_eq!(drain(&mut u), "\x1b[1A\r\x1b[Kjingwei> \x1b7\x1b[1B\r\x1b[K\x1b8");
+        u.paint_idle(false); // recovery path: no move up
+        assert_eq!(drain(&mut u), "\r\x1b[Kjingwei> \x1b7\x1b[1B\r\x1b[K\x1b8");
+    }
+
+    #[test]
+    fn plain_mode_passes_through_and_never_touches_the_pane() {
+        let mut u = ui_buf();
+        u.pane = false;
+        u.stream_text("x"); // goes to the real stdout (captured by the harness)
+        u.transcript_line("hi", Style::Plain);
+        u.warn("watch out");
+        assert!(drain(&mut u).is_empty(), "plain mode bypasses the pane sink");
     }
 }
