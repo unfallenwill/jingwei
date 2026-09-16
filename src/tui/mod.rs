@@ -22,6 +22,17 @@
 //! scrolls by printing newlines on the last row (see [`Stage::scroll`]), the
 //! way the transcript has always ridden the terminal. The one query of the
 //! session happens in [`Stage::new`], before the reader thread exists.
+//!
+//! A repaint reaches the terminal as *one burst*: everything the frame
+//! wants — cursor hide, scrolls, transcript rows, the pane, the caret — is
+//! staged into a buffer (see [`Stage::frame`]) and written by a single
+//! flush, bracketed by synchronized output (CSI ? 2026 h/l). Terminals
+//! render on their own clock, and a frame that arrives in pieces lends
+//! them intermediate states to show: a scroll whose freed rows are not
+//! painted yet, or a pane cleared of its old rows before the new ones
+//! land, each reads as a flash. The brackets ask the terminal to hold
+//! presentation until the frame closes (terminals without the mode ignore
+//! it, and still take the whole frame as one contiguous write).
 
 pub mod model;
 pub mod update;
@@ -35,7 +46,8 @@ use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
-use crossterm::terminal::{Clear, ClearType};
+use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
+use crossterm::Command;
 use model::{App, Mode};
 use ratatui::backend::CrosstermBackend;
 use ratatui::backend::Backend as _;
@@ -44,6 +56,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Text};
 use ratatui::widgets::Widget;
 use std::io::{self, IsTerminal};
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
@@ -106,10 +119,42 @@ fn scroll_bytes(n: u16) -> String {
     "\r\n".repeat(n as usize)
 }
 
+/// Append a command's escape sequence to a writer as bytes — commands
+/// speak `fmt::Write`, the wire speaks `io::Write`; this is the one
+/// adapter. (fmt::Write into a String cannot fail, so neither can this.)
+fn put_cmd<W: Write>(w: &mut W, cmd: impl Command) -> io::Result<()> {
+    let mut s = String::new();
+    let _ = cmd.write_ansi(&mut s);
+    w.write_all(s.as_bytes())
+}
+
+/// Write one composed frame as a single synchronized burst: the body
+/// wrapped in Begin/End Synchronized Update (CSI ? 2026 h/l), then one
+/// flush. The brackets are the terminal's promise to present nothing
+/// until the frame closes — so the scroll inside a frame never shows
+/// without the rows that fill the gap it opened (the flash this pins).
+/// Terminals without the mode ignore it and still take one contiguous
+/// write. An empty frame writes nothing at all.
+fn send_frame<W: Write>(w: &mut W, frame: &[u8]) -> io::Result<()> {
+    if frame.is_empty() {
+        return Ok(());
+    }
+    put_cmd(w, BeginSynchronizedUpdate)?;
+    w.write_all(frame)?;
+    put_cmd(w, EndSynchronizedUpdate)?;
+    w.flush()
+}
+
 /// The bottom of the screen: the pane's rows and where they sit. All
 /// geometry is tracked, never queried — see the module docs.
 struct Stage {
-    backend: Backend,
+    /// The frame under construction. Everything one repaint wants on the
+    /// wire — Hide, scrolls, transcript rows, height-change clears, pane
+    /// rows, the caret — is staged here as raw ANSI until [`Stage::send`]
+    /// writes it in one burst. Nothing paints outside a frame, so a frame
+    /// never carries state across repaints (a resize's scroll is staged
+    /// only when the size changed, which forces the repaint that sends it).
+    frame: Vec<u8>,
     /// The pane's top row on the primary screen.
     top: u16,
     /// The pane's current row count (it grows with the draft).
@@ -122,16 +167,18 @@ impl Stage {
     /// Anchor the pane at the cursor's row — the one cursor-position query
     /// of the session, made before the keyboard reader exists. If the
     /// anchor is too close to the bottom, scroll so the pane fits.
-    fn new(backend: Backend, height: u16) -> io::Result<Self> {
-        let size = backend.size()?;
+    fn new(height: u16) -> io::Result<Self> {
+        let (w, h) = crossterm::terminal::size()?;
         let (_, top) = crossterm::cursor::position()
             .map_err(|e| io::Error::other(format!("cursor position: {e}")))?;
-        let screen = size.height.max(1);
+        let screen = h.max(1);
         let height = height.min(screen);
-        let mut me = Stage { backend, top, height, width: size.width.max(8), screen };
+        let mut me = Stage { frame: Vec::new(), top, height, width: w.max(8), screen };
         if me.top + me.height > me.screen {
             let s = me.top + me.height - me.screen;
-            me.scroll(s)?;
+            // before the first frame there is nothing of ours on screen,
+            // so no intermediate state to hide — a direct write is fine
+            crossterm::execute!(io::stdout(), MoveTo(0, me.screen - 1), Print(scroll_bytes(s)))?;
             me.top = me.screen - me.height;
         }
         Ok(me)
@@ -139,7 +186,10 @@ impl Stage {
 
     /// Reconcile with the terminal's size. Resize events nudge this
     /// immediately; the per-frame size poll (below) is the same fallback
-    /// ratatui's own autoresize performs per draw.
+    /// ratatui's own autoresize performs per draw. A scroll this performs
+    /// is staged into the frame — safe because a size change also forces
+    /// the repaint ([`needs_paint`] compares the painted size), and the
+    /// repaint is what sends the frame.
     fn ensure_size(&mut self, w: u16, h: u16) -> io::Result<()> {
         let w = w.max(8);
         let h = h.max(1);
@@ -159,12 +209,15 @@ impl Stage {
 
     /// Grow or shrink the pane. Growth scrolls the screen (old transcript
     /// rides into the scrollback, nothing is lost); shrink clears the rows
-    /// the pane gives up.
+    /// the pane gives up. Both are staged — the clears and the rows that
+    /// replace them ride the same burst, so the pane never spends a render
+    /// with its old bottom erased and its new one not yet drawn.
     fn set_height(&mut self, new_h: u16) -> io::Result<()> {
         let new_h = new_h.min(self.screen).max(1);
         if new_h < self.height {
             for y in (self.top + new_h)..(self.top + self.height) {
-                crossterm::execute!(io::stdout(), MoveTo(0, y), Clear(ClearType::UntilNewLine))?;
+                self.put(MoveTo(0, y));
+                self.put(Clear(ClearType::UntilNewLine));
             }
         } else if new_h > self.height && self.top + new_h > self.screen {
             let s = self.top + new_h - self.screen;
@@ -186,7 +239,8 @@ impl Stage {
             // Raw mode has OPOST off, so "\n" is a bare line feed; each LF
             // on the bottom row scrolls the screen (and archives the top)
             // and the CR keeps the cursor honest for the next one.
-            crossterm::execute!(io::stdout(), MoveTo(0, self.screen - 1), Print(scroll_bytes(n)))?;
+            self.put(MoveTo(0, self.screen - 1));
+            self.frame.extend_from_slice(scroll_bytes(n).as_bytes());
         }
         Ok(())
     }
@@ -217,7 +271,10 @@ impl Stage {
     /// Write whole rows at `at` — every column, spaces included, so shorter
     /// rows clear what they draw over (the pane is repainted in place). The
     /// one exception is the trailing half of a wide grapheme, which
-    /// [`row_cells`] steps over.
+    /// [`row_cells`] steps over. The rows are staged into the frame through
+    /// a backend over its bytes: ratatui's own run-packing (MoveTo only
+    /// between non-adjacent cells) keeps working, and nothing reaches the
+    /// terminal until [`Stage::send`].
     fn paint_at(&mut self, at: u16, lines: &[Line<'static>]) -> io::Result<()> {
         let n = lines.len() as u16;
         if n == 0 {
@@ -228,13 +285,39 @@ impl Stage {
         let mut buf = Buffer::empty(area);
         Text::from(lines.to_vec()).render(area, &mut buf);
         let cells = row_cells(&buf, at);
-        self.backend.draw(cells.iter().map(|(x, y, c)| (*x, *y, c)))?;
-        self.backend.flush()
+        let mut backend = CrosstermBackend::new(&mut self.frame);
+        backend.draw(cells.iter().map(|(x, y, c)| (*x, *y, c)))?;
+        Ok(())
     }
 
     /// The pane itself.
     fn paint(&mut self, lines: &[Line<'static>]) -> io::Result<()> {
         self.paint_at(self.top, lines)
+    }
+
+    /// Append a command's escape sequence to the frame under construction.
+    fn put(&mut self, cmd: impl Command) {
+        let _ = put_cmd(&mut self.frame, cmd);
+    }
+
+    /// Open a frame: hide the caret for the composition to come — the
+    /// writes of a frame walk a visible caret across rows that are only
+    /// half-repainted, and the caret reappears (with [`Stage::send`]) only
+    /// once the rows are in place, where it belongs.
+    fn open_frame(&mut self) {
+        self.put(Hide);
+    }
+
+    /// Put the composed frame on the wire: one synchronized burst, one
+    /// flush — every flush is a render opportunity, so a frame offers the
+    /// terminal exactly one. (Stdout is line-buffered and the frame carries
+    /// the scroll's newlines, so the tty may still split the write at the
+    /// last one; the sync brackets make that split invisible wherever the
+    /// mode is known, and microseconds-wide where it is not.)
+    fn send(&mut self) -> io::Result<()> {
+        send_frame(&mut io::stdout().lock(), &self.frame)?;
+        self.frame.clear();
+        Ok(())
     }
 }
 
@@ -332,7 +415,7 @@ pub async fn run(cfg: &Config) -> crate::Result<()> {
         )
     )
     .map_err(|e| Error::Msg(format!("keyboard protocol: {e}")))?;
-    let mut stage = Stage::new(CrosstermBackend::new(io::stdout()), 4)
+    let mut stage = Stage::new(4)
         .map_err(|e| Error::Msg(format!("terminal: {e}")))?;
 
     // only now does anything else read stdin
@@ -365,8 +448,8 @@ pub async fn run(cfg: &Config) -> crate::Result<()> {
                     crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
                     painted = None;
                 }
-                if let Ok(s) = stage.backend.size() {
-                    stage.ensure_size(s.width, s.height)?;
+                if let Ok((sw, sh)) = crossterm::terminal::size() {
+                    stage.ensure_size(sw, sh)?;
                 }
                 let w = stage.width;
                 let h = stage.screen;
@@ -375,23 +458,25 @@ pub async fn run(cfg: &Config) -> crate::Result<()> {
                 flushed = app.rows.len();
                 let p = view::pane(&app, w, h);
                 if needs_paint(grew, painted.as_ref(), w, h, &p) {
-                    // Paint with the cursor hidden. Cells go out as contiguous
-                    // runs that walk a visible caret across the pane, and a
-                    // growing pane scrolls the screen under it — the caret only
-                    // exists once the rows are in place, so it is shown then,
-                    // where it belongs. (Ratatui's Terminal hides for the same
-                    // reason while it diffs.)
-                    crossterm::execute!(io::stdout(), Hide)?;
+                    // The whole frame is composed first and sent as one
+                    // synchronized burst (see [`Stage::send`]): scrolls,
+                    // transcript rows, and the pane land together, so the
+                    // terminal is never handed the intermediate state —
+                    // a scrolled screen with its freed rows still blank —
+                    // that read as a flash. Cells go out as contiguous
+                    // runs that walk a visible caret across the pane, and
+                    // a growing pane scrolls the screen under it — the
+                    // caret only exists once the rows are in place, so it
+                    // is shown then, where it belongs.
+                    stage.open_frame();
                     stage.flush(&lines)?;
                     stage.set_height(p.lines.len() as u16)?;
                     stage.paint(&p.lines)?;
                     if let Some(c) = p.cursor.as_ref() {
-                        crossterm::execute!(
-                            io::stdout(),
-                            Show,
-                            MoveTo(c.col.min(w.saturating_sub(1)), stage.top + c.row)
-                        )?;
+                        stage.put(Show);
+                        stage.put(MoveTo(c.col.min(w.saturating_sub(1)), stage.top + c.row));
                     }
+                    stage.send()?;
                     painted = Some(((w, h), p));
                 }
             }
@@ -612,6 +697,43 @@ mod tests {
         let b = scroll_bytes(3);
         assert_eq!(b, "\r\n\r\n\r\n");
         assert!(!b.contains('\x1b'), "no escape sequences in the scroll primitive");
+    }
+
+    /// A sink that records the wire: every write, and every flush. Each
+    /// flush is a render opportunity — what this counts is how many
+    /// chances a frame gives the terminal to show a half-painted screen.
+    #[derive(Default)]
+    struct Wire {
+        writes: Vec<Vec<u8>>,
+        flushes: usize,
+    }
+
+    impl io::Write for Wire {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_frame_leaves_as_one_synchronized_burst() {
+        // the bug this pins: a repaint used to arrive as several separate
+        // flushes — Hide, then the scroll, then the rows it made room for,
+        // then the caret — and a terminal that rendered between the scroll
+        // and the rows showed the pane displaced over blank rows: a flash
+        let mut w = Wire::default();
+        send_frame(&mut w, b"").unwrap();
+        assert_eq!((w.writes.len(), w.flushes), (0, 0), "an empty frame never touches the wire");
+
+        let mut w = Wire::default();
+        send_frame(&mut w, b"\x1b[?25l\r\nrows").unwrap();
+        let flat = w.writes.concat();
+        assert_eq!(flat, b"\x1b[?2026h\x1b[?25l\r\nrows\x1b[?2026l".to_vec(), "begin, body, end — in order");
+        assert_eq!(w.flushes, 1, "one flush per frame, the one render opportunity it offers");
     }
 
     #[test]
