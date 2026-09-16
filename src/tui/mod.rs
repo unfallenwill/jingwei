@@ -145,6 +145,23 @@ fn send_frame<W: Write>(w: &mut W, frame: &[u8]) -> io::Result<()> {
     w.flush()
 }
 
+/// The exit burst: erase the pane's rows, park the caret where the
+/// shell's prompt will land, and roll back the session's modes —
+/// composed like any frame (see [`send_frame`]) so the pane dissolves
+/// in one render instead of row by row.
+fn retire_bytes(top: u16, height: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    for y in top..top + height {
+        let _ = put_cmd(&mut out, MoveTo(0, y));
+        let _ = put_cmd(&mut out, Clear(ClearType::UntilNewLine));
+    }
+    let _ = put_cmd(&mut out, MoveTo(0, top));
+    let _ = put_cmd(&mut out, Show);
+    let _ = put_cmd(&mut out, DisableBracketedPaste);
+    let _ = put_cmd(&mut out, PopKeyboardEnhancementFlags);
+    out
+}
+
 /// The bottom of the screen: the pane's rows and where they sit. All
 /// geometry is tracked, never queried — see the module docs.
 struct Stage {
@@ -442,10 +459,14 @@ pub async fn run(cfg: &Config) -> crate::Result<()> {
                 if overlay.take().is_some() {
                     // back on the primary screen: it still holds the pane
                     // and the whole scrollback, exactly as we left them.
-                    // The overlay left the terminal's cursor hidden, so
-                    // the pane's caret must be shown again even if the
-                    // pane itself is unchanged — forget what was painted.
-                    crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
+                    // The mode switch rides the frame's first bytes and
+                    // goes out with the repaint in the same burst (a
+                    // repaint always follows — painted is forgotten), so
+                    // no render catches the screen switched but the pane
+                    // still stale. The overlay left the terminal's cursor
+                    // hidden; the frame's own Show restores it even if
+                    // the pane itself is unchanged.
+                    stage.put(crossterm::terminal::LeaveAlternateScreen);
                     painted = None;
                 }
                 if let Ok((sw, sh)) = crossterm::terminal::size() {
@@ -492,7 +513,17 @@ pub async fn run(cfg: &Config) -> crate::Result<()> {
                     }
                 }
                 if let Some(t) = overlay.as_mut() {
-                    draw_overlay(t, &app)?;
+                    // the overlay obeys the same one-burst law: ratatui's
+                    // diff flushes on its own, so the brackets go around
+                    // its whole draw — a resize or a first paint rewrites
+                    // the entire screen, the widest tearing window there
+                    // is. The End goes out even when the draw fails: a
+                    // terminal left inside the brackets would present
+                    // nothing at all.
+                    let _ = crossterm::execute!(io::stdout(), BeginSynchronizedUpdate);
+                    let drawn = draw_overlay(t, &app);
+                    let _ = crossterm::execute!(io::stdout(), EndSynchronizedUpdate);
+                    drawn?;
                 }
             }
         }
@@ -508,10 +539,17 @@ pub async fn run(cfg: &Config) -> crate::Result<()> {
                             handle(step(&mut app, Ev::Paste(p)), cfg, &history, &mut agent);
                         }
                         // a resize lands immediately: re-fit the pane and
-                        // force the next frame to repaint at the new size
+                        // force the next frame to repaint at the new size —
+                        // unless the overlay owns the screen, when escapes
+                        // would land on the alternate screen it shows. The
+                        // Input arm's size poll reconciles in the very
+                        // iteration that closes the overlay, after the mode
+                        // switch is staged into the frame.
                         crossterm::event::Event::Resize(w, h) => {
-                            let _ = stage.ensure_size(w, h);
-                            painted = None;
+                            if overlay.is_none() {
+                                let _ = stage.ensure_size(w, h);
+                                painted = None;
+                            }
                         }
                         _ => {}
                     },
@@ -551,12 +589,13 @@ pub async fn run(cfg: &Config) -> crate::Result<()> {
     if overlay.take().is_some() {
         let _ = crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
     }
-    for y in stage.top..stage.top + stage.height {
-        let _ = crossterm::execute!(io::stdout(), MoveTo(0, y), Clear(ClearType::UntilNewLine));
-    }
-    let _ = crossterm::execute!(io::stdout(), MoveTo(0, stage.top), Show);
+    // One burst to dissolve: the pane's rows erase, the caret parks on
+    // the first of them for the shell's prompt, and the session's modes
+    // roll back — a render between the per-row clears used to show the
+    // pane dissolving row by row. Raw mode is termios, not escape
+    // bytes; it goes back after the burst.
+    let _ = send_frame(&mut io::stdout().lock(), &retire_bytes(stage.top, stage.height));
     let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste, PopKeyboardEnhancementFlags);
     save_history(&app.input.history);
     Ok(())
 }
@@ -734,6 +773,21 @@ mod tests {
         let flat = w.writes.concat();
         assert_eq!(flat, b"\x1b[?2026h\x1b[?25l\r\nrows\x1b[?2026l".to_vec(), "begin, body, end — in order");
         assert_eq!(w.flushes, 1, "one flush per frame, the one render opportunity it offers");
+    }
+
+    #[test]
+    fn retiring_dissolves_the_pane_in_one_burst() {
+        // the exit used to clear the pane with one execute! per row — a
+        // render between them showed the pane dissolving row by row
+        let s = String::from_utf8(retire_bytes(20, 4)).unwrap();
+        assert_eq!(s.matches("\x1b[K").count(), 4, "one erase per pane row: {s:?}");
+        // rows clear top-down …
+        let rows: Vec<usize> =
+            ["\x1b[21;1H", "\x1b[22;1H", "\x1b[23;1H", "\x1b[24;1H"].iter().map(|m| s.find(m).expect("a move per row")).collect();
+        assert!(rows.windows(2).all(|w| w[0] < w[1]), "top-down: {s:?}");
+        // … then the caret parks on the pane's first row for the shell's
+        // prompt, and the session's modes roll back in the same burst
+        assert!(s.ends_with("\x1b[21;1H\x1b[?25h\x1b[?2004l\x1b[<1u"), "caret parks, modes roll back: {s:?}");
     }
 
     #[test]
