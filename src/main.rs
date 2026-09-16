@@ -79,6 +79,20 @@ impl From<ureq::Error> for Error {
 impl From<serde_json::Error> for Error { fn from(e: serde_json::Error) -> Self { Self::Json(e) } }
 impl From<io::Error> for Error { fn from(e: io::Error) -> Self { Self::Io(e) } }
 
+impl Error {
+    /// Is this worth sending again? A 429 or a 5xx, or a socket that never
+    /// answered, is not the request's fault — and the answer is the same on
+    /// every wire, so it lives on the error type rather than at the call
+    /// sites. Pure, so a test reaches it.
+    fn is_transient(&self) -> bool {
+        match self {
+            Error::Http(_) => true,                                  // connect / timeout / DNS
+            Error::Api(s, _) => *s == 408 || *s == 429 || *s >= 500, // the retryable statuses
+            _ => false,                                              // Msg / Json / Io / Interrupted
+        }
+    }
+}
+
 // ---- colors --------------------------------------------------------------
 // (the gate, the palette, and the painter all live in display.rs — the
 // agent core below never touches a terminal)
@@ -760,6 +774,7 @@ const SYSTEM: &str = "You are jingwei (精卫), a coding agent with these tools:
     Never run destructive commands unless the user explicitly asks. \
     Never run git commit, push, reset, checkout, clean, or rebase unless the user explicitly asks. \
     Write for a terminal, not a Markdown renderer: plain text, no headings/tables/bold markers, short lines, with exact copy-pasteable paths and commands. And since your reasoning is folded away and unseen, put every conclusion in the visible answer. \
+    Don't stop until the task is actually delivered: make the change, then verify it by running the build, the tests, or the exact command, fix what fails, and repeat until it passes — only then summarize. If you cannot finish, say exactly what is done, what is left, and what blocked you. \
     When asked your name, say you are jingwei (精卫). \
     When finished, reply with a concise 1-3 sentence summary of what you did.";
 
@@ -1146,6 +1161,59 @@ fn post(api_key: &str, url: String, body: Value, messages_wire: bool) -> Result<
     Ok(req.send_json(body)?)
 }
 
+/// How many times one request is sent before giving up: the first try plus
+/// this many resends.
+const RETRY_ATTEMPTS: u32 = 4;
+/// The first backoff step, and the ceiling it doubles up to.
+const RETRY_BASE: Duration = Duration::from_millis(500);
+const RETRY_MAX: Duration = Duration::from_secs(8);
+
+/// The wait before resend `attempt` (1-based): doubling from [`RETRY_BASE`],
+/// capped. A pure fact, so tests reach it — like
+/// [`flush_plan`](crate::tui::mod).
+fn backoff(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(5);
+    (RETRY_BASE * 2u32.pow(shift)).min(RETRY_MAX)
+}
+
+/// The transport's one door: every wire's request goes through it, so the
+/// retry sits *below* the provider port — the vendors never see it and their
+/// signatures do not change. A 429, a 5xx, or a socket that never answered
+/// ([`Error::is_transient`]) is not the request's fault, so it is sent again
+/// with a doubling backoff; the wait races the cancel token, so a Ctrl-C
+/// never sleeps through it. Only the request is retried — never a stream
+/// that has already delivered content — which is exactly why this wraps the
+/// POST and stops there: nothing above a started stream is re-sendable, and
+/// nothing below the port is reachable by the tools.
+async fn request<T>(
+    token: &CancelToken,
+    key: &str,
+    url: &str,
+    body: &Value,
+    messages_wire: bool,
+    decode: fn(ureq::Response) -> Result<T>,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let (key, url, body) = (key.to_owned(), url.to_owned(), body.clone());
+        let out = blocking(token, move || decode(post(&key, url, body, messages_wire)?)).await;
+        match out {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < RETRY_ATTEMPTS && e.is_transient() => {
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff(attempt)) => {}
+                    _ = token.cancelled() => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// SSE lines from a response, newlines stripped — produced on a plain reader
 /// thread and handed to the agent coroutine over a channel. A blocking
 /// socket can't suspend, so the socket gets its own thread and the
@@ -1280,8 +1348,8 @@ async fn minimax_blocking(cfg: &Config, messages: &[Message], schemas: &[Value],
     let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
     let body = minimax_body(cfg, messages, schemas, false);
     let key = cfg.api_key.clone();
-    let v = blocking(token, move || -> Result<Value> {
-        let v: Value = post(&key, url, body, true)?.into_json()?;
+    let v: Value = request(token, &key, &url, &body, true, |r| {
+        let v: Value = r.into_json()?;
         if let Some(err) = v.get("error") { return Err(Error::Msg(err.to_string())); }
         Ok(v)
     }).await?;
@@ -1294,7 +1362,7 @@ async fn minimax_streaming(cfg: &Config, messages: &[Message], schemas: &[Value]
     let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
     let body = minimax_body(cfg, messages, schemas, true);
     let key = cfg.api_key.clone();
-    let resp = blocking(token, move || post(&key, url, body, true)).await?;
+    let resp = request(token, &key, &url, &body, true, Ok).await?;
     // Blocks arrive one at a time, indexed; a tool_use's arguments stream as
     // partial JSON, so they accumulate in `tool_json` beside the typed block
     // until the block closes and the assembled JSON parses into `input`.
@@ -1458,8 +1526,8 @@ fn chat_tools(schemas: &[Value]) -> Value {
 async fn chat_blocking(cfg: &Config, body: Value, to_internal: fn(&Value) -> Response, token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
     let url = chat_url(cfg);
     let key = cfg.api_key.clone();
-    let v = blocking(token, move || -> Result<Value> {
-        let v: Value = post(&key, url, body, false)?.into_json()?;
+    let v: Value = request(token, &key, &url, &body, false, |r| {
+        let v: Value = r.into_json()?;
         if let Some(err) = v.get("error") { return Err(Error::Msg(err.to_string())); }
         Ok(v)
     }).await?;
@@ -1497,7 +1565,7 @@ fn chat_to_internal(v: &Value, usage_of: fn(&Value) -> (Value, Usage)) -> Respon
 async fn chat_streaming(cfg: &Config, body: Value, usage_of: fn(&Value) -> (Value, Usage), token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
     let url = chat_url(cfg);
     let key = cfg.api_key.clone();
-    let resp = blocking(token, move || post(&key, url, body, false)).await?;
+    let resp = request(token, &key, &url, &body, false, Ok).await?;
     let (mut text, mut reasoning, mut tool_calls) = (String::new(), String::new(), vec![]);
     let mut think_open = false;
     let mut usage = empty_usage();
@@ -1751,6 +1819,21 @@ async fn deepseek_streaming(cfg: &Config, messages: &[Message], schemas: &[Value
 
 // ---- tests -----------------------------------------------------------------
 
+/// Cargo runs a crate's tests in parallel threads of one process, and
+/// `std::env` is process-global — one test's `JINGWEI_EFFORT` (or `NO_COLOR`)
+/// is another test's surprise. Every test that reads or writes an
+/// environment variable holds this lock, so the env-touching set runs one at
+/// a time. Test-only: the binary never touches it.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`ENV_LOCK`], ignoring poisoning so one failed test does not cascade
+/// into "poisoned" panics for every other env-touching test.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1951,6 +2034,7 @@ mod tests {
 
     #[test]
     fn flags_parse_and_validate() {
+        let _env = env_lock();
         let a = flags(&["--base-url", "https://x/v1", "--api-key", "k", "-m", "m1",
             "--protocol", "zai", "--cache", "auto", "--thinking", "strip",
             "--max-tokens", "4096", "--context-size", "100000", "--max-turns", "5",
@@ -2019,6 +2103,7 @@ mod tests {
 
     #[test]
     fn enum_flags_case_insensitive_and_list_available_values() {
+        let _env = env_lock();
         let parse = |extra: &[&str]| parse_from(
             ["--api-key", "k", "--base-url", "https://x", "-m", "m"].iter()
                 .chain(extra.iter()).map(|s| s.to_string())).unwrap();
@@ -2223,6 +2308,7 @@ mod tests {
 
     #[test]
     fn effort_maps_to_the_wires_and_respects_their_rules() {
+        let _env = env_lock();
         let mut c = cfg("https://x".into(), true);
 
         // minimax: adaptive thinking, the budget as its dial
@@ -2381,6 +2467,7 @@ mod tests {
 
     #[test]
     fn zai_rules_and_defaults_live_with_the_vendor() {
+        let _env = env_lock();
         let ok = |cache, thinking, effort| zai_accepts(cache, thinking, effort).is_ok();
         assert!(ok(CacheMode::Auto, Thinking::Preserve, Some(Effort::High)));
         assert!(!ok(CacheMode::Active, Thinking::Preserve, None), "the cache is implicit — nothing to mark");
@@ -2466,6 +2553,7 @@ mod tests {
 
     #[test]
     fn deepseek_default_base_and_policy_ride_build_config() {
+        let _env = env_lock();
         std::env::remove_var("JINGWEI_BASE_URL");
         std::env::remove_var("JINGWEI_EFFORT");
         std::env::remove_var("JINGWEI_THINKING");
@@ -2761,4 +2849,57 @@ mod tests {
         assert_eq!(Error::Interrupted.to_string(), "interrupted");
     }
 
+    // ---- retry: the transport's own rule ----
+
+    #[test]
+    fn only_transient_errors_are_resent() {
+        // the retryable kinds: a rate limit, a timeout, a server that is down
+        for code in [408, 429, 500, 502, 503, 504] {
+            assert!(Error::Api(code, "x".into()).is_transient(), "{code} should be resent");
+        }
+        // the request's own fault, or a stop: never resent
+        for code in [400, 401, 403, 404, 422] {
+            assert!(!Error::Api(code, "x".into()).is_transient(), "{code} must not be resent");
+        }
+        assert!(!Error::Msg("x".into()).is_transient());
+        assert!(!Error::Interrupted.is_transient(), "a cancellation is not a failure to retry");
+    }
+
+    #[test]
+    fn backoff_doubles_then_caps() {
+        assert_eq!(backoff(1), Duration::from_millis(500));
+        assert_eq!(backoff(2), Duration::from_millis(1000));
+        assert_eq!(backoff(3), Duration::from_millis(2000));
+        assert_eq!(backoff(4), Duration::from_millis(4000));
+        assert_eq!(backoff(5), RETRY_MAX, "doubling is capped");
+        assert_eq!(backoff(99), RETRY_MAX, "and stays capped");
+    }
+
+    #[test]
+    fn a_transient_failure_is_resent_through_the_one_door() {
+        // 429 first, then the real answer: the door resends and the turn
+        // succeeds where it used to die on the first status
+        let (port, reqs) = mock_seq(vec![
+            (429, r#"{"error":{"message":"rate limited"}}"#.into()),
+            (200, r#"{"content":[{"type":"text","text":"after retry"}],"usage":{}}"#.into()),
+        ]);
+        let (resp, _) = block_on(call_api(
+            &cfg(format!("http://127.0.0.1:{port}"), false), &[], &[], &CancelToken::new(), &sink(),
+        )).unwrap();
+        assert_eq!(blocks(&resp.blocks)[0]["text"], "after retry");
+        assert_eq!(reqs.lock().unwrap().len(), 2, "the request went out twice");
+    }
+
+    #[test]
+    fn a_request_fault_is_not_resent() {
+        // a 400 is the request's own; it must fail on the first answer
+        let (port, reqs) = mock_seq(vec![
+            (400, r#"{"error":{"message":"bad model"}}"#.into()),
+        ]);
+        let err = block_on(call_api(
+            &cfg(format!("http://127.0.0.1:{port}"), false), &[], &[], &CancelToken::new(), &sink(),
+        )).unwrap_err();
+        assert!(err.to_string().contains("bad model"), "got: {err}");
+        assert_eq!(reqs.lock().unwrap().len(), 1, "no second request");
+    }
 }
