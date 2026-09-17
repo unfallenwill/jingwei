@@ -220,6 +220,10 @@ caching decides how the server bills and accelerates that context.
 | `write_file` | Writes a file, creating parent dirs.                     |
 | `edit_file`  | Replaces `old` with `new` — exactly, then line by line ignoring indentation. Names the line numbers when `old` is ambiguous; `replace_all` replaces every occurrence; `edits` applies several pairs in one all-or-nothing call. |
 
+jingwei also speaks the **Model Context Protocol** — external servers can
+expose their own tools, and jingwei offers them to the model with the same
+shape as the built-in ones. See [MCP](#mcp) below.
+
 `edit_file` is the tool with the most policy, all of it aimed at keeping the
 work in one trip. It matches exactly first, then line by line with indentation
 ignored — the model may copy a line rather than every byte of it — and shifts
@@ -246,7 +250,57 @@ Tool outputs above `MAX_TOOL_OUTPUT` (50 KB) are truncated before they go back
 to the model. The agent loop stops after `--max-turns` (default 60) iterations —
 even 精卫 has a budget.
 
-## How it works
+## MCP
+
+The Model Context Protocol is how jingwei extends its tool set without
+forking: an external process speaks JSON-RPC over stdio (or HTTP), jingwei
+asks it for its tools on startup, and the model sees them with the same
+`{name, description, input_schema}` shape it sees the built-ins.
+
+### Configuration
+
+Two places the configuration can live:
+
+- `~/.jingwei/mcp.json` — every workspace picks it up.
+- `<cwd>/.mcp.json` — this project's own servers. A name defined in
+  both files is the project's (it is the more specific of the two).
+
+Both files use the shape every MCP client (Claude Code, Cursor, VS Code,
+…) writes — servers under `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "files":  {"command": "npx",  "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]},
+    "github": {"url": "https://api.githubcopilot.com/mcp/", "headers": {"Authorization": "Bearer ..."}}
+  }
+}
+```
+
+`command` (with `args`, `env`) speaks stdio; `url` (with `headers`) speaks
+streamable HTTP. `${VAR}` is expanded in every string field, with the
+usual `${VAR:-default}` for optional ones. A server that did not come up
+at startup does not cost the session — the model only sees the tools of
+the ones that did, and `/mcp` says which was missing and why.
+
+### `/mcp` in the REPL
+
+Both frontends handle a `/mcp` family of commands, the same way:
+
+| command              | what it does                                              |
+| -------------------- | --------------------------------------------------------- |
+| `/mcp`               | one line per server, plus the tools it offers             |
+| `/mcp list`          | one row per server: name, state (`ready`/`failed`/…), tools |
+| `/mcp enable <name>` | reconnect a server that was disabled                      |
+| `/mcp disable <name>`| take a server offline without losing its configuration    |
+| `/mcp reconnect <name>` | close any live connection and reopen with the stored config |
+| `/mcp disconnect <name>` | close the live connection, configuration preserved       |
+
+A server's tools are advertised to the model as `mcp__<server>__<tool>` —
+the same convention every other MCP client uses. A call that the server
+cannot answer, or one to a server that was disabled mid-session, comes
+back as a sentence the model can read: `error: mcp server <name> is
+disabled; enable it with /mcp enable <name>`.
 
 1. POST `{base}/v1/messages` (minimax — base defaulting to
    `https://api.minimax.cn/anthropic`, model to `MiniMax-M3`) or
@@ -268,7 +322,7 @@ even 精卫 has a budget.
 ## Tests
 
 ```sh
-cargo test            # 128 unit tests + 6 integration tests
+cargo test            # 433 unit tests + 8 integration tests
 cargo clippy --all-targets
 ```
 

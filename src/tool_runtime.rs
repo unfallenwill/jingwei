@@ -12,6 +12,7 @@
 
 use crate::api::blocking;
 use crate::cancel::CancelToken;
+use crate::mcp::Hub;
 use crate::tools::{bash_output, dispatch};
 use serde_json::Value;
 use std::io::Read;
@@ -142,12 +143,31 @@ pub(crate) async fn run_bash(command: &str, token: &CancelToken) -> String {
 /// child process is killed); the file tools are quick, run on the blocking
 /// pool, and are simply abandoned if cancellation wins the race.
 ///
+/// `hub` is the MCP hub: every call whose name carries the `mcp__` prefix
+/// goes through it. The hub's actor task owns the connection to the server;
+/// what `run_tool` does is the one line of dispatch the agent core needs to
+/// know.
+///
 /// Cancellation formats are deliberately different — the model can tell
 /// what happened from the prefix alone: bash preserves whatever output
 /// had already arrived (so the marker sits *after* the bytes, and reads
 /// like a note the tool appended) while the file tools had no partial
 /// output to keep (so the whole tool result is a single line saying so).
-pub(crate) async fn run_tool(name: &str, input: &Value, token: &CancelToken) -> String {
+/// MCP calls inherit the cancellation marker the way the file tools do:
+/// an in-flight hub call is a coroutine on tokio, and dropping the
+/// `select!` arm that awaited it is what abandonment looks like here.
+pub(crate) async fn run_tool(name: &str, input: &Value, token: &CancelToken, hub: &Hub) -> String {
+    if crate::mcp::is_tool(name) {
+        // MCP calls are not cancellable mid-flight (the hub's actor task
+        // owns the connection, and the call's `tokio::time::timeout` is what
+        // bounds it). What we can cancel is the *wait* for the reply — a
+        // token already fired means the user stopped the turn and the
+        // answer is no longer wanted.
+        if token.is_cancelled() {
+            return "[interrupted by user]".into();
+        }
+        return hub.call(name, &input.to_string()).await;
+    }
     if name == "bash" {
         return run_bash(input["command"].as_str().unwrap_or(""), token).await;
     }
@@ -363,16 +383,23 @@ mod tests {
 
     // ---- run_tool: the dispatcher's two paths -----------------------------
 
+    /// An empty hub for tests that do not exercise MCP dispatch.
+    fn empty_hub() -> Hub {
+        Hub::empty()
+    }
+
     #[test]
     fn run_tool_dispatches_non_bash_to_the_blocking_pool() {
         // file tools run through spawn_blocking; cancellation only fires
         // if the tool itself is slow enough — a write+read is fast, so the
         // result is the tool's string, not "interrupted by user"
-        let token = CancelToken::new();
-        let out = block_on(async {
-            run_tool("bash", &serde_json::json!({"command": "echo hi"}), &token).await
+        block_on(async {
+            let token = CancelToken::new();
+            let hub = empty_hub();
+            let out = run_tool("bash", &serde_json::json!({"command": "echo hi"}), &token, &hub).await;
+            assert!(out.starts_with("exit=0"), "got: {out}");
+            hub.shutdown().await;
         });
-        assert!(out.starts_with("exit=0"), "got: {out}");
     }
 
     #[test]
@@ -383,11 +410,14 @@ mod tests {
         let token = Arc::new(CancelToken::new());
         let t = token.clone();
         let out = block_on(async move {
+            let hub = empty_hub();
             tokio::task::spawn_blocking(move || {
                 std::thread::sleep(Duration::from_millis(200));
                 t.cancel();
             });
-            run_tool("bash", &serde_json::json!({"command": "sleep 30"}), &token).await
+            let out = run_tool("bash", &serde_json::json!({"command": "sleep 30"}), &token, &hub).await;
+            hub.shutdown().await;
+            out
         });
         assert!(out.contains("[interrupted by user]"), "got: {out}");
     }
@@ -401,9 +431,73 @@ mod tests {
         let token = Arc::new(CancelToken::new());
         token.cancel();
         let out = block_on(async {
-            run_tool("write_file", &serde_json::json!({"path": "/tmp/jingwei_cancel_marker", "content": "x"}), &token).await
+            let hub = empty_hub();
+            let out = run_tool(
+                "write_file",
+                &serde_json::json!({"path": "/tmp/jingwei_cancel_marker", "content": "x"}),
+                &token,
+                &hub,
+            ).await;
+            hub.shutdown().await;
+            out
         });
         assert_eq!(out, "[interrupted by user]",
             "non-bash cancellation uses the bash marker: {out}");
+    }
+
+    // ---- MCP dispatch: the prefix-armed branch of run_tool ---------------
+
+    /// `run_tool` on an `mcp__` name dispatches to the hub: the result is
+    /// what the server answered, and the same answer the hub would give on
+    /// its own. This is the path the agent loop exercises when the model
+    /// calls an MCP tool.
+    #[tokio::test]
+    async fn run_tool_dispatches_an_mcp_name_to_the_hub() {
+        use crate::mcp::{Hub, stub::Stub};
+        let stub = Stub::new();
+        let hub = Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
+        let out = run_tool(
+            "mcp__stub__echo",
+            &serde_json::json!({"text": "hello"}),
+            &CancelToken::new(),
+            &hub,
+        ).await;
+        assert_eq!(out, "called with {text:hello}", "got: {out}");
+        hub.shutdown().await;
+    }
+
+    /// A pre-cancelled token never reaches the hub — the run is over before
+    /// any of this matters. Same cancellation marker every other tool uses.
+    #[tokio::test]
+    async fn run_tool_with_an_mcp_name_and_a_pre_cancelled_token_short_circuits() {
+        use crate::mcp::Hub;
+        let token = Arc::new(CancelToken::new());
+        token.cancel();
+        let hub = Hub::empty();
+        let out = run_tool(
+            "mcp__anyone__anything",
+            &serde_json::json!({}),
+            &token,
+            &hub,
+        ).await;
+        assert_eq!(out, "[interrupted by user]");
+        hub.shutdown().await;
+    }
+
+    /// An MCP name no server offers is answered with the hub's own message:
+    /// `error: no MCP tool named ...`. The model sees the same shape it
+    /// would see for any unknown tool.
+    #[tokio::test]
+    async fn run_tool_with_an_mcp_name_no_server_offers_yields_a_hub_error() {
+        use crate::mcp::Hub;
+        let hub = Hub::empty();
+        let out = run_tool(
+            "mcp__nobody__nothing",
+            &serde_json::json!({}),
+            &CancelToken::new(),
+            &hub,
+        ).await;
+        assert!(out.starts_with("error: no MCP tool named"), "got: {out}");
+        hub.shutdown().await;
     }
 }

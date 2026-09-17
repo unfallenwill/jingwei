@@ -41,6 +41,7 @@ pub mod view;
 use crate::api::VENDORS;
 use crate::config::Config;
 use crate::display::{ChannelSink, Msg, Sev, Show as DisplayShow};
+use crate::mcp::Hub;
 use crate::session::Convo;
 use crate::settings::Settings;
 use crate::{agent_turn, user_message, Error};
@@ -403,7 +404,9 @@ fn needs_paint(
 /// Open the TUI: terminal setup, the event loop, guaranteed restore.
 /// `convo` is the conversation to run on (history + its session); the
 /// banners come from the composition root and land beside ours.
-pub async fn run(cfg: Config, convo: Convo, banners: Vec<String>) -> crate::Result<()> {
+/// `hub` is the MCP hub: a clone the TUI shares with the agent loop, and
+/// uses itself for `/mcp` slash commands while idle.
+pub async fn run(cfg: Config, convo: Convo, banners: Vec<String>, hub: Hub) -> crate::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sink = ChannelSink::new(tx);
     sink.show(Msg::Banner(format!(
@@ -413,6 +416,11 @@ pub async fn run(cfg: Config, convo: Convo, banners: Vec<String>) -> crate::Resu
         "type a task · Ctrl-J / Shift-Enter breaks the line · Ctrl-O unfolds · Ctrl-C interrupts (twice exits) · /exit or Ctrl-D rests".into()));
     for b in banners {
         sink.show(Msg::Banner(b));
+    }
+    // MCP startup notes — same surface the plain REPL shows, so the two
+    // frontends announce servers the same way.
+    for note in hub.notes().await {
+        sink.show(Msg::Banner(note));
     }
 
     let mut app = App::new();
@@ -430,6 +438,14 @@ pub async fn run(cfg: Config, convo: Convo, banners: Vec<String>) -> crate::Resu
     // until any in-flight agent coroutine finishes.
     let mut convo = Arc::new(AsyncMutex::new(convo));
     let mut agent: Option<Agent> = None;
+    // The MCP hub is shared with the spawned agent task (so MCP tool
+    // calls have a hub to dispatch to) and with the slash dispatcher
+    // (so /mcp can read & operate on the same servers). Cloning a Hub
+    // is cloning an mpsc::Sender — cheap, and the actor task is the
+    // single owner of the real state. `mut` is in case future code
+    // paths need to replace it; nothing currently does.
+    #[allow(unused_mut)]
+    let mut hub = hub;
 
     // Raw mode, bracketed paste, and the kitty keyboard protocol (which
     // makes Shift-Enter distinguishable from Enter on terminals that
@@ -568,10 +584,10 @@ pub async fn run(cfg: Config, convo: Convo, banners: Vec<String>) -> crate::Resu
                 match maybe {
                     Some(ev) => match ev {
                         crossterm::event::Event::Key(k) => {
-                            apply_outcome(handle(step(&mut app, Ev::Key(k)), &cfg, &convo, &mut agent, &sink), &mut cfg, &mut convo, &mut app, &sink);
+                            apply_outcome(handle(step(&mut app, Ev::Key(k)), &cfg, &convo, &mut agent, &sink, &hub), &mut cfg, &mut convo, &mut app, &sink);
                         }
                         crossterm::event::Event::Paste(p) => {
-                            apply_outcome(handle(step(&mut app, Ev::Paste(p)), &cfg, &convo, &mut agent, &sink), &mut cfg, &mut convo, &mut app, &sink);
+                            apply_outcome(handle(step(&mut app, Ev::Paste(p)), &cfg, &convo, &mut agent, &sink, &hub), &mut cfg, &mut convo, &mut app, &sink);
                         }
                         // a resize needs no arm of its own: the Input arm
                         // polls the size every frame and redraws the viewport
@@ -735,6 +751,7 @@ fn dispatch_slash(
     cfg: &Config,
     convo: &Arc<AsyncMutex<Convo>>,
     sink: &ChannelSink,
+    hub: &Hub,
 ) -> HandleOutcome {
     match cmd.name {
         "exit" | "quit" => {
@@ -749,10 +766,23 @@ fn dispatch_slash(
                 HandleOutcome::None
             }
         },
+        "mcp" => {
+            // /mcp subcommands are handled inline (cannot block the TUI
+            // event loop on a network round-trip). The handler mirrors
+            // plain::handle_mcp_command exactly so the two frontends
+            // say the same thing for the same input.
+            let hub = hub.clone();
+            let sink = sink.clone();
+            let rest = cmd.args.join(" ");
+            tokio::spawn(async move {
+                crate::plain::handle_mcp_command(&rest, &hub, &sink).await;
+            });
+            HandleOutcome::None
+        }
         "help" => {
             sink.show(Msg::Note {
                 sev: Sev::Warn,
-                text: " commands: /model [<provider>/<model>] · /exit · /help ".into(),
+                text: " commands: /model [<provider>/<model>] · /mcp [list|enable|disable|reconnect|disconnect <name>] · /exit · /help ".into(),
             });
             HandleOutcome::None
         }
@@ -890,6 +920,7 @@ fn handle(
     convo: &Arc<AsyncMutex<Convo>>,
     agent: &mut Option<Agent>,
     sink: &ChannelSink,
+    hub: &Hub,
 ) -> HandleOutcome {
     match action {
         Action::None => HandleOutcome::None,
@@ -904,7 +935,7 @@ fn handle(
             // they never reach the agent. Dispatch first, and only fall
             // through to a real submit when the line is just a task.
             if let Some(cmd) = parse_slash(&line) {
-                return dispatch_slash(cmd, cfg, convo, sink);
+                return dispatch_slash(cmd, cfg, convo, sink, hub);
             }
             // The narrow race: the agent's `Msg::TaskBegin` rides the
             // channel back to update `app.working()`; between sending
@@ -922,6 +953,7 @@ fn handle(
             }
             let cfg = cfg.clone();
             let convo = convo.clone();
+            let hub = hub.clone();
             let token = Arc::new(crate::cancel::CancelToken::new());
             let tok = token.clone();
             sink.show(Msg::TaskBegin(line.clone()));
@@ -933,7 +965,7 @@ fn handle(
                     sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
                 }
                 // the task is on disk before the first stone moves
-                match agent_turn(&cfg, &mut c.history, &tok, &sink).await {
+                match agent_turn(&cfg, &mut c.history, &tok, &hub, &sink).await {
                     Err(Error::Interrupted) => {}
                     Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
                     Ok(()) => {}
@@ -1596,26 +1628,27 @@ mod tests {
         convo.history.push(crate::ir::Message::User("seed".into()));
         let convo = Arc::new(AsyncMutex::new(convo));
         let mut agent: Option<Agent> = None;
-        handle(action, &cfg, &convo, &mut agent, &sink);
+        let hub = crate::mcp::Hub::empty();
+        handle(action, &cfg, &convo, &mut agent, &sink, &hub);
         (sink, agent)
     }
 
-    #[test]
-    fn handle_none_is_a_no_op() {
+    #[tokio::test]
+    async fn handle_none_is_a_no_op() {
         let (_sink, agent) = run_handle(Action::None);
         assert!(agent.is_none(), "no agent spawned on None");
     }
 
-    #[test]
-    fn handle_cancel_with_no_agent_does_not_panic() {
+    #[tokio::test]
+    async fn handle_cancel_with_no_agent_does_not_panic() {
         // the test of `if let Some(a) = agent` — absent agent is a silent
         // no-op (the action runs against a now-empty agent slot)
         let (_sink, agent) = run_handle(Action::Cancel);
         assert!(agent.is_none());
     }
 
-    #[test]
-    fn handle_submit_starts_an_agent_and_emits_task_begin() {
+    #[tokio::test]
+    async fn handle_submit_starts_an_agent_and_emits_task_begin() {
         // a Submit lands a TaskBegin in the sink and fills `agent`. The
         // spawned task races an unreachable host, so we cancel it before
         // returning — what we assert here is the *start* of the action,
@@ -1634,10 +1667,9 @@ mod tests {
         convo.history.push(crate::ir::Message::User("seed".into()));
         let convo = Arc::new(AsyncMutex::new(convo));
         let mut agent: Option<Agent> = None;
-        // handle → tokio::spawn requires a runtime in this thread
-        crate::test_util::block_on(async {
-            handle(Action::Submit("hello world".into()), &cfg, &convo, &mut agent, &sink);
-        });
+        let hub = crate::mcp::Hub::empty();
+        // tokio::test gives us the runtime; handle does its own tokio::spawn.
+        handle(Action::Submit("hello world".into()), &cfg, &convo, &mut agent, &sink, &hub);
         assert!(agent.is_some(), "submit sets the agent slot");
         // a task begin landed in the sink
         let got = rx.try_recv().expect("TaskBegin emitted by submit");
@@ -1651,8 +1683,8 @@ mod tests {
 
     // ---- Agent::reap: panic becomes a visible note ------------------------
 
-    #[test]
-    fn handle_submit_refuses_when_an_agent_is_already_running() {
+    #[tokio::test]
+    async fn handle_submit_refuses_when_an_agent_is_already_running() {
         // the narrow race window: a first Submit spawned an agent; a
         // second Submit arriving before the channel carries TaskBegin
         // back to the state must not orphan the first one. The first
@@ -1673,13 +1705,12 @@ mod tests {
         // run and the spawned coroutine were still in flight
         let mut agent: Option<Agent> = None;
         let first_token = Arc::new(crate::cancel::CancelToken::new());
-        crate::test_util::block_on(async {
-            // spawn inside a runtime: the second handle() call also lives
-            // inside the block_on so any tasks it spawns have a home
-            let first_job = tokio::spawn(async {});
-            agent = Some(Agent { token: first_token.clone(), job: first_job });
-            handle(Action::Submit("second task".into()), &cfg, &convo, &mut agent, &sink);
-        });
+        let hub = crate::mcp::Hub::empty();
+        // tokio::test wraps us in a runtime; spawn the pre-existing agent
+        // slot inside this scope so its JoinHandle has a home.
+        let first_job = tokio::spawn(async {});
+        agent = Some(Agent { token: first_token.clone(), job: first_job });
+        handle(Action::Submit("second task".into()), &cfg, &convo, &mut agent, &sink, &hub);
         // the original agent is still there — same token, not replaced
         assert!(agent.is_some());
         assert_eq!(Arc::as_ptr(&agent.as_ref().unwrap().token), Arc::as_ptr(&first_token));
@@ -1850,8 +1881,8 @@ mod tests {
         assert_eq!(cmd.args, vec!["MINIMAX/M3"]);
     }
 
-    #[test]
-    fn slash_dispatch_unknown_command_yields_no_switch() {
+    #[tokio::test]
+    async fn slash_dispatch_unknown_command_yields_no_switch() {
         // `/garbage` does not exist; the dispatcher surfaces a warning
         // and returns None so the loop keeps its current cfg / convo.
         let cfg = Config { api_key: "k".into(), base_url: "https://x".into(), model: "m".into(),
@@ -1862,15 +1893,16 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
         let cmd = SlashCmd { name: "garbage", args: vec![] };
-        let outcome = dispatch_slash(cmd, &cfg, &convo, &sink);
+        let hub = crate::mcp::Hub::empty();
+        let outcome = dispatch_slash(cmd, &cfg, &convo, &sink, &hub);
         // we don't read the warning Note — the sink it would land on is
         // a fake channel — but we pin the outcome, which is what the
         // loop acts on.
         assert!(matches!(outcome, HandleOutcome::None), "garbage must not switch");
     }
 
-    #[test]
-    fn slash_help_announces_available_commands() {
+    #[tokio::test]
+    async fn slash_help_announces_available_commands() {
         let cfg = Config { api_key: "k".into(), base_url: "https://x".into(), model: "m".into(),
             protocol: crate::api::Protocol::MINIMAX, cache: crate::api::CacheMode::Auto,
             thinking: crate::api::Thinking::Preserve, effort: None,
@@ -1879,7 +1911,8 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
         let cmd = SlashCmd { name: "help", args: vec![] };
-        let outcome = dispatch_slash(cmd, &cfg, &convo, &sink);
+        let hub = crate::mcp::Hub::empty();
+        let outcome = dispatch_slash(cmd, &cfg, &convo, &sink, &hub);
         assert!(matches!(outcome, HandleOutcome::None));
     }
 

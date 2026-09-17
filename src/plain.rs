@@ -4,6 +4,7 @@
 //! (`crate::display`), none of the terminal machinery.
 
 use crate::display::{self, Msg, Sev, Show};
+use crate::mcp::Hub;
 use std::io::{IsTerminal, Write};
 
 /// Where a rendered plain line goes.
@@ -151,6 +152,7 @@ pub async fn plain_repl(
     cfg: &crate::config::Config,
     mut convo: crate::session::Convo,
     banners: Vec<String>,
+    hub: Hub,
 ) -> crate::Result<()> {
     use crate::{agent_turn};
     let sink = PlainSink::new();
@@ -159,6 +161,12 @@ pub async fn plain_repl(
     sink.show(Msg::Banner(cfg.identity()));
     for b in banners {
         sink.show(Msg::Banner(b));
+    }
+    // The hub's notes are also a banner: which servers came up, which did
+    // not, and what to look at. They land before the prompt so the user
+    // knows MCP is wired before their first turn.
+    for note in hub.notes().await {
+        sink.show(Msg::Banner(note));
     }
     let stdin = std::io::stdin();
     loop {
@@ -193,6 +201,14 @@ pub async fn plain_repl(
         if display::is_exit(&line) {
             break;
         }
+        // `/mcp` is its own little command family: handled before the
+        // line becomes a task. Sub-commands (`list`, `enable <n>`, ...)
+        // are routed through the hub and printed via the same port the
+        // agent uses, so the user sees them the same way.
+        if let Some(rest) = line.strip_prefix("/mcp").map(str::trim) {
+            handle_mcp_command(rest, &hub, &sink).await;
+            continue;
+        }
         convo.history.push(crate::user_message(&line));
         if let Err(e) = convo.persist() {
             sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
@@ -200,7 +216,7 @@ pub async fn plain_repl(
         // the task is on disk before the first stone moves
         sink.show(Msg::TaskBegin(line));
         let token = crate::cancel::CancelToken::new();
-        match agent_turn(cfg, &mut convo.history, &token, &sink).await {
+        match agent_turn(cfg, &mut convo.history, &token, &hub, &sink).await {
             Err(crate::Error::Interrupted) => {}
             Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
             Ok(()) => {}
@@ -212,6 +228,88 @@ pub async fn plain_repl(
         sink.show(Msg::TaskEnd);
     }
     Ok(())
+}
+
+/// One `/mcp` subcommand. The bare `/mcp` (called as the empty `rest`)
+/// shows the long report; `list` shows the per-server row; `enable`,
+/// `disable`, `reconnect`, `disconnect` operate on a named server. The
+/// routing mirrors the TUI's, so the two frontends say the same thing.
+pub(crate) async fn handle_mcp_command(rest: &str, hub: &Hub, sink: &dyn Show) {
+    let mut it = rest.split_whitespace();
+    let sub = it.next().unwrap_or("");
+    let name = it.next();
+    match sub {
+        "" => {
+            // bare /mcp: long report — one line per server, then tools
+            for line in hub.report().await {
+                sink.show(Msg::Banner(line));
+            }
+        }
+        "list" => {
+            // one row per server: name, state, tools_count
+            for status in hub.list().await {
+                sink.show(Msg::Banner(format_mcp_status(&status)));
+            }
+        }
+        "enable" => {
+            let Some(name) = name else {
+                sink.show(Msg::Note { sev: Sev::Err, text: " mcp: missing server name — try /mcp list ".into() });
+                return;
+            };
+            match hub.enable(name).await {
+                Ok(()) => sink.show(Msg::Banner(format!("mcp: enable {name}: done"))),
+                Err(why) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" mcp: enable {name}: {why} ") }),
+            }
+        }
+        "disable" => {
+            let Some(name) = name else {
+                sink.show(Msg::Note { sev: Sev::Err, text: " mcp: missing server name — try /mcp list ".into() });
+                return;
+            };
+            match hub.disable(name).await {
+                Ok(()) => sink.show(Msg::Banner(format!("mcp: disable {name}: done"))),
+                Err(why) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" mcp: disable {name}: {why} ") }),
+            }
+        }
+        "reconnect" => {
+            let Some(name) = name else {
+                sink.show(Msg::Note { sev: Sev::Err, text: " mcp: missing server name — try /mcp list ".into() });
+                return;
+            };
+            match hub.reconnect(name).await {
+                Ok(()) => sink.show(Msg::Banner(format!("mcp: reconnect {name}: done"))),
+                Err(why) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" mcp: reconnect {name}: {why} ") }),
+            }
+        }
+        "disconnect" => {
+            let Some(name) = name else {
+                sink.show(Msg::Note { sev: Sev::Err, text: " mcp: missing server name — try /mcp list ".into() });
+                return;
+            };
+            match hub.disconnect(name).await {
+                Ok(()) => sink.show(Msg::Banner(format!("mcp: disconnect {name}: done"))),
+                Err(why) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" mcp: disconnect {name}: {why} ") }),
+            }
+        }
+        other => sink.show(Msg::Note {
+            sev: Sev::Warn,
+            text: format!(" mcp: unknown subcommand: {other:?} · try /mcp list "),
+        }),
+    }
+}
+
+/// One row of `/mcp list`: the server name, the state it stands in, and
+/// the count of tools being offered. Shared with the TUI so the two
+/// frontends print the same shape.
+pub(crate) fn format_mcp_status(status: &crate::mcp::ServerStatus) -> String {
+    use crate::mcp::ServerState;
+    let state = match &status.state {
+        ServerState::Ready => "ready".to_string(),
+        ServerState::Failed(why) => format!("failed ({why})"),
+        ServerState::Disabled => "disabled".into(),
+        ServerState::Disconnected => "disconnected".into(),
+    };
+    format!("{:<20} {:<14} {} tools", status.name, state, status.tools_count)
 }
 
 
@@ -383,5 +481,116 @@ mod tests {
         ]);
         assert_eq!(out[0], (Stream::Out, "thinking aloud".into()));
         assert_eq!(out[1].1, "[bash] $ ls");
+    }
+
+    // ---- /mcp command handling: same path the REPL takes ------------------
+
+    use crate::display::Show;
+
+    /// A sink that captures every message handed to it, so the tests
+    /// can assert on what the user actually sees after `/mcp ...`.
+    struct CapturingSink(std::sync::Mutex<Vec<(Stream, String)>>);
+    impl Show for CapturingSink {
+        fn show(&self, m: Msg) {
+            use std::io::Write as _;
+            // Reuse the public Plain fold to land the message on the
+            // right stream, then capture the resulting lines. This keeps
+            // the test honest about what the REPL would print.
+            let sink = crate::plain::PlainSink::new();
+            // We can't read PlainSink's output — only capture the raw
+            // messages and assert on them.
+            let _ = sink;
+            let _ = m;
+        }
+    }
+
+    /// Capture sink that records banner / note messages verbatim.
+    struct BagSink(std::sync::Mutex<Vec<Msg>>);
+    impl Show for BagSink {
+        fn show(&self, m: Msg) {
+            self.0.lock().unwrap().push(m);
+        }
+    }
+
+    /// The bare `/mcp` on an empty hub surfaces the "no MCP servers"
+    /// message — the only thing the report function returns.
+    #[tokio::test]
+    async fn mcp_bare_lists_the_default_message_when_nothing_is_configured() {
+        let hub = crate::mcp::Hub::empty();
+        let sink = BagSink(Default::default());
+        handle_mcp_command("", &hub, &sink).await;
+        let msgs = sink.0.lock().unwrap();
+        assert_eq!(msgs.len(), 1, "got: {msgs:?}");
+        match &msgs[0] {
+            Msg::Banner(s) => assert!(s.contains("no MCP servers"), "{s}"),
+            other => panic!("expected a banner, got {other:?}"),
+        }
+        hub.shutdown().await;
+    }
+
+    /// `/mcp list` on an empty hub says so without crashing.
+    #[tokio::test]
+    async fn mcp_list_on_an_empty_hub_emits_nothing_visible() {
+        let hub = crate::mcp::Hub::empty();
+        let sink = BagSink(Default::default());
+        handle_mcp_command("list", &hub, &sink).await;
+        // empty hub → empty list → no banners
+        assert!(sink.0.lock().unwrap().is_empty());
+        hub.shutdown().await;
+    }
+
+    /// An unknown subcommand is a warning, not a silent failure.
+    #[tokio::test]
+    async fn mcp_unknown_subcommand_emits_a_warning() {
+        let hub = crate::mcp::Hub::empty();
+        let sink = BagSink(Default::default());
+        handle_mcp_command("frobnicate", &hub, &sink).await;
+        let msgs = sink.0.lock().unwrap();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            Msg::Note { text, .. } => assert!(text.contains("unknown subcommand"), "{text}"),
+            other => panic!("expected a note, got {other:?}"),
+        }
+        hub.shutdown().await;
+    }
+
+    /// Subcommands that need a server name say so when none is given.
+    #[tokio::test]
+    async fn mcp_enable_without_a_name_is_an_error() {
+        let hub = crate::mcp::Hub::empty();
+        let sink = BagSink(Default::default());
+        handle_mcp_command("enable", &hub, &sink).await;
+        let msgs = sink.0.lock().unwrap();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            Msg::Note { sev, text } => {
+                assert_eq!(*sev, Sev::Err);
+                assert!(text.contains("missing server name"), "{text}");
+            }
+            other => panic!("expected a note, got {other:?}"),
+        }
+        hub.shutdown().await;
+    }
+
+    /// `format_mcp_status` produces one row with the columns a list needs:
+    /// the name, the state, the tool count.
+    #[test]
+    fn format_mcp_status_has_the_columns_a_list_needs() {
+        use crate::mcp::{ServerState, ServerStatus};
+        let row = format_mcp_status(&ServerStatus {
+            name: "files".into(),
+            state: ServerState::Ready,
+            tools_count: 3,
+        });
+        assert!(row.contains("files"), "{row}");
+        assert!(row.contains("ready"), "{row}");
+        assert!(row.contains("3 tools"), "{row}");
+        let failed = format_mcp_status(&ServerStatus {
+            name: "broken".into(),
+            state: ServerState::Failed("nope".into()),
+            tools_count: 0,
+        });
+        assert!(failed.contains("failed"), "{failed}");
+        assert!(failed.contains("nope"), "{failed}");
     }
 }

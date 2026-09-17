@@ -20,6 +20,7 @@ mod format;
 mod ir;
 mod ledger;
 mod login;
+mod mcp;
 mod plain;
 mod session;
 mod settings;
@@ -33,6 +34,7 @@ use crate::cancel::CancelToken;
 use crate::config::{Args, Config, build_config};
 use crate::display::{Msg, Sev, Show};
 use crate::ir::{Block, Message, ToolResult};
+use crate::mcp::Hub;
 use crate::settings::Settings;
 use crate::tool_runtime::run_tool;
 use crate::tools::{print_tool_call, tools};
@@ -40,6 +42,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::env;
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 const MAX_TOOL_OUTPUT: usize = 50_000;
 type Result<T> = std::result::Result<T, Error>;
@@ -340,14 +343,32 @@ async fn run() -> Result<()> {
         return session::print_list(args.all);
     }
     let cfg = build_config(&args)?;
+    // MCP hub: external servers' tools, offered to the model as though
+    // they were the agent's own. Spawned once per process and shared
+    // across every turn (and every front-end). The user's servers are
+    // read from `~/.jingwei/mcp.json`; the project's live in `<cwd>/.mcp.json`
+    // and are picked up by the hub itself. A missing file is a None — the
+    // hub starts empty and the session runs as it always did.
+    let user_mcp = read_user_mcp();
+    let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let hub = Hub::spawn(&workspace, user_mcp.as_ref());
+    run_with_hub(args, cfg, hub).await
+}
+
+/// The rest of `run` after the hub is spawned. The TUI and plain REPL take
+/// the hub by value (it is `Clone` — handing a clone is a clone of an
+/// `mpsc::Sender`); the one-shot path also takes a clone, then calls
+/// `shutdown` on its own copy at the end so the connections close in
+/// every exit path.
+async fn run_with_hub(args: Args, cfg: Config, hub: Hub) -> Result<()> {
     let interactive = args.prompt.is_empty();
     let (mut convo, banners) = begin_session(&args, &cfg, interactive)?;
     if interactive {
         // A terminal gets the TUI; pipes, tests, and one-shots get the log.
         return if tui::wanted() {
-            tui::run(cfg, convo, banners).await
+            tui::run(cfg, convo, banners, hub).await
         } else {
-            plain::plain_repl(&cfg, convo, banners).await
+            plain::plain_repl(&cfg, convo, banners, hub).await
         };
     }
     // One-shot: always the plain frontend — its output must stay in the
@@ -363,12 +384,29 @@ async fn run() -> Result<()> {
         sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
     }
     let token = CancelToken::new();
-    let res = agent_turn(&cfg, &mut convo.history, &token, &sink).await;
+    let res = agent_turn(&cfg, &mut convo.history, &token, &hub, &sink).await;
     if let Err(e) = convo.persist() {
         sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
     }
     sink.show(Msg::TaskEnd);
+    hub.shutdown().await;
     res
+}
+
+/// Read `~/.jingwei/mcp.json` if it exists. A missing or unreadable file is
+/// a `None`: the hub starts empty, and the rest of the agent runs as it
+/// always did. The hub's own loader is what reaches for the file again to
+/// print warnings about it; here we just answer "did the user write one?".
+fn read_user_mcp() -> Option<Value> {
+    let path = Settings::home_dir()?.join(".jingwei").join("mcp.json");
+    let text = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!(" jingwei: ~/.jingwei/mcp.json: cannot be parsed ({e}); running without MCP ");
+            None
+        }
+    }
 }
 
 /// The conversation this process runs on, and the banner lines that say
@@ -437,8 +475,8 @@ fn user_message(text: &str) -> Message {
 /// REPL prompt comes back with everything the agent already carried still in
 /// place. A second Ctrl-C while it is unwinding exits immediately, for when
 /// even graceful is too slow.
-async fn agent_turn(cfg: &crate::config::Config, history: &mut Vec<Message>, token: &crate::cancel::CancelToken, sink: &dyn Show) -> crate::Result<()> {
-    let agent = agent_loop(cfg, history, token, sink);
+async fn agent_turn(cfg: &crate::config::Config, history: &mut Vec<Message>, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
+    let agent = agent_loop(cfg, history, token, hub, sink);
     tokio::pin!(agent);
     tokio::select! {
         res = &mut agent => return res,
@@ -468,10 +506,17 @@ async fn agent_turn(cfg: &crate::config::Config, history: &mut Vec<Message>, tok
 /// runs. On cancellation it returns `Err(Interrupted)` after leaving the
 /// history valid — interrupted tools get results, unfinished tool calls are
 /// dropped from the turn, and the REPL prompt simply returns.
-async fn agent_loop(cfg: &crate::config::Config, history: &mut Vec<Message>, token: &crate::cancel::CancelToken, sink: &dyn Show) -> crate::Result<()> {
-    let schemas: Vec<Value> = tools().iter()
+///
+/// `hub` is the MCP hub — its `definitions()` is the source of the schemas
+/// the model sees, and its `call()` is what runs when the model asks for a
+/// tool whose name starts with `mcp__`. Re-fetching the definitions every
+/// turn is what lets `/mcp enable|disable|reconnect` take effect mid-session
+/// without restarting.
+async fn agent_loop(cfg: &crate::config::Config, history: &mut Vec<Message>, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
+    let mut schemas: Vec<Value> = tools().iter()
         .map(|t| json!({"name": t.name, "description": t.desc, "input_schema": t.schema}))
         .collect();
+    schemas.extend(hub.definitions().await);
     for turn in 0..cfg.max_turns {
         if token.is_cancelled() { return Err(Error::Interrupted); }
         if fit_context(history, cfg.context_size) {
@@ -507,7 +552,7 @@ async fn agent_loop(cfg: &crate::config::Config, history: &mut Vec<Message>, tok
             let out = if stopped {
                 "skipped: this run was interrupted before the tool ran".into()
             } else {
-                run_tool(name, input, token).await
+                run_tool(name, input, token, hub).await
             };
             let out = truncate(&out);
             print_tool_call(name, input, &out, sink);
@@ -928,7 +973,14 @@ mod tests {
         let done = r#"{"content":[{"type":"text","text":"done"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
         let (port, reqs) = mock_seq(vec![(200, tool.into()), (200, done.into())]);
         let mut history = hv(vec![json!({"role": "user", "content": "run echo"})]);
-        block_on(agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &CancelToken::new(), &sink())).unwrap();
+        block_on(async {
+            // Hub::empty() spawns an actor task — the test needs a runtime
+            // for the spawn to land, even though the hub itself has no work
+            // to do in this test.
+            let hub = crate::mcp::Hub::empty();
+            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &CancelToken::new(), &hub, &sink()).await.unwrap();
+            hub.shutdown().await;
+        });
         assert_eq!(history.len(), 4); // user + assistant(tool_use) + user(tool_result) + assistant(text)
         let j = hist(&history);
         assert_eq!(j[1]["role"], json!("assistant"));
@@ -949,7 +1001,11 @@ mod tests {
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
         c.max_turns = 1;
         let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
-        block_on(agent_loop(&c, &mut history, &CancelToken::new(), &sink())).unwrap(); // must return instead of spinning
+        block_on(async {
+            let hub = crate::mcp::Hub::empty();
+            agent_loop(&c, &mut history, &CancelToken::new(), &hub, &sink()).await.unwrap(); // must return instead of spinning
+            hub.shutdown().await;
+        });
         assert_eq!(history.len(), 3); // user + assistant(tool_use) + user(tool_result)
     }
 
@@ -976,13 +1032,16 @@ mod tests {
         let port = mock_stall(tool, stalled);
         let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
         let err = block_on(async {
+            let hub = crate::mcp::Hub::empty();
             let token = Arc::new(CancelToken::new());
             let t = token.clone();
             tokio::task::spawn_blocking(move || {
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 t.cancel();
             });
-            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), true), &mut history, &token, &sink()).await
+            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), true), &mut history, &token, &hub, &sink()).await;
+            hub.shutdown().await;
+            res
         }).unwrap_err();
         assert!(matches!(err, Error::Interrupted), "got: {err}");
         // user + assistant(tool_use) + user(tool_result) + assistant(partial text; tool_use dropped)
@@ -1008,13 +1067,16 @@ mod tests {
         let (port, _) = mock_seq(vec![(200, tool)]);
         let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
         let err = block_on(async {
+            let hub = crate::mcp::Hub::empty();
             let token = Arc::new(CancelToken::new());
             let t = token.clone();
             tokio::task::spawn_blocking(move || {
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 t.cancel();
             });
-            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &token, &sink()).await
+            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &token, &hub, &sink()).await;
+            hub.shutdown().await;
+            res
         }).unwrap_err();
         assert!(matches!(err, Error::Interrupted), "got: {err}");
         assert_eq!(history.len(), 3); // user + assistant(tool_use) + user(tool_result)
