@@ -1,7 +1,7 @@
 //! The plain frontend: a pure fold over [`Msg`]s into a line-oriented log,
-//! plus the dumb line reader that drives it (pipes, one-shot runs,
-//! `JINGWEI_NO_TUI=1`). The TUI's sibling — same port, same vocabulary
-//! (`crate::display`), none of the terminal machinery.
+//! plus the dumb line reader that drives it (pipes, one-shot runs). The
+//! TUI's sibling — same port, same vocabulary (`crate::display`), none of
+//! the terminal machinery.
 
 use crate::display::{self, Msg, Sev, Show};
 use crate::mcp::Hub;
@@ -143,8 +143,8 @@ impl Show for PlainSink {
 }
 
 /// Drive the plain REPL: read lines, run the agent, print via the port.
-/// Used when stdout is not a terminal (pipes, one-shot runs) or when
-/// `JINGWEI_NO_TUI` asks for the log form.
+/// Used when stdout is not a terminal (pipes, one-shot runs). The TUI
+/// gate is `tui::wanted()` — when stdout is a tty, the TUI takes over.
 ///
 /// No editor here, so no input-history file: recall is a TUI feature; this
 /// path keeps the shell's own history (up-arrow) and line editing.

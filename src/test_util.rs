@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-/// Serializes the env-mutating tests so JINGWEI_EFFORT or NO_COLOR set
+/// Serializes the env-mutating tests so NO_COLOR set
 /// by one test cannot race a sibling reading them. Test-only.
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

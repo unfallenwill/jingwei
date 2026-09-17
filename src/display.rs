@@ -170,19 +170,13 @@ pub fn is_exit(line: &str) -> bool {
     line.trim() == EXIT_COMMAND
 }
 
-/// Should we color at all? Honors `NO_COLOR`/`JINGWEI_NO_COLOR`, gates
-/// on `stderr` being a terminal (the only stream `paint` writes to —
-/// the fatal-error banner in `main`), and `JINGWEI_COLOR=always|1|true`
-/// forces color on (useful when stderr rides a pipe into a color-aware
-/// pager). `stdout` is intentionally not in the gate: this function is
-/// about one specific banner, and a tty-stderr / piped-stdout layout
-/// should still paint a coloured fatal line.
+/// Should we color at all? Honors `NO_COLOR` (the industry-standard opt-out)
+/// and gates on `stderr` being a terminal — the only stream `paint` writes
+/// to (the fatal-error banner in `main`). `stdout` is intentionally not in
+/// the gate: this function is about one specific banner, and a tty-stderr /
+/// piped-stdout layout should still paint a coloured fatal line.
 pub fn color_on() -> bool {
-    if matches!(env::var("JINGWEI_COLOR").as_deref(), Ok("always" | "1" | "true")) {
-        return true;
-    }
     env::var_os("NO_COLOR").is_none()
-        && env::var_os("JINGWEI_NO_COLOR").is_none()
         && io::stderr().is_terminal()
 }
 
@@ -320,19 +314,14 @@ mod tests {
     }
 
     #[test]
-    fn paint_emits_ansi_when_color_is_forced_and_a_passthrough_otherwise() {
+    fn paint_passes_through_when_color_is_off() {
+        // NO_COLOR on → strict passthrough, no escape sequences either way
         let _env = crate::test_util::env_lock();
-        std::env::set_var("JINGWEI_COLOR", "always");
-        let on = paint("err", ERR_BG, true);
-        assert!(on.starts_with("\x1b[") && on.contains("err") && on.ends_with("\x1b[39m"), "got: {on:?}");
-        // the white-text vs dark-text fork: 97 (white) vs 30 (near-black)
-        let dark = paint("warn", WARN_BG, false);
-        assert!(dark.contains("\x1b[30m"), "white=false picks 30: {dark:?}");
-        // and off: a strict passthrough through the
-        std::env::remove_var("JINGWEI_COLOR");
         std::env::set_var("NO_COLOR", "1");
         let off = paint("err", ERR_BG, true);
         assert_eq!(off, "err");
+        let dark = paint("warn", WARN_BG, false);
+        assert_eq!(dark, "warn");
         std::env::remove_var("NO_COLOR");
     }
 

@@ -7,8 +7,9 @@
 // its own). Vendors that live at one address name it themselves; everything
 // else you bring the endpoint for.
 //
-// Env: JINGWEI_API_KEY, JINGWEI_BASE_URL, JINGWEI_MODEL, JINGWEI_PROTOCOL,
-//      JINGWEI_CACHE, JINGWEI_THINKING, JINGWEI_NO_TUI, NO_COLOR
+// Env: NO_COLOR (the only environment variable consulted; all other
+//      settings — key, base URL, model, protocol, cache, thinking,
+//      effort, frontend choice — go through CLI flags)
 
 mod api;
 mod cancel;
@@ -329,10 +330,10 @@ async fn run() -> Result<()> {
         return Ok(());
     }
     let mut args = args_from_cli(cli)?;
-    // Settings is the layer between env and vendor defaults. We fold its
-    // active profile into `args` here so `build_config` (which only reads
-    // args + env) sees a fully-resolved request. The chain is
-    // CLI flag > env var > settings.json active profile > vendor default.
+    // Settings is the layer between persisted preferences and vendor defaults.
+    // We fold its active profile into `args` here so `build_config` (which
+    // only reads args) sees a fully-resolved request. The chain is
+    // CLI flag > settings.json active profile > vendor default.
     if let Some(active) = Settings::load().ok().and_then(|s| s.active_args()) {
         if args.api_key.is_none() { args.api_key = Some(active.api_key); }
         if args.base_url.is_none() { args.base_url = active.base_url; }
@@ -638,10 +639,10 @@ fn drop_result_and_pair(history: &mut Vec<Message>, mi: usize, bi: usize) {
 // ---- tests -----------------------------------------------------------------
 
 /// Cargo runs a crate's tests in parallel threads of one process, and
-/// `std::env` is process-global — one test's `JINGWEI_EFFORT` (or `NO_COLOR`)
-/// is another test's surprise. Every test that reads or writes an
-/// environment variable holds this lock, so the env-touching set runs one at
-/// a time. Test-only: the binary never touches it.
+/// `std::env` is process-global — one test's `NO_COLOR` is another test's
+/// surprise. Every test that reads or writes an environment variable holds
+/// this lock, so the env-touching set runs one at a time. Test-only: the
+/// binary never touches it.
 #[cfg(test)]
 #[cfg(test)]
 mod tests {
@@ -787,7 +788,6 @@ mod tests {
 
     #[test]
     fn flags_parse_and_validate() {
-        let _env = crate::test_util::env_lock();
         let a = flags(&["--base-url", "https://x/v1", "--api-key", "k", "-m", "m1",
             "--protocol", "zai", "--cache", "auto", "--thinking", "strip",
             "--max-tokens", "4096", "--context-size", "100000", "--max-turns", "5",
@@ -856,7 +856,6 @@ mod tests {
 
     #[test]
     fn enum_flags_case_insensitive_and_list_available_values() {
-        let _env = crate::test_util::env_lock();
         let parse = |extra: &[&str]| {
             let mut argv: Vec<&str> = vec!["--api-key", "k", "--base-url", "https://x", "-m", "m"];
             argv.extend_from_slice(extra);

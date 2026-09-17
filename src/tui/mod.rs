@@ -982,9 +982,9 @@ fn handle(
     }
 }
 
-/// Should the REPL open the TUI? A terminal on stdout and no opt-out.
+/// Should the REPL open the TUI? A terminal on stdout is the only gate.
 pub fn wanted() -> bool {
-    io::stdout().is_terminal() && std::env::var_os("JINGWEI_NO_TUI").is_none()
+    io::stdout().is_terminal()
 }
 
 fn load_history() -> Vec<String> {
@@ -1846,17 +1846,6 @@ mod tests {
         std::env::set_var(var, "/tmp/some-test-home");
         assert_eq!(home_dir().unwrap().to_str().unwrap(), "/tmp/some-test-home");
         restore_home(_prev);
-    }
-
-    // ---- wanted(): stdout-is-a-tty AND no opt-out env --------------------
-
-    #[test]
-    fn wanted_is_false_when_no_tui_env_is_set() {
-        let prev = std::env::var_os("JINGWEI_NO_TUI");
-        std::env::set_var("JINGWEI_NO_TUI", "1");
-        // the env flag alone flips the answer, regardless of stdout
-        assert!(!wanted());
-        if let Some(v) = prev { std::env::set_var("JINGWEI_NO_TUI", v); } else { std::env::remove_var("JINGWEI_NO_TUI"); }
     }
 
     // ---- slash command parser & dispatcher -----------------------------

@@ -1,14 +1,13 @@
-// The agent's configuration: how the user talks to the binary (CLI flags,
-// env vars, the help text), and the resolved shape that the runtime,
-// vendors, and tests all read. This is the seam between "what the user
-// asked for" (Args) and "what the agent runs with" (Config). The vendor
-// types themselves live in the api block of main.rs for now (phase 4 will
+// The agent's configuration: how the user talks to the binary (CLI flags
+// and the help text), and the resolved shape that the runtime, vendors,
+// and tests all read. This is the seam between "what the user asked for"
+// (Args) and "what the agent runs with" (Config). The vendor types
+// themselves live in the api block of main.rs for now (phase 4 will
 // move them to `api/`) — this module references them by path but does not
 // own them.
 
 use crate::api::{CacheMode, Effort, Protocol, Thinking, VENDORS};
 use crate::{Error, Result};
-use std::env;
 
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 131_072;
 pub(crate) const DEFAULT_CONTEXT_SIZE: u64 = 1_000_000;
@@ -36,9 +35,8 @@ pub(crate) struct Config {
     pub(crate) streaming: bool,
 }
 
-/// What the user typed on the command line, before anything has been resolved
-/// against the environment. Each field is `Option<String>` so the resolver
-/// can fall back to an env var when the flag was absent.
+/// What the user typed on the command line. Each field is `Option<String>`
+/// so the resolver can reject a missing required one with a clear message.
 #[derive(Default, Debug)]
 pub(crate) struct Args {
     pub(crate) api_key: Option<String>,
@@ -85,11 +83,10 @@ impl Config {
     }
 }
 
-/// Resolve an enum from flag or env, case-insensitive, defaulting to the
+/// Resolve an enum from a flag value, case-insensitive, defaulting to the
 /// first variant. `variants` maps accepted spellings to values.
-fn enum_of<T: Copy>(raw: &Option<String>, var: &str, name: &str, variants: &[(&'static str, T)]) -> Result<T> {
-    let owned = raw.clone().or_else(|| env::var(var).ok());
-    let raw = owned.as_deref().unwrap_or(variants[0].0);
+fn enum_of<T: Copy>(raw: &Option<String>, name: &str, variants: &[(&'static str, T)]) -> Result<T> {
+    let raw = raw.as_deref().unwrap_or(variants[0].0);
     variants.iter().find(|(v, _)| v.eq_ignore_ascii_case(raw))
         .map(|(_, t)| *t)
         .ok_or_else(|| Error::Msg(format!(
@@ -98,29 +95,28 @@ fn enum_of<T: Copy>(raw: &Option<String>, var: &str, name: &str, variants: &[(&'
         )))
 }
 
-/// [`enum_of`] without a default: absent flag and env mean `None`, which
-/// the caller turns into "say nothing on the wire".
-fn opt_enum_of<T: Copy>(raw: &Option<String>, var: &str, name: &str, variants: &[(&'static str, T)]) -> Result<Option<T>> {
-    match raw.clone().or_else(|| env::var(var).ok()) {
+/// [`enum_of`] without a default: absent flag means `None`, which the
+/// caller turns into "say nothing on the wire".
+fn opt_enum_of<T: Copy>(raw: &Option<String>, name: &str, variants: &[(&'static str, T)]) -> Result<Option<T>> {
+    match raw.as_deref() {
         None => Ok(None),
-        Some(s) => enum_of(&Some(s), var, name, variants).map(Some),
+        Some(s) => enum_of(&Some(s.to_string()), name, variants).map(Some),
     }
 }
 
-/// Resolve `Args` against the environment into a `Config`: parse numbers,
-/// fall back to env vars, ask the chosen vendor what its defaults are,
-/// let it refuse anything it cannot serve. The wire's own rules live with
-/// the wire (`protocol.accepts`), not in here.
+/// Resolve `Args` into a `Config`: parse numbers, ask the chosen vendor
+/// what its defaults are, let it refuse anything it cannot serve. The
+/// wire's own rules live with the wire (`protocol.accepts`), not in here.
 pub(crate) fn build_config(args: &Args) -> Result<Config> {
-    let req = |flag: &Option<String>, var: &str, what: &str| flag.clone()
-        .or_else(|| env::var(var).ok())
-        .ok_or_else(|| Error::Msg(format!("missing {what} (or env {var})")));
-    let protocol = enum_of(&args.protocol, "JINGWEI_PROTOCOL", "protocol", VENDORS)?;
-    let cache = enum_of(&args.cache, "JINGWEI_CACHE", "cache",
+    let req = |flag: &Option<String>, what: &str| -> Result<String> {
+        flag.clone().ok_or_else(|| Error::Msg(format!("missing {what}")))
+    };
+    let protocol = enum_of(&args.protocol, "protocol", VENDORS)?;
+    let cache = enum_of(&args.cache, "cache",
         &[("auto", CacheMode::Auto), ("active", CacheMode::Active)])?;
-    let thinking = enum_of(&args.thinking, "JINGWEI_THINKING", "thinking",
+    let thinking = enum_of(&args.thinking, "thinking",
         &[("preserve", Thinking::Preserve), ("strip", Thinking::Strip)])?;
-    let effort = opt_enum_of(&args.effort, "JINGWEI_EFFORT", "effort",
+    let effort = opt_enum_of(&args.effort, "effort",
         &[("low", Effort::Low), ("medium", Effort::Medium), ("high", Effort::High), ("max", Effort::Max)])?;
     protocol.accepts(cache, thinking, effort)?;
     let max_turns = args.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
@@ -128,15 +124,13 @@ pub(crate) fn build_config(args: &Args) -> Result<Config> {
         return Err(Error::Msg("--max-turns must be at least 1".into()));
     }
     let base_url = args.base_url.clone()
-        .or_else(|| env::var("JINGWEI_BASE_URL").ok())
         .or_else(|| protocol.default_base().map(str::to_owned))
-        .ok_or_else(|| Error::Msg("missing --base-url (or env JINGWEI_BASE_URL)".into()))?;
+        .ok_or_else(|| Error::Msg("missing --base-url".into()))?;
     let model = args.model.clone()
-        .or_else(|| env::var("JINGWEI_MODEL").ok())
         .or_else(|| protocol.default_model().map(str::to_owned))
-        .ok_or_else(|| Error::Msg("missing -m/--model (or env JINGWEI_MODEL)".into()))?;
+        .ok_or_else(|| Error::Msg("missing -m/--model".into()))?;
     Ok(Config {
-        api_key: req(&args.api_key, "JINGWEI_API_KEY", "--api-key")?,
+        api_key: req(&args.api_key, "--api-key")?,
         base_url, model,
         protocol, cache, thinking, effort,
         max_tokens: args.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
@@ -156,7 +150,7 @@ USAGE:
     jingwei                       # interactive REPL
 
 CONNECTION:
-    --base-url <URL>    endpoint base (JINGWEI_BASE_URL)
+    --base-url <URL>    endpoint base
                         minimax: POST {base}/v1/messages — base defaults to
                         https://api.minimax.cn/anthropic, model to MiniMax-M3
                         zai: POST {base}/chat/completions — base defaults to
@@ -164,8 +158,8 @@ CONNECTION:
                         glm-5.3-flash
                         deepseek: POST {base}/chat/completions — base defaults
                         to https://api.deepseek.com
-    --api-key <KEY>     API key (JINGWEI_API_KEY)
-    -m, --model <NAME>  model name (JINGWEI_MODEL; minimax defaults MiniMax-M3,
+    --api-key <KEY>     API key
+    -m, --model <NAME>  model name (minimax defaults MiniMax-M3,
                         zai defaults glm-5.3-flash)
     --protocol <P>      minimax (default) | zai | deepseek
 
@@ -177,8 +171,8 @@ BEHAVIOR:
                         breakpoints on the Messages wire — minimax's own)
     --thinking <MODE>   preserve (default) | strip reasoning from sent history
     --effort <TIER>     low | medium | high | max — reasoning effort, when the
-                        endpoint offers the knob (JINGWEI_EFFORT); unset (default)
-                        sends nothing and the endpoint's default rules.
+                        endpoint offers the knob; unset (default) sends
+                        nothing and the endpoint's default rules apply.
                         minimax wire: thinking adaptive + budget_tokens (low
                         1024 · medium 8k · high 32k · max = max-tokens minus
                         a floor for the reply)
@@ -224,7 +218,6 @@ TUI (interactive, on a terminal):
                         switch closes the current session file and opens a
                         new one under the same project subdirectory.
     /help                list slash commands
-    JINGWEI_NO_TUI=1    log-style REPL instead of the TUI
 
 EXAMPLES:
     jingwei \"task\"                       # minimax · MiniMax-M3, endpoint known
@@ -240,7 +233,6 @@ pub(crate) fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::env_lock;
     use crate::api::{CacheMode, Effort, Protocol, Thinking};
 
     fn parse(argv: &[&str]) -> Result<Args> {
@@ -340,56 +332,49 @@ mod tests {
         }
     }
 
-    /// `opt_enum_of`'s `Some(s)` arm: when the env var is set, the resolver
-    /// honors it even though no flag was passed. Parsed case-insensitively.
-    #[test]
-    fn effort_resolves_from_env_case_insensitively() {
-        let _env = env_lock();
-        std::env::set_var("JINGWEI_API_KEY", "k");
-        std::env::set_var("JINGWEI_EFFORT", "HIGH");
-        let args = parse(&[]).unwrap();
-        let cfg = build_config(&args).unwrap();
-        assert_eq!(cfg.effort, Some(Effort::High));
-        std::env::remove_var("JINGWEI_EFFORT");
-        std::env::remove_var("JINGWEI_API_KEY");
-    }
-
-    /// `opt_enum_of`'s absent path: no flag, no env → `None` (the wire
+    /// `opt_enum_of`'s absent path: no flag means `None` (the wire
     /// stays silent and the endpoint's default rules apply).
     #[test]
-    fn effort_absent_flag_and_env_stays_none() {
-        let _env = env_lock();
-        std::env::set_var("JINGWEI_API_KEY", "k");
-        std::env::remove_var("JINGWEI_EFFORT");
+    fn effort_absent_flag_stays_none() {
         let args = parse(&[]).unwrap();
-        let cfg = build_config(&args).unwrap();
-        assert!(cfg.effort.is_none());
-        std::env::remove_var("JINGWEI_API_KEY");
+        // no api_key: build_config itself fails before effort is consulted;
+        // the resolver's absent-flag path is reached only when effort is
+        // the only thing being decided — exercise it through the variant
+        // pair directly so we don't need a full config.
+        let effort = opt_enum_of(&args.effort, "effort",
+            &[("low", Effort::Low), ("medium", Effort::Medium), ("high", Effort::High), ("max", Effort::Max)]).unwrap();
+        assert!(effort.is_none());
+    }
+
+    /// `opt_enum_of`'s `Some(s)` arm: when the flag carries a value, the
+    /// resolver honors it (parsed case-insensitively). Spelled without a
+    /// full config so the case-insensitivity contract is the only thing
+    /// under test.
+    #[test]
+    fn effort_flag_value_is_case_insensitive() {
+        let args = parse(&["--effort", "HIGH"]).unwrap();
+        let effort = opt_enum_of(&args.effort, "effort",
+            &[("low", Effort::Low), ("medium", Effort::Medium), ("high", Effort::High), ("max", Effort::Max)]).unwrap();
+        assert_eq!(effort, Some(Effort::High));
     }
 
     // ---- enum_of: the variant resolver -----------------------------------
 
     #[test]
-    fn enum_of_falls_back_to_env_when_no_flag() {
-        // no flag for thinking: the env var resolves the value
-        let _env = env_lock();
-        std::env::set_var("JINGWEI_API_KEY", "k");
-        std::env::set_var("JINGWEI_THINKING", "strip");
-        std::env::remove_var("JINGWEI_CACHE");
-        let args = parse(&["--protocol", "minimax", "--base-url", "https://x", "-m", "m"]).unwrap();
+    fn enum_of_uses_flag_value_when_provided() {
+        // a flag for thinking resolves the value, no env involvement
+        let args = parse(&["--api-key", "k", "--base-url", "https://x", "-m", "m",
+            "--thinking", "strip"]).unwrap();
         let cfg = build_config(&args).unwrap();
         assert_eq!(cfg.thinking, Thinking::Strip);
-        std::env::remove_var("JINGWEI_API_KEY");
-        std::env::remove_var("JINGWEI_THINKING");
     }
 
     #[test]
     fn enum_of_rejects_unknown_values_with_the_known_list() {
         // the error names the flag and lists what is accepted — it comes
-        // from build_config, not parse_from (which has nothing to reject)
-        let _env = env_lock();
-        std::env::set_var("JINGWEI_API_KEY", "k");
-        let args = parse(&["--cache", "turbo"]).unwrap();
+        // from build_config, not parse (which has nothing to reject)
+        let args = parse(&["--api-key", "k", "--base-url", "https://x", "-m", "m",
+            "--cache", "turbo"]).unwrap();
         match build_config(&args) {
             Err(e) => {
                 let s = e.to_string();
@@ -398,7 +383,6 @@ mod tests {
             }
             Ok(_) => panic!("--cache turbo should fail"),
         }
-        std::env::remove_var("JINGWEI_API_KEY");
     }
 
     #[test]

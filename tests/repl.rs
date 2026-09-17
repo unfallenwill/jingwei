@@ -15,9 +15,7 @@ fn spawn_repl() -> std::process::Child {
     Command::new(bin)
         .env("HOME", &home)
         .env("USERPROFILE", &home)
-        .env("JINGWEI_API_KEY", "dummy")
-        .env("JINGWEI_BASE_URL", "http://127.0.0.1:1") // never reached
-        .env("JINGWEI_MODEL", "dummy")
+        .args(["--api-key", "dummy", "--base-url", "http://127.0.0.1:1", "-m", "dummy"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

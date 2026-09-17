@@ -21,9 +21,7 @@ fn jingwei(home: &Path) -> Command {
     let mut c = Command::new(bin);
     // both spellings, so the sandbox holds on every platform
     c.env("HOME", home).env("USERPROFILE", home)
-        .env("JINGWEI_API_KEY", "dummy")
-        .env("JINGWEI_BASE_URL", "http://127.0.0.1:1")
-        .env("JINGWEI_MODEL", "it-model");
+        .args(["--api-key", "dummy", "--base-url", "http://127.0.0.1:1", "-m", "it-model"]);
     c
 }
 

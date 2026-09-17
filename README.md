@@ -20,18 +20,31 @@ Cross-platform (Linux / macOS / Windows). Release binary ~2 MB.
 
 ## Setup
 
+Everything is a CLI flag — no environment variables to set. At minimum you
+need an API key; the endpoint and model default to each vendor's own:
+
 ```sh
-export JINGWEI_API_KEY=<your-api-key>
-# optional
-export JINGWEI_BASE_URL=...
-export JINGWEI_MODEL=...
-# Defaults: --max-tokens 131072 · --context-size 1000000 · --max-turns 100
-export JINGWEI_PROTOCOL=minimax     # or zai, or deepseek
-export JINGWEI_CACHE=auto           # or active (minimax's cache_control breakpoints)
-export JINGWEI_THINKING=preserve     # or strip
-export JINGWEI_EFFORT=high           # low | medium | high | max — reasoning effort knob
-export NO_COLOR=1                    # disable colors, both frontends (JINGWEI_NO_COLOR too)
-export JINGWEI_COLOR=always          # force colors on (e.g. through a pipe into a pager)
+jingwei --api-key <your-api-key> "task"
+```
+
+Override the defaults when you want a different endpoint or model:
+
+```sh
+jingwei --api-key <key> --base-url https://your-endpoint -m your-model "task"
+jingwei --protocol zai    --effort high "task"
+jingwei --protocol deepseek --thinking strip "task"
+```
+
+Other knobs:
+
+```sh
+--cache auto|active           # server cache mode (active = cache_control breakpoints on Messages wire)
+--thinking preserve|strip     # whether to keep reasoning in sent history
+--effort low|medium|high|max  # reasoning effort; unset sends nothing
+--max-tokens 131072           # per-turn output cap
+--context-size 1000000        # trim history when the estimate exceeds this
+--max-turns 100               # stop the agent loop after N turns
+NO_COLOR=1                    # disable colors (both frontends honor the industry standard)
 ```
 
 Build:
@@ -77,7 +90,7 @@ With no prompt, jingwei opens a REPL. `/exit` quits; Ctrl-C clears the
 current line, Ctrl-D exits; an API error is reported but doesn't kill the
 session. In the TUI,
 input history is saved to `~/.jingwei_history` and reloaded on start; the
-plain log (pipes, one-shots, `JINGWEI_NO_TUI=1`) has no editor, so it keeps
+plain log (pipes, one-shots) has no editor, so it keeps
 your shell's own line editing and history instead. Each answer (including the
 final text turn of an agent run) stays in the conversation, so follow-ups keep
 context.
@@ -102,7 +115,7 @@ line everywhere; Shift-Enter too, where the terminal speaks the kitty
 keyboard protocol), line-wise Home/End, history recall
 (`~/.jingwei_history`), word deletes — no readline dependency. Submitting
 clears the input line for the next task; Up recalls the last one. Pipes,
-one-shot runs, and `JINGWEI_NO_TUI=1` get the plain line-oriented log
+one-shot runs get the plain line-oriented log
 instead.
 
 Reasoning arrives *live and folded*: while a block streams, the pane shows
@@ -164,7 +177,7 @@ port (`src/display.rs`), and a frontend interprets them —
   Every UI rule (grapheme-safe editing, history recall, scroll clamping,
   follow-the-tail, the fold ratchet) is a unit-tested fact about pure
   functions; no terminal needed to test the UI.
-- **plain** (`src/plain.rs`; pipes, one-shot runs, `JINGWEI_NO_TUI=1`):
+- **plain** (`src/plain.rs`; pipes, one-shot runs):
   a pure fold over the same messages into a line-oriented log, plus the
   dumb line reader that drives it.
 
@@ -172,7 +185,7 @@ The port module is only the contract: the `Msg` type (with its documented
 ordering), the usage shape it carries, the `Show` sink the core emits
 through, and the vocabulary both frontends render with — the prompt, the
 thought marker, width measurement, the color gate (`NO_COLOR` honored
-everywhere; `JINGWEI_COLOR=always` forces it on). The core is handed a
+everywhere; `NO_COLOR` opts out). The core is handed a
 `&dyn Show` and never learns which frontend is listening — there is no
 process-global sink, so a run's frontend is a detail the composition root
 plugs in: the terminal TUI, the plain log, or (one day) a web socket that

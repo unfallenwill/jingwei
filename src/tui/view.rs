@@ -1018,7 +1018,7 @@ mod tests {
         // the claim of the gutter: strip every color and modifier and the
         // block still reads as a block — DIM-blind terminals lose nothing
         let _env = crate::test_util::env_lock();
-        std::env::set_var("JINGWEI_NO_COLOR", "1");
+        std::env::set_var("NO_COLOR", "1");
         let mut a = App::new();
         update(&mut a, Ev::Msg(Msg::Think("reasoned".into())));
         update(&mut a, Ev::Msg(Msg::ThinkEnd));
@@ -1030,34 +1030,23 @@ mod tests {
         assert!(texts.iter().any(|t| t.starts_with("▾ thought #1")), "glyph survives: {texts:?}");
         assert!(texts.iter().any(|t| t == "│ reasoned"), "gutter survives: {texts:?}");
         assert!(texts.iter().any(|t| t == "│ b"), "tool body too: {texts:?}");
-        std::env::remove_var("JINGWEI_NO_COLOR");
+        std::env::remove_var("NO_COLOR");
     }
 
     #[test]
-    fn notes_render_with_severity_background() {
-        // this row is *about* color — force it on regardless of the harness
+    fn notes_render_without_background_when_color_is_off() {
+        // the negative half of the color gate: NO_COLOR strips backgrounds
+        // (the positive half — color-on implies a background — is implicit
+        //  in `note_style`'s return value and depends on the harness's tty)
         let _env = crate::test_util::env_lock();
-        std::env::set_var("JINGWEI_COLOR", "always");
-        let mut a = App::new();
-        update(&mut a, Ev::Msg(Msg::Note { sev: crate::display::Sev::Err, text: "api 429".into() }));
-        let row = flush_lines(&a, 60, 0).into_iter().find(|l| {
-            l.spans.iter().any(|sp| sp.content.contains("api 429"))
-        }).expect("error row rendered");
-        assert!(row.spans.iter().all(|sp| sp.style.bg.is_some()), "error row carries a background");
-        std::env::remove_var("JINGWEI_COLOR");
-    }
-
-    #[test]
-    fn no_color_renders_the_same_rows_without_color() {
-        let _env = crate::test_util::env_lock();
-        std::env::set_var("JINGWEI_NO_COLOR", "1");
+        std::env::set_var("NO_COLOR", "1");
         let mut a = App::new();
         update(&mut a, Ev::Msg(Msg::Note { sev: crate::display::Sev::Err, text: "api 429".into() }));
         let row = flush_lines(&a, 60, 0).into_iter().find(|l| {
             l.spans.iter().any(|sp| sp.content.contains("api 429"))
         }).expect("error row rendered");
         assert!(row.spans.iter().all(|sp| sp.style.bg.is_none()), "NO_COLOR strips backgrounds");
-        std::env::remove_var("JINGWEI_NO_COLOR");
+        std::env::remove_var("NO_COLOR");
     }
 
     #[test]
