@@ -57,7 +57,8 @@ use crossterm::event::{
 };
 use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 use crossterm::Command;
-use model::{App, Mode};
+use model::{App, CompletionItem, CompletionKind, Mode};
+use update::{detect_completion, set_completion};
 use ratatui::backend::CrosstermBackend;
 use ratatui::backend::Backend as _;
 use ratatui::buffer::{Buffer, Cell, CellDiffOption, CellWidth};
@@ -584,10 +585,17 @@ pub async fn run(cfg: Config, convo: Convo, banners: Vec<String>, hub: Hub) -> c
                 match maybe {
                     Some(ev) => match ev {
                         crossterm::event::Event::Key(k) => {
-                            apply_outcome(handle(step(&mut app, Ev::Key(k)), &cfg, &convo, &mut agent, &sink, &hub), &mut cfg, &mut convo, &mut app, &sink);
+                            let action = step(&mut app, Ev::Key(k));
+                            // After every key event the input may have
+                            // crossed a slash-command boundary — sync the
+                            // menu from scratch (cheap when nothing changes).
+                            refresh_completion(&mut app, &hub).await;
+                            apply_outcome(handle(action, &cfg, &convo, &mut agent, &sink, &hub), &mut cfg, &mut convo, &mut app, &sink);
                         }
                         crossterm::event::Event::Paste(p) => {
-                            apply_outcome(handle(step(&mut app, Ev::Paste(p)), &cfg, &convo, &mut agent, &sink, &hub), &mut cfg, &mut convo, &mut app, &sink);
+                            let action = step(&mut app, Ev::Paste(p));
+                            refresh_completion(&mut app, &hub).await;
+                            apply_outcome(handle(action, &cfg, &convo, &mut agent, &sink, &hub), &mut cfg, &mut convo, &mut app, &sink);
                         }
                         // a resize needs no arm of its own: the Input arm
                         // polls the size every frame and redraws the viewport
@@ -985,6 +993,84 @@ fn handle(
 /// Should the REPL open the TUI? A terminal on stdout is the only gate.
 pub fn wanted() -> bool {
     io::stdout().is_terminal()
+}
+
+/// Re-derive the slash-command menu from the current input text, with
+/// fresh candidates from the hub (server names) and settings (profile
+/// keys). Called after every key event the run loop processes.
+async fn refresh_completion(app: &mut App, hub: &Hub) {
+    let Some((kind, prefix)) = detect_completion(&app.input.text) else {
+        if app.completion.is_some() { app.completion = None; }
+        return;
+    };
+    let candidates = collect_candidates(kind, &prefix, hub).await;
+    set_completion(app, kind, &prefix, candidates);
+}
+
+/// Fetch the candidate list for `kind`, filtered by `prefix`. The
+/// hard-coded lists (commands, `/mcp` subcommands) come back at once;
+/// settings and the hub are awaited only for the kinds that need them.
+async fn collect_candidates(
+    kind: CompletionKind,
+    prefix: &str,
+    hub: &Hub,
+) -> Vec<CompletionItem> {
+    let prefix_lc = prefix.to_lowercase();
+    let starts = |s: &str| s.to_lowercase().starts_with(&prefix_lc);
+    match kind {
+        CompletionKind::Command => vec![
+            item("exit",   "/exit",   "leave the session"),
+            item("quit",   "/quit",   "leave the session"),
+            item("model",  "/model",  "switch profile (bare lists, <key> switches)"),
+            item("mcp",    "/mcp",    "manage MCP servers — list | enable | disable | reconnect | disconnect"),
+            item("help",   "/help",   "show this menu"),
+        ].into_iter().filter(|c| prefix.is_empty() || starts(&c.insert)).collect(),
+        CompletionKind::McpSub => vec![
+            item("list",       "list",       "list servers + their states"),
+            item("enable",     "enable",     "re-enable a disabled server"),
+            item("disable",    "disable",    "take a server offline, keep its config"),
+            item("reconnect",  "reconnect",  "close + reopen the connection"),
+            item("disconnect", "disconnect", "disconnect a server (errors if not connected)"),
+        ].into_iter().filter(|c| prefix.is_empty() || starts(&c.insert)).collect(),
+        CompletionKind::ModelArg => {
+            let Ok(settings) = Settings::load() else { return vec![] };
+            settings.providers.keys()
+                .filter(|k| prefix.is_empty() || starts(k))
+                .map(|k| CompletionItem {
+                    insert: k.clone(),
+                    label: k.clone(),
+                    description: "switch to this profile".into(),
+                    trailing_space: false,
+                })
+                .collect()
+        }
+        CompletionKind::McpServer => {
+            let servers = hub.list().await;
+            servers.into_iter().map(|s| s.name)
+                .filter(|n| prefix.is_empty() || starts(n))
+                .map(|n| CompletionItem {
+                    insert: n.clone(),
+                    label: n.clone(),
+                    description: "MCP server".into(),
+                    trailing_space: false,
+                })
+                .collect()
+        }
+    }
+}
+
+fn item(insert: &str, label: &str, description: &str) -> CompletionItem {
+    // Commands end a word — Tab appends a space and the menu then offers
+    // what comes next (subcommands, server tags). Profile keys and
+    // server names are the whole argument — Tab just lands the caret.
+    let trailing_space = matches!(insert, "exit" | "quit" | "help" | "model" | "mcp"
+                                       | "list" | "enable" | "disable" | "reconnect" | "disconnect");
+    CompletionItem {
+        insert: insert.into(),
+        label: label.into(),
+        description: description.into(),
+        trailing_space,
+    }
 }
 
 fn load_history() -> Vec<String> {

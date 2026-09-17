@@ -4,7 +4,7 @@
 //! history recall, scroll clamping, follow-the-tail, the fold ratchet — is
 //! unit-tested without a terminal.
 
-use super::model::{App, Mode, Row, Scroll, Task};
+use super::model::{App, Completion, CompletionItem, CompletionKind, Mode, Row, Scroll, Task};
 use crate::display::Msg;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::Duration;
@@ -64,6 +64,8 @@ fn msg(app: &mut App, m: Msg) -> Action {
             app.status.pane_floor = 0;
             app.cancel_sent = false;
             app.scroll = Scroll::Tail;
+            // a working task locks the editor — drop any open menu
+            dismiss_completion(app);
             app.flush_partial();
             app.rows.push(Row::Task(t));
         }
@@ -105,6 +107,154 @@ fn key(app: &mut App, k: KeyEvent) -> Action {
     }
 }
 
+/// What the menu should currently offer — derived from the input text.
+/// Returns `None` when the menu should hide (regular task, complete
+/// command with no args expected). The `String` is the substring the
+/// menu is filtering on: the last whitespace-separated word of the
+/// relevant position (or `""` when the user just typed a space).
+pub fn detect_completion(text: &str) -> Option<(CompletionKind, String)> {
+    let text = text.trim_start();
+    if text.is_empty() || !text.starts_with('/') { return None; }
+    let body = &text[1..];
+    let trimmed = body.trim_end();
+    let trailing_space = body.len() > trimmed.len();
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+
+    if tokens.is_empty() {
+        // `/` alone or with trailing whitespace: list every command.
+        return Some((CompletionKind::Command, String::new()));
+    }
+
+    let cmd = tokens[0];
+    let rest = tokens.len() - 1;
+
+    match cmd {
+        // Commands that take no arguments: once the user has typed the
+        // full name (and a trailing space, signalling they mean it),
+        // the menu closes — there is nothing to complete.
+        "exit" | "quit" | "help" if trailing_space || rest >= 1 => None,
+        // `/model [arg]` — one optional profile key.
+        "model" => match (rest, trailing_space) {
+            (0, false) => Some((CompletionKind::Command, cmd.to_string())),
+            (0, true) => Some((CompletionKind::ModelArg, String::new())),
+            (1, false) => Some((CompletionKind::ModelArg, tokens[1].to_string())),
+            (1, true) => None,
+            _ => None,
+        },
+        // `/mcp <sub> [<server>]` — subcommand name, then server tag.
+        "mcp" => match (rest, trailing_space) {
+            (0, false) => Some((CompletionKind::Command, cmd.to_string())),
+            (0, true) => Some((CompletionKind::McpSub, String::new())),
+            (1, false) => Some((CompletionKind::McpSub, tokens[1].to_string())),
+            (1, true) => Some((CompletionKind::McpServer, String::new())),
+            (2, false) => Some((CompletionKind::McpServer, tokens[2].to_string())),
+            _ => None,
+        },
+        // Unknown command being typed: keep offering command names as
+        // long as the user has not yet typed a space.
+        other => {
+            if trailing_space {
+                None
+            } else {
+                Some((CompletionKind::Command, other.to_string()))
+            }
+        }
+    }
+}
+
+/// Sync `app.completion` with what the input currently asks for.
+/// `candidates_for` supplies the filtered list for whatever
+/// kind/prefix the menu now shows; the closure captures settings/hub so
+/// `App` stays pure of its own devices.
+///
+/// Selection is preserved across same-kind+same-prefix refreshes (so
+/// typing the next letter of a filter does not reset the highlight);
+/// any change in kind, or in prefix, resets selection to the top — what
+/// the user is now looking for is different.
+pub fn set_completion(
+    app: &mut App,
+    kind: CompletionKind,
+    prefix: &str,
+    candidates: Vec<CompletionItem>,
+) {
+    let prefix = prefix.to_string();
+    match app.completion.as_mut() {
+        Some(c) if c.kind == kind && c.prefix == prefix => {
+            c.candidates = candidates;
+            if c.selected >= c.candidates.len() {
+                c.selected = if c.candidates.is_empty() {
+                    0
+                } else {
+                    c.candidates.len() - 1
+                };
+            }
+        }
+        _ => {
+            app.completion = Some(Completion::new(kind, &prefix, candidates));
+        }
+    }
+}
+
+/// Hide the menu — Esc, or any input that has decided completion is no
+/// longer relevant.
+pub fn dismiss_completion(app: &mut App) {
+    app.completion = None;
+}
+
+/// Move the highlight one row up (wrapping); no-op when the menu is
+/// empty.
+pub fn completion_up(app: &mut App) {
+    if let Some(c) = app.completion.as_mut() {
+        if !c.candidates.is_empty() {
+            c.selected = (c.selected + c.candidates.len() - 1) % c.candidates.len();
+        }
+    }
+}
+
+/// Move the highlight one row down (wrapping); no-op when empty.
+pub fn completion_down(app: &mut App) {
+    if let Some(c) = app.completion.as_mut() {
+        if !c.candidates.is_empty() {
+            c.selected = (c.selected + 1) % c.candidates.len();
+        }
+    }
+}
+
+/// Apply the highlighted completion: replace the prefix the menu is
+/// filtering on with the candidate's `insert` text, optionally append a
+/// trailing space, and leave the caret at the end of what was just
+/// inserted. Returns whether anything happened — the caller can ignore
+/// it (Tab when nothing is selected is just a no-op).
+pub fn apply_completion(app: &mut App) -> bool {
+    let Some(c) = app.completion.as_ref() else { return false };
+    let Some(item) = c.candidates.get(c.selected).cloned() else { return false };
+    let prefix = c.prefix.clone();
+
+    // The prefix lives at the caret. For command completion the prefix
+    // starts after the leading `/`; for arg completion it starts after
+    // the last whitespace. Both are exactly `prefix.len()` bytes back
+    // from the caret — provided the menu has been kept in sync with
+    // the input, which `set_completion` (called after every key event)
+    // enforces.
+    let cur = app.input.caret();
+    let replace_start = cur.saturating_sub(prefix.len());
+    let trailing_space = item.trailing_space;
+
+    let mut new_text = String::with_capacity(app.input.text.len() + item.insert.len() + 1);
+    new_text.push_str(&app.input.text[..replace_start]);
+    new_text.push_str(&item.insert);
+    if trailing_space { new_text.push(' '); }
+    new_text.push_str(&app.input.text[cur..]);
+    app.input.text = new_text;
+    app.input.cursor = replace_start + item.insert.len() + if trailing_space { 1 } else { 0 };
+
+    // The TUI loop's next refresh recomputes the menu from the new
+    // input. We drop the stale one now so a highlighted row does not
+    // linger one keystroke behind.
+    app.completion = None;
+    true
+}
+
 fn input_mode(app: &mut App, k: KeyEvent) -> Action {
     // Ctrl-C outranks mode: while a task runs it cancels, twice exits.
     if matches!(k.code, KeyCode::Char('c')) && k.modifiers.contains(KeyModifiers::CONTROL) {
@@ -119,6 +269,29 @@ fn input_mode(app: &mut App, k: KeyEvent) -> Action {
             input_clear(app);
         }
         return Action::None;
+    }
+    // Completion keys (Tab / Esc / arrows) outrank the editor: while the
+    // menu is up, these keys belong to it, not to the cursor.
+    if app.completion.is_some() {
+        match k.code {
+            KeyCode::Tab => return if apply_completion(app) { Action::None } else { Action::None },
+            KeyCode::BackTab => { completion_up(app); return Action::None; }
+            KeyCode::Esc => { dismiss_completion(app); return Action::None; }
+            KeyCode::Up => { completion_up(app); return Action::None; }
+            KeyCode::Down => { completion_down(app); return Action::None; }
+            KeyCode::Enter => {
+                // Enter still submits; if a row is highlighted, apply it first.
+                apply_completion(app);
+            }
+            _ => {}
+        }
+    } else {
+        // No menu up — Tab inserts a literal tab if the cursor is past
+        // column 1 of an empty line and nothing else applies. We have
+        // no use for that today, so swallow it silently.
+        if matches!(k.code, KeyCode::Tab) {
+            return Action::None;
+        }
     }
     // While working, the input row shows the locked task — no editing.
     if app.working() {
@@ -155,6 +328,8 @@ fn input_mode(app: &mut App, k: KeyEvent) -> Action {
             // the editor empties for the next task; Up recalls this one
             input_clear(app);
             app.scroll = Scroll::Tail;
+            // submitting a slash command closes the menu — its work is done
+            dismiss_completion(app);
             Action::Submit(line)
         }
         KeyCode::Char(c) if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
@@ -225,10 +400,14 @@ fn input_mode(app: &mut App, k: KeyEvent) -> Action {
             Action::None
         }
         KeyCode::Char('o') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+            // entering browse dismisses any menu — the overlay has its
+            // own affordances, the completion has nothing to point at
+            dismiss_completion(app);
             browse(app);
             Action::None
         }
         KeyCode::PageUp => {
+            dismiss_completion(app);
             browse(app);
             app.scroll = app.scroll.lift(10);
             Action::None
@@ -673,5 +852,193 @@ mod tests {
         assert_eq!(a.input.text, "");
         drive(&mut a, vec![key(KeyCode::Enter, KeyModifiers::NONE)]);
         // Enter does not submit while a task runs
+    }
+
+    // ---- the slash-command menu ----
+
+    fn fake_candidates(kind: CompletionKind, prefix: &str) -> Vec<CompletionItem> {
+        // A standalone candidate source for tests: nothing profile- or
+        // hub-specific — a fixed map the test then asserts on.
+        match kind {
+            CompletionKind::Command => vec![
+                CompletionItem { insert: "exit".into(), label: "/exit".into(), description: "leave".into(), trailing_space: false },
+                CompletionItem { insert: "model".into(), label: "/model".into(), description: "switch profile".into(), trailing_space: true },
+                CompletionItem { insert: "mcp".into(), label: "/mcp".into(), description: "manage servers".into(), trailing_space: true },
+            ],
+            CompletionKind::ModelArg => vec![
+                CompletionItem { insert: "minimax/MiniMax-M3".into(), label: "minimax/MiniMax-M3".into(), description: "default".into(), trailing_space: false },
+                CompletionItem { insert: "zai/glm-5.3-flash".into(), label: "zai/glm-5.3-flash".into(), description: "zai".into(), trailing_space: false },
+            ],
+            CompletionKind::McpSub => vec![
+                CompletionItem { insert: "list".into(), label: "list".into(), description: "list servers".into(), trailing_space: true },
+                CompletionItem { insert: "enable".into(), label: "enable".into(), description: "re-enable".into(), trailing_space: true },
+            ],
+            CompletionKind::McpServer => vec![
+                CompletionItem { insert: "alpha".into(), label: "alpha".into(), description: "first server".into(), trailing_space: false },
+                CompletionItem { insert: "beta".into(), label: "beta".into(), description: "second server".into(), trailing_space: false },
+            ],
+            _ => vec![],
+        }
+        .into_iter()
+        .filter(|c| c.insert.starts_with(prefix) || c.label.trim_start_matches('/').starts_with(prefix) || prefix.is_empty())
+        .collect()
+    }
+
+    #[test]
+    fn detect_lists_commands_for_empty_or_partial_slash() {
+        assert_eq!(detect_completion(""), None);
+        assert_eq!(detect_completion("count files"), None);
+        assert_eq!(detect_completion("/"), Some((CompletionKind::Command, String::new())));
+        assert_eq!(detect_completion("/mod"), Some((CompletionKind::Command, "mod".into())));
+        assert_eq!(detect_completion("/model"), Some((CompletionKind::Command, "model".into())));
+        assert_eq!(detect_completion("/xyz"), Some((CompletionKind::Command, "xyz".into())));
+    }
+
+    #[test]
+    fn detect_transitions_to_model_arg_on_space() {
+        assert_eq!(detect_completion("/model "), Some((CompletionKind::ModelArg, String::new())));
+        assert_eq!(detect_completion("/model m"), Some((CompletionKind::ModelArg, "m".into())));
+        assert_eq!(detect_completion("/model m "), None, "no completion after the arg + space");
+    }
+
+    #[test]
+    fn detect_walks_through_mcp_levels() {
+        assert_eq!(detect_completion("/mcp "), Some((CompletionKind::McpSub, String::new())));
+        assert_eq!(detect_completion("/mcp e"), Some((CompletionKind::McpSub, "e".into())));
+        assert_eq!(detect_completion("/mcp enable "), Some((CompletionKind::McpServer, String::new())));
+        assert_eq!(detect_completion("/mcp enable a"), Some((CompletionKind::McpServer, "a".into())));
+        assert_eq!(detect_completion("/mcp enable alpha "), None);
+    }
+
+    #[test]
+    fn detect_closes_the_menu_after_no_arg_commands() {
+        assert_eq!(detect_completion("/exit "), None);
+        assert_eq!(detect_completion("/help "), None);
+    }
+
+    #[test]
+    fn set_completion_keeps_selection_across_same_kind_same_prefix() {
+        let mut a = App::new();
+        let cands = fake_candidates(CompletionKind::Command, "");
+        set_completion(&mut a, CompletionKind::Command, "", cands.clone());
+        a.completion.as_mut().unwrap().selected = 1;
+        // refresh with the same kind + prefix: selection survives
+        set_completion(&mut a, CompletionKind::Command, "", cands);
+        assert_eq!(a.completion.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn set_completion_resets_selection_on_prefix_change() {
+        let mut a = App::new();
+        set_completion(&mut a, CompletionKind::Command, "", fake_candidates(CompletionKind::Command, ""));
+        a.completion.as_mut().unwrap().selected = 2;
+        // the prefix narrowed: a fresh menu — selection returns to the top
+        set_completion(&mut a, CompletionKind::Command, "mo", fake_candidates(CompletionKind::Command, "mo"));
+        assert_eq!(a.completion.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn set_completion_clamps_selection_when_candidates_shrink() {
+        let mut a = App::new();
+        set_completion(&mut a, CompletionKind::Command, "", fake_candidates(CompletionKind::Command, ""));
+        a.completion.as_mut().unwrap().selected = 3; // past the end after filtering
+        set_completion(&mut a, CompletionKind::Command, "mo", fake_candidates(CompletionKind::Command, "mo"));
+        let c = a.completion.as_ref().unwrap();
+        assert!(c.selected < c.candidates.len(), "selected clamps into the new list");
+    }
+
+    #[test]
+    fn completion_up_and_down_wrap_within_candidates() {
+        let mut a = App::new();
+        set_completion(&mut a, CompletionKind::Command, "", fake_candidates(CompletionKind::Command, ""));
+        let c = a.completion.as_mut().unwrap();
+        assert_eq!(c.selected, 0);
+        completion_up(&mut a);
+        let c = a.completion.as_ref().unwrap();
+        assert_eq!(c.selected, c.candidates.len() - 1, "Up from the top wraps to the bottom");
+        completion_down(&mut a);
+        assert_eq!(a.completion.as_ref().unwrap().selected, 0, "Down from the bottom wraps to the top");
+    }
+
+    #[test]
+    fn apply_completion_replaces_prefix_and_appends_trailing_space() {
+        let mut a = App::new();
+        type_str(&mut a, "/mod");
+        set_completion(&mut a, CompletionKind::Command, "mod", fake_candidates(CompletionKind::Command, "mod"));
+        assert!(apply_completion(&mut a));
+        assert_eq!(a.input.text, "/model ", "the prefix is replaced and a space follows");
+        assert_eq!(a.input.cursor, "/model ".len(), "caret sits after the inserted text");
+    }
+
+    #[test]
+    fn apply_completion_for_arg_does_not_add_trailing_space() {
+        let mut a = App::new();
+        type_str(&mut a, "/model mini");
+        set_completion(&mut a, CompletionKind::ModelArg, "mini", fake_candidates(CompletionKind::ModelArg, "mini"));
+        assert!(apply_completion(&mut a));
+        assert_eq!(a.input.text, "/model minimax/MiniMax-M3", "profile key replaces prefix in place");
+        assert_eq!(a.input.cursor, "/model minimax/MiniMax-M3".len());
+    }
+
+    #[test]
+    fn tab_with_no_menu_is_a_no_op() {
+        let mut a = App::new();
+        type_str(&mut a, "/mod");
+        a.completion = None;
+        let before = a.input.text.clone();
+        drive(&mut a, vec![key(KeyCode::Tab, KeyModifiers::NONE)]);
+        assert_eq!(a.input.text, before, "Tab without a menu does nothing");
+    }
+
+    #[test]
+    fn tab_while_menu_open_applies_the_highlighted_row() {
+        let mut a = App::new();
+        type_str(&mut a, "/mod");
+        set_completion(&mut a, CompletionKind::Command, "mod", fake_candidates(CompletionKind::Command, "mod"));
+        let acts = drive(&mut a, vec![key(KeyCode::Tab, KeyModifiers::NONE)]);
+        assert_eq!(acts, vec![Action::None]);
+        assert!(a.input.text.starts_with("/model "), "Tab applied the selected row");
+    }
+
+    #[test]
+    fn arrows_while_menu_open_navigate_instead_of_recalling_history() {
+        let mut a = App::new();
+        type_str(&mut a, "/");
+        set_completion(&mut a, CompletionKind::Command, "", fake_candidates(CompletionKind::Command, ""));
+        // history is empty; Up/Down would otherwise be no-ops on history too,
+        // so instead seed the menu and assert selection moves
+        drive(&mut a, vec![key(KeyCode::Down, KeyModifiers::NONE)]);
+        assert_eq!(a.completion.as_ref().unwrap().selected, 1, "Down advanced the highlight");
+        drive(&mut a, vec![key(KeyCode::Up, KeyModifiers::NONE)]);
+        assert_eq!(a.completion.as_ref().unwrap().selected, 0, "Up went back");
+    }
+
+    #[test]
+    fn esc_dismisses_the_menu_without_changing_input() {
+        let mut a = App::new();
+        type_str(&mut a, "/mod");
+        set_completion(&mut a, CompletionKind::Command, "mod", fake_candidates(CompletionKind::Command, "mod"));
+        drive(&mut a, vec![key(KeyCode::Esc, KeyModifiers::NONE)]);
+        assert!(a.completion.is_none());
+        assert_eq!(a.input.text, "/mod", "Esc closes the menu, not the input");
+    }
+
+    #[test]
+    fn submitting_a_command_clears_the_menu() {
+        let mut a = App::new();
+        type_str(&mut a, "/help");
+        set_completion(&mut a, CompletionKind::Command, "help", fake_candidates(CompletionKind::Command, "help"));
+        let acts = drive(&mut a, vec![key(KeyCode::Enter, KeyModifiers::NONE)]);
+        assert!(a.completion.is_none(), "the menu closes when Enter fires");
+        assert_eq!(acts, vec![Action::Submit("/help".into())]);
+    }
+
+    #[test]
+    fn working_drops_any_open_menu() {
+        let mut a = App::new();
+        type_str(&mut a, "/");
+        set_completion(&mut a, CompletionKind::Command, "", fake_candidates(CompletionKind::Command, ""));
+        drive(&mut a, vec![Ev::Msg(Msg::TaskBegin("busy".into()))]);
+        assert!(a.completion.is_none(), "TaskBegin locks the editor and the menu");
     }
 }

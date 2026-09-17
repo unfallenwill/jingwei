@@ -223,6 +223,62 @@ pub struct App {
     /// Where the review overlay looks (see [`Scroll`]). The REPL itself
     /// never scrolls — its transcript lives in the terminal's scrollback.
     pub scroll: Scroll,
+    /// Slash-command menu: when the input line starts with `/`, this
+    /// holds the menu of completions (commands, then `/model` keys, then
+    /// `/mcp` subcommands + server names). `None` while the input is not
+    /// a slash command — and the only state the menu itself owns.
+    pub completion: Option<Completion>,
+}
+
+/// One row in the slash-command menu. `insert` is what Tab writes into
+/// the input (replacing the prefix the menu was filtering on); `label`
+/// is what the row shows. `trailing_space` means "the candidate ends a
+/// word" — Tab appends one space and keeps the menu open for the next.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionItem {
+    pub insert: String,
+    pub label: String,
+    pub description: String,
+    pub trailing_space: bool,
+}
+
+/// What the menu is currently offering — drives candidate collection
+/// and what the menu appends on accept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionKind {
+    /// `/<something>` — the slash-command name itself.
+    Command,
+    /// `/model <something>` — a profile key from settings.json.
+    ModelArg,
+    /// `/mcp <something>` — a subcommand name.
+    McpSub,
+    /// `/mcp <sub> <something>` — a server name.
+    McpServer,
+}
+
+/// The slash-command menu: which completions are on offer, what was
+/// filtered, and which row is highlighted. The view decides where to
+/// draw it; the update decides when to show, filter, and apply.
+#[derive(Clone, Debug)]
+pub struct Completion {
+    pub kind: CompletionKind,
+    /// The exact substring of input.text that completion is filtering
+    /// on — the last whitespace-separated word (the one the caret is in
+    /// for command/mcp, or the second arg for model/mcp). Replacing this
+    /// with the chosen `insert` is the whole effect of Tab.
+    pub prefix: String,
+    /// All candidates for this kind, after filtering by `prefix`.
+    pub candidates: Vec<CompletionItem>,
+    pub selected: usize,
+}
+
+impl Completion {
+    pub fn new(kind: CompletionKind, prefix: &str, candidates: Vec<CompletionItem>) -> Self {
+        // selected defaults to 0 (the top row); if the filtered list is
+        // empty, the menu is still drawn but says nothing — so the user
+        // sees their typo is unrecognised, not that the menu vanished.
+        Self { kind, prefix: prefix.to_string(), candidates, selected: 0 }
+    }
 }
 
 impl App {
@@ -239,6 +295,7 @@ impl App {
             cancel_sent: false,
             quit: false,
             scroll: Scroll::Tail,
+            completion: None,
         }
     }
 

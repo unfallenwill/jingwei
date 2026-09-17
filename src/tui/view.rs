@@ -19,7 +19,7 @@
 //! Styling honors [`crate::display::color_on`]: with NO_COLOR the same
 //! structure renders without color, exactly like the plain frontend.
 
-use super::model::{App, Fold, Mode, Row, THINK_TAIL_SHOWN};
+use super::model::{App, Completion, Fold, Mode, Row, THINK_TAIL_SHOWN};
 use crate::display::{color_on, disp_width, elapsed_str, prompt_w, thought_folded, truncate_cols, wrap_cols, Usage, ERR_BG, FOLD_GUTTER, PROMPT_GUTTER, PROMPT_HEAD, WARN_BG};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -168,6 +168,12 @@ pub fn pane(app: &App, w: u16, h: u16) -> Pane {
         lines.push(Line::from(""));
     }
     lines.push(rule(w));
+    // The slash-command menu hangs between the top rule and the input
+    // block. No menu — the gap collapses as before. When the menu is
+    // up, the input stays at its row and the menu grows upward.
+    if let Some(c) = &app.completion {
+        lines.extend(menu_rows(c, w));
+    }
 
     let cursor = match &app.status.task {
         // while a task runs, one locked row shows the task; no caret
@@ -183,7 +189,7 @@ pub fn pane(app: &App, w: u16, h: u16) -> Pane {
             None
         }
         None => {
-            // leave room for tail + two rules + the bar
+            // leave room for tail + two rules + the bar + the menu
             let cap = (h as usize).saturating_sub(lines.len() + 2).max(1);
             let (rows, caret_row, caret_col) = input_rows(app, w, cap);
             let caret_row = lines.len() + caret_row;
@@ -196,6 +202,49 @@ pub fn pane(app: &App, w: u16, h: u16) -> Pane {
     lines.push(status_row(app, w));
     Pane { lines, cursor }
 }
+
+/// Render the slash-command menu as up to [`MENU_ROWS`] rows of
+/// `label · description`, with the highlighted row painted bold. An
+/// empty candidate list yields one placeholder row ("no matches"),
+/// so the menu does not silently vanish on a typo.
+fn menu_rows(c: &Completion, w: usize) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = vec![];
+    if c.candidates.is_empty() {
+        let row = Line::from(Span::styled(
+            truncate_cols(&format!("  (no matches for /{})", c.prefix), w),
+            dim(),
+        ));
+        out.push(row);
+        return out;
+    }
+    for (i, item) in c.candidates.iter().take(MENU_ROWS).enumerate() {
+        let is_sel = i == c.selected;
+        let style = if is_sel { head_style() } else { dim() };
+        // gutter for the highlight glyph; the label itself is what Tab inserts.
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::styled(if is_sel { "▸ " } else { "  " }, style),
+            Span::styled(truncate_cols(&item.label, (w / 2).max(16), ), style),
+        ];
+        // separator + description, in dim
+        spans.push(Span::styled(
+            format!(" · {}", truncate_cols(&item.description, w.saturating_sub(w / 2 + 4))),
+            dim(),
+        ));
+        out.push(Line::from(spans));
+    }
+    let extra = c.candidates.len().saturating_sub(MENU_ROWS);
+    if extra > 0 {
+        out.push(Line::from(Span::styled(
+            format!("  … +{extra} more"),
+            dim(),
+        )));
+    }
+    out
+}
+
+/// The most menu rows we render before falling back to "+N more".
+/// Small on purpose: the menu is a hint, not the transcript.
+const MENU_ROWS: usize = 6;
 
 /// The prompt row: `❯ <label>`, continuation rows indented by the
 /// same gutter width.
