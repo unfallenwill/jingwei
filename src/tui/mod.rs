@@ -657,13 +657,19 @@ fn handle(
             let job = tokio::spawn(async move {
                 let mut c = convo.lock().await;
                 c.history.push(user_message(&line));
-                c.persist(&sink); // the task is on disk before the first stone moves
+                if let Err(e) = c.persist() {
+                    sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
+                }
+                // the task is on disk before the first stone moves
                 match agent_turn(&cfg, &mut c.history, &tok, &sink).await {
                     Err(Error::Interrupted) => {}
                     Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
                     Ok(()) => {}
                 }
-                c.persist(&sink); // run boundary: the file never ends mid-run
+                if let Err(e) = c.persist() {
+                    sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
+                }
+                // run boundary: the file never ends mid-run
                 sink.show(Msg::TaskEnd);
             });
             *agent = Some(Agent { token, job });

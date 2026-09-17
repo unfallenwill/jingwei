@@ -14,6 +14,7 @@ mod api;
 mod cancel;
 mod config;
 mod file_io;
+mod format;
 mod display;
 mod edit;
 mod ir;
@@ -157,10 +158,14 @@ async fn run() -> Result<()> {
     }
     sink.show(Msg::TaskBegin(prompt.clone()));
     convo.history.push(user_message(&prompt));
-    convo.persist(&sink);
+    if let Err(e) = convo.persist() {
+        sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
+    }
     let token = CancelToken::new();
     let res = agent_turn(&cfg, &mut convo.history, &token, &sink).await;
-    convo.persist(&sink);
+    if let Err(e) = convo.persist() {
+        sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
+    }
     sink.show(Msg::TaskEnd);
     res
 }

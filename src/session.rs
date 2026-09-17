@@ -45,7 +45,6 @@
 //! the internal representation, which every wire adapter already speaks —
 //! a session started on one protocol resumes on another for free.
 
-use crate::display::{self, Msg, Sev, Show};
 use crate::ir::Message;
 use crate::Error;
 
@@ -122,13 +121,14 @@ impl Convo {
     }
 
     /// Land everything not yet on disk. Run boundaries only. A failure
-    /// here must never take the agent down: the note says what happened,
-    /// the conversation continues in memory.
-    pub fn persist(&mut self, sink: &dyn Show) {
-        let Some(s) = self.session.as_mut() else { return };
-        if let Err(e) = s.sync(&self.history) {
-            sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
-        }
+    /// here must never take the agent down — the agent keeps the
+    /// conversation in memory; the caller decides whether to surface the
+    /// error (banner, log line, silent retry) and how. Returning a Result
+    /// keeps session from importing display (which is a presentation
+    /// type) and lets each frontend translate the io::Error its own way.
+    pub fn persist(&mut self) -> std::io::Result<()> {
+        let Some(s) = self.session.as_mut() else { return Ok(()); };
+        s.sync(&self.history)
     }
 }
 
@@ -447,20 +447,20 @@ pub fn format_table(metas: &[Meta], scope: &Path, show_dir: bool) -> String {
             m.id.clone(),
             utc(m.created),
             m.protocol.clone(),
-            display::truncate_cols(&m.model, 18),
+            crate::format::truncate_cols(&m.model, 18),
             m.msgs.to_string(),
         ];
         if show_dir {
             v.push(clip_head(&dir_tail(&m.cwd), 26));
         }
-        v.push(display::truncate_cols(m.first.trim(), 40));
+        v.push(crate::format::truncate_cols(m.first.trim(), 40));
         v
     };
     let rows: Vec<Vec<String>> = metas.iter().map(cells).collect();
-    let mut widths: Vec<usize> = heads.iter().map(|h| display::disp_width(h)).collect();
+    let mut widths: Vec<usize> = heads.iter().map(|h| crate::format::disp_width(h)).collect();
     for r in &rows {
         for (i, c) in r.iter().enumerate() {
-            widths[i] = widths[i].max(display::disp_width(c));
+            widths[i] = widths[i].max(crate::format::disp_width(c));
         }
     }
     let row = |cells: &[String]| {
@@ -468,7 +468,7 @@ pub fn format_table(metas: &[Meta], scope: &Path, show_dir: bool) -> String {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let pad = " ".repeat(widths[i].saturating_sub(display::disp_width(c)));
+                let pad = " ".repeat(widths[i].saturating_sub(crate::format::disp_width(c)));
                 format!("{c}{pad}")
             })
             .collect::<Vec<_>>()
@@ -569,16 +569,16 @@ pub fn dir_tail(path: &str) -> String {
 
 /// Clip to `max` display columns keeping the *end* — paths name things at
 /// their leaf, so the DIR column drops the front; the mirror of
-/// `display::truncate_cols`, which drops the end.
+/// `crate::format::truncate_cols`, which drops the end.
 fn clip_head(s: &str, max: usize) -> String {
     use unicode_segmentation::UnicodeSegmentation;
-    if display::disp_width(s) <= max {
+    if crate::format::disp_width(s) <= max {
         return s.to_string();
     }
     let mut kept: Vec<&str> = vec![];
     let mut w = 1; // the ellipsis rides inside the budget
     for g in s.graphemes(true).rev() {
-        let gw = display::disp_width(g).max(1);
+        let gw = crate::format::disp_width(g).max(1);
         if w + gw > max {
             break;
         }
@@ -899,7 +899,7 @@ mod tests {
     fn ephemeral_convo_persists_nothing_and_never_panics() {
         let mut c = Convo::ephemeral();
         c.history.push(crate::user_message("hi"));
-        c.persist(&crate::plain::PlainSink::new()); // a quiet no-op — one-shots leave no session behind
+        c.persist().unwrap(); // a quiet no-op — one-shots leave no session behind
         assert_eq!(c.history.len(), 1);
     }
 }

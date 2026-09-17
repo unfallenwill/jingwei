@@ -187,7 +187,10 @@ pub async fn plain_repl(
             break;
         }
         convo.history.push(crate::user_message(&line));
-        convo.persist(&sink); // the task is on disk before the first stone moves
+        if let Err(e) = convo.persist() {
+            sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
+        }
+        // the task is on disk before the first stone moves
         sink.show(Msg::TaskBegin(line));
         let token = crate::cancel::CancelToken::new();
         match agent_turn(cfg, &mut convo.history, &token, &sink).await {
@@ -195,7 +198,10 @@ pub async fn plain_repl(
             Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
             Ok(()) => {}
         }
-        convo.persist(&sink); // run boundary: the file never ends mid-run
+        if let Err(e) = convo.persist() {
+            sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
+        }
+        // run boundary: the file never ends mid-run
         sink.show(Msg::TaskEnd);
     }
     Ok(())

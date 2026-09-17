@@ -13,6 +13,7 @@ use serde_json::Value;
 use std::env;
 use std::time::Duration;
 use std::io::{self, IsTerminal};
+use unicode_segmentation::UnicodeSegmentation;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Severity of a note row (warnings scroll with the transcript).
@@ -181,38 +182,17 @@ pub fn color_on() -> bool {
         && io::stderr().is_terminal()
 }
 
-/// Display width of a string, per Unicode (east-asian wide = 2, combining
-/// marks = 0). Both frontends measure with the same ruler.
-pub fn disp_width(s: &str) -> usize {
-    use unicode_width::UnicodeWidthStr;
-    s.width()
-}
-
-/// Cut to `max` display columns, marking the cut with an ellipsis. Walks
-/// graphemes so a combining mark is never severed from its base.
-pub fn truncate_cols(s: &str, max: usize) -> String {
-    use unicode_segmentation::UnicodeSegmentation;
-    let mut out = String::new();
-    let mut w = 0;
-    for g in s.graphemes(true) {
-        let gw = disp_width(g).max(1);
-        if w + gw > max.saturating_sub(2) {
-            out.push('…');
-            return out;
-        }
-        out.push_str(g);
-        w += gw;
-    }
-    out
-}
+// Re-exported so existing callers keep working; the canonical home is
+// `crate::format` (where session.rs can reach them without depending on
+// the presentation layer).
+pub use crate::format::{disp_width, truncate_cols};
 
 /// Wrap to `max` display columns, grapheme-greedy: every chunk fits, no
 /// ellipsis — the review mode's ruler, where reading the whole line beats
 /// keeping the row count. Empty input yields one empty chunk, so a wrapped
 /// line never loses its row.
 pub fn wrap_cols(s: &str, max: usize) -> Vec<String> {
-    use unicode_segmentation::UnicodeSegmentation;
-    let max = max.max(1);
+        let max = max.max(1);
     let mut out = vec![];
     let mut cur = String::new();
     let mut w = 0;
