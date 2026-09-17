@@ -111,7 +111,7 @@ fn bar_segs(app: &App) -> Vec<Seg> {
 /// ```text
 /// (streaming tail — only while a line is in flight)
 /// ───────────────────────────── rule
-/// jingwei ❯ the input, one row per line while composing
+/// ❯ the input, one row per line while composing
 /// ───────────────────────────── rule
 /// the ledger bar, flush right
 /// ```
@@ -197,7 +197,7 @@ pub fn pane(app: &App, w: u16, h: u16) -> Pane {
     Pane { lines, cursor }
 }
 
-/// The prompt row: `jingwei ❯ <label>`, continuation rows indented by the
+/// The prompt row: `❯ <label>`, continuation rows indented by the
 /// same gutter width.
 fn prompt_line(label: &str, style: Style) -> Line<'static> {
     Line::from(vec![
@@ -726,7 +726,7 @@ mod tests {
         let idle = texts_of(&pane(&a, 80, 24).lines);
         assert_eq!(idle.len(), 8, "idle keeps the reserve: {idle:?}");
         assert!(idle[..4].iter().all(|t| t.is_empty()), "still blank when idle: {idle:?}");
-        assert!(idle[5].starts_with("jingwei ❯"), "the idle prompt follows it: {idle:?}");
+        assert!(idle[5].starts_with("❯"), "the idle prompt follows it: {idle:?}");
         // the next task starts tight: the floor resets, so the pane
         // collapses to its bare frame until the new task's thinking
         // streams and raises the reserve again
@@ -855,7 +855,7 @@ mod tests {
         let texts = texts_of(&p.lines);
         assert_eq!(texts.len(), 4, "rule, input, rule, bar: {texts:?}");
         assert!(texts[0].starts_with("─────"), "top rule: {texts:?}");
-        assert!(texts[1].starts_with("jingwei ❯ "), "input row carries the prompt");
+        assert!(texts[1].starts_with("❯ "), "input row carries the prompt");
         assert!(texts[2].starts_with("─────"), "bottom rule: {texts:?}");
         assert_eq!(p.cursor, Some(Cursor { row: 1, col: prompt_w() as u16 }));
 
@@ -869,7 +869,7 @@ mod tests {
         let p = pane(&a, 80, 24);
         let texts = texts_of(&p.lines);
         let locked = &texts[texts.len() - 3];
-        assert!(locked.starts_with("jingwei ❯ busy …"), "multi-line task locks one row: {locked:?}");
+        assert!(locked.starts_with("❯ busy …"), "multi-line task locks one row: {locked:?}");
         assert!(p.cursor.is_none(), "no caret while the row is locked");
     }
 
@@ -881,7 +881,7 @@ mod tests {
         type_str(&mut a, "tw");
         let p = pane(&a, 40, 24);
         let texts = texts_of(&p.lines);
-        assert_eq!(texts[1], "jingwei ❯ one", "first line carries the prompt: {texts:?}");
+        assert_eq!(texts[1], "❯ one", "first line carries the prompt: {texts:?}");
         assert_eq!(texts[2], format!("{}tw", " ".repeat(prompt_w())), "continuation aligns under the prompt");
         assert_eq!(p.cursor, Some(Cursor { row: 2, col: (prompt_w() + 2) as u16 }));
     }

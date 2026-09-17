@@ -1213,7 +1213,13 @@ mod tests {
         let buf = render_buf(&p.lines, 40);
         let rows = replay(&row_cells(&buf, 0), 40, buf.area.height);
         let input = &rows[1]; // rule, input, rule, bar
-        let draft: String = input.chars().skip(10).take(caret.col as usize - 10).collect();
+        // the draft starts immediately after the prompt prefix; the test
+        // helper duplicates wide chars back into chars so 精卫 (4 display
+        // cols) lands as 4 chars. caret.col is in display columns, so the
+        // draft's display width is `caret.col - prompt_w`.
+        let prefix = format!("{}{}", crate::display::PROMPT_HEAD, crate::display::PROMPT_GUTTER);
+        let after = input.strip_prefix(&prefix).expect("prompt prefix");
+        let draft: String = after.chars().take((caret.col as usize).saturating_sub(crate::display::prompt_w())).collect();
         assert_eq!(draft, "精精卫卫 fill", "the draft renders compact under the prompt: {input:?}");
         assert_eq!(input.chars().nth(caret.col as usize), Some(' '), "the column the caret sits on is free");
     }

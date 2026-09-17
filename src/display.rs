@@ -105,9 +105,10 @@ impl Usage {
 // same severity colors. The strings live here, once, so the log and the TUI
 // cannot drift apart.
 
-/// The prompt's head and gutter; [`prompt_w`] is derived, never restated.
-pub const PROMPT_HEAD: &str = "jingwei";
-pub const PROMPT_GUTTER: &str = " ❯ ";
+/// The prompt's gutter; [`prompt_w`] is derived, never restated.
+/// Just `❯` — no name prefix, the editor pane says where it is by where it sits.
+pub const PROMPT_HEAD: &str = "";
+pub const PROMPT_GUTTER: &str = "❯ ";
 
 /// Display columns the prompt occupies — computed from the strings above so
 /// editing the prompt cannot silently break alignment.
