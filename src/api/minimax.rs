@@ -98,6 +98,15 @@ async fn streaming(cfg: &Config, messages: &[Message], schemas: &[Value], token:
                 // the wire reports blocks progressively via content_block_start,
                 // and message_start's `content` may be empty until the first
                 // block arrives. Let content_block_start grow `blocks`.
+                // What is reliable here: the *usage* ledger — minimax opens
+                // the turn with the real input/cache counts already filled in,
+                // and a later `message_delta` only carries output_tokens. If
+                // we don't merge this now, status.turn.context_in() stays at
+                // zero for the whole turn, and the bar's ctx gauge disappears.
+                // The display port is wired so any later merge (turn-end
+                // `message_delta`) replaces — so merging twice with the same
+                // fields is a no-op rather than a double-count.
+                merge_usage(&mut usage, v["message"]["usage"].as_object());
             }
             Some("content_block_start") => {
                 let i = v["index"].as_u64().unwrap_or(0) as usize;
@@ -262,6 +271,33 @@ usage: {:?}", resp.blocks, resp.usage);
         assert_eq!(resp.blocks[0].text().unwrap(), "hello world");
         assert_eq!(resp.blocks[1].name(), "bash");
         assert_eq!(resp.blocks[1].input(), &json!({"command": "echo hi"}));
+    }
+
+    #[test]
+    fn streaming_merges_message_start_usage_so_ctx_is_not_zero() {
+        // minimax opens the turn with input_tokens/cache counts already in
+        // message_start.usage, and message_delta only carries output_tokens.
+        // If the adapter drops message_start's usage, status.turn.context_in()
+        // is zero for the whole turn and the bar's ctx gauge disappears.
+        let stream = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1234,"cache_read_input_tokens":800}}}"#, "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#, "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
+            r#"data: {"type":"message_delta","usage":{"output_tokens":5}}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n");
+        let port = mock(stream, 200, true);
+        let c = cfg(format!("http://127.0.0.1:{port}"), true);
+        let token = crate::cancel::CancelToken::new();
+        let (resp, _) = block_on(call_api(&c, &[], &[], &token, &sink())).unwrap();
+        // message_start's usage must reach the response — both input and
+        // cache_read survive even though message_delta carries neither.
+        assert_eq!(resp.usage["input_tokens"], 1234, "message_start input must persist");
+        assert_eq!(resp.usage["cache_read_input_tokens"], 800, "message_start cache_read must persist");
+        assert_eq!(resp.usage["output_tokens"], 5);
+        // And the ctx gauge can read it: context_in() = input + cache_read + cache_write.
+        let u = crate::display::Usage::from_value(&resp.usage);
+        assert_eq!(u.context_in(), 2034, "ctx_in must include input + cache_read");
     }
 
     #[test]
