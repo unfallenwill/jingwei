@@ -61,9 +61,10 @@ pub(crate) fn edit_tool(i: &Value) -> String {
         Value::Array(a) => {
             let mut out = Vec::with_capacity(a.len());
             for (n, e) in a.iter().enumerate() {
-                match (e["old"].as_str(), e["new"].as_str()) {
-                    (Some(old), Some(new)) => out.push((old.to_string(), new.to_string())),
-                    _ => return format!("error: edits[{}] needs `old` and `new` strings (in {p})", n + 1),
+                // An omitted `new` is a deletion, same as the outer single-pair form.
+                match e["old"].as_str() {
+                    Some(old) => out.push((old.to_string(), e["new"].as_str().unwrap_or("").to_string())),
+                    None => return format!("error: edits[{}] needs `old` (in {p})", n + 1),
                 }
             }
             out
@@ -417,14 +418,38 @@ mod tests {
             {"old": "keep()", "new": "gone()"}, {"old": "missing()", "new": "x"}]}));
         assert!(out.contains("edit 2/2") && out.contains("nothing was written"), "got: {out}");
         assert_eq!(fs::read_to_string(&p).unwrap(), "final_a();\nkeep();\nnew_b();\n", "all or nothing");
-        // the two spellings do not mix, and neither does an empty batch
+        // the two spellings do not mix, an empty batch is rejected, and
+        // an item that omits `old` is still malformed (`new` may be omitted
+        // — that's a deletion; see the test below)
         let both = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "a", "new": "b",
             "edits": [{"old": "a", "new": "b"}]}));
         assert!(both.contains("not both"), "got: {both}");
         let none = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "edits": []}));
         assert!(none.contains("`edits` is empty"), "got: {none}");
-        let malformed = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "edits": [{"old": "a"}]}));
-        assert!(malformed.contains("edits[1] needs"), "got: {malformed}");
+        let malformed = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "edits": [{"new": "y"}]}));
+        assert!(malformed.contains("edits[1] needs `old`"), "got: {malformed}");
+    }
+
+    #[test]
+    fn edits_array_omitting_new_is_a_deletion() {
+        // mirrors the outer single-pair contract: omitting `new` deletes the
+        // matched text. The schema and edit_tool both honour this now — the
+        // outer `new` field has always said "omit to delete", and the edits
+        // array is the same shape with the same omission rule.
+        let dir = temp_dir("edit_edits_delete");
+        let p = dir.join("f.rs");
+        fs::write(&p, "let a = old_call();\nlet b = keep();\nlet c = old_call();\n").unwrap();
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "edits": [
+            {"old": "let a = old_call();\n"},
+            {"old": "let c = old_call();\n"},
+        ]}));
+        assert!(out.starts_with("ok:"), "got: {out}");
+        assert_eq!(fs::read_to_string(&p).unwrap(), "let b = keep();\n");
+        // the same omission in the single-pair form has always worked —
+        // this is the contract both spellings share.
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "let b = keep();\n"}));
+        assert!(out.starts_with("ok:"), "got: {out}");
+        assert_eq!(fs::read_to_string(&p).unwrap(), "");
     }
 
     #[test]

@@ -58,9 +58,18 @@ pub(crate) fn tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "bash",
-            desc: "Run a shell command; returns combined stdout/stderr and the exit code. \
-                   Use `cd <dir> && <cmd>` to change directory within a call.",
-            schema: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
+            desc: "Run a shell command (`sh -c` on Unix, `cmd /C` on Windows). Output shape is \
+                   `exit=N\\n<stdout><optional stderr>` (N is the child's status; `-1` means the process \
+                   was terminated by a signal with no normal exit code). Output longer than 50,000 bytes \
+                   is truncated with a `…[truncated, N bytes total]` marker — tail the file or pipe \
+                   through `head` / `tail` / `sed` if you need more. The shell inherits the agent's \
+                   current working directory; relative paths resolve there, not against the user's \
+                   shell. Use `cd <dir> && <cmd>` to change directory within a single call. Long-running \
+                   commands are killed on Ctrl-C; partial output still reaches the model with an \
+                   `[interrupted by user]` marker.",
+            schema: json!({"type":"object","properties":{
+                "command":{"type":"string","description":"Shell command string; passed to `sh -c` on Unix or `cmd /C` on Windows. Multi-line commands use `;` or `&&`."}
+            },"required":["command"]}),
             run: |i| {
                 let prog_flag = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
                 match Command::new(prog_flag.0).args([prog_flag.1, i["command"].as_str().unwrap_or("")]).output() {
@@ -73,8 +82,13 @@ pub(crate) fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "read_file",
-            desc: "Read the full contents of a file.",
-            schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            desc: "Read the full contents of a file. Use this — not `cat` via bash — before any edit. \
+                   A read also loads the file into the agent's ledger: edit_file and write_file \
+                   then refuse to touch the file if it changed on disk, so re-read after any \
+                   external edit (rustfmt, git pull, sed, …).",
+            schema: json!({"type":"object","properties":{
+                "path":{"type":"string","description":"Absolute or relative path; resolves against the agent's current working directory."}
+            },"required":["path"]}),
             run: |i| {
                 let p = i["path"].as_str().unwrap_or("");
                 match fs::read(p) {
@@ -88,8 +102,15 @@ pub(crate) fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "write_file",
-            desc: "Write content to a file, creating parent dirs as needed. Overwrites existing files.",
-            schema: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
+            desc: "Write content to a file, creating parent dirs as needed. Overwrites existing files. \
+                   Prefer edit_file for small or targeted changes — this is the blunt tool and \
+                   will silently replace uncommitted work. The write is atomic (temp+rename): \
+                   a crash mid-call cannot leave a truncated file. Refuses to overwrite if the \
+                   file changed since jingwei last read or wrote it; re-read first, then write.",
+            schema: json!({"type":"object","properties":{
+                "path":{"type":"string","description":"Absolute or relative path; resolves against the agent's current working directory. Parent dirs are created if they do not exist."},
+                "content":{"type":"string","description":"Full file contents — the tool always overwrites. For a small or targeted change, use edit_file instead."}
+            },"required":["path","content"]}),
             run: |i| {
                 let p = i["path"].as_str().unwrap_or("");
                 let c = i["content"].as_str().unwrap_or("");
@@ -114,12 +135,16 @@ pub(crate) fn tools() -> Vec<Tool> {
                    error names the line numbers — widen `old` with a line of context around the one \
                    you mean, or set replace_all:true to replace every occurrence. The result carries \
                    the affected line numbers and a diff. Refuses to write over a file that changed \
-                   on disk since jingwei last read it: re-read it, then redo the edit.",
+                   on disk since jingwei last read it: re-read it, then redo the edit. Passing an \
+                   empty `old` is refused — use write_file to create or replace a file wholesale.",
             schema: json!({"type":"object","properties":{
-                "path":{"type":"string"},
+                "path":{"type":"string","description":"Absolute or relative path; resolves against the agent's current working directory."},
                 "old":{"type":"string","description":"the text to find"},
                 "new":{"type":"string","description":"what goes in its place; omit to delete"},
-                "edits":{"type":"array","description":"several `old`/`new` pairs applied in one call, in order, all or nothing","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"}},"required":["old","new"]}},
+                "edits":{"type":"array","description":"several `old`/`new` pairs applied in one call, in order, all or nothing. Omitting `new` in an item is a deletion, mirroring the outer `old`/`new` shape.","items":{"type":"object","properties":{
+                    "old":{"type":"string","description":"the text to find"},
+                    "new":{"type":"string","description":"what goes in its place; omit to delete (matches the outer `old`/`new` shape)"}
+                },"required":["old"]}},
                 "replace_all":{"type":"boolean","description":"replace every occurrence, instead of refusing when `old` is not unique"}},
                 "required":["path"]}),
             run: |i| edit_tool(i),
