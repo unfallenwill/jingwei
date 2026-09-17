@@ -38,9 +38,11 @@ pub mod model;
 pub mod update;
 pub mod view;
 
+use crate::api::VENDORS;
+use crate::config::Config;
 use crate::display::{ChannelSink, Msg, Sev, Show as DisplayShow};
 use crate::session::Convo;
-use crate::config::Config;
+use crate::settings::Settings;
 use crate::{agent_turn, user_message, Error};
 
 fn home_dir() -> Option<std::path::PathBuf> {
@@ -401,7 +403,7 @@ fn needs_paint(
 /// Open the TUI: terminal setup, the event loop, guaranteed restore.
 /// `convo` is the conversation to run on (history + its session); the
 /// banners come from the composition root and land beside ours.
-pub async fn run(cfg: &Config, convo: Convo, banners: Vec<String>) -> crate::Result<()> {
+pub async fn run(cfg: Config, convo: Convo, banners: Vec<String>) -> crate::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sink = ChannelSink::new(tx);
     sink.show(Msg::Banner(format!(
@@ -421,7 +423,12 @@ pub async fn run(cfg: &Config, convo: Convo, banners: Vec<String>) -> crate::Res
         context_limit: cfg.context_size,
     };
 
-    let convo = Arc::new(AsyncMutex::new(convo));
+    let mut cfg = cfg;
+    // convo is replaceable — `/model` swaps in a fresh Convo without
+    // disturbing the running event loop. Each replacement wraps a new
+    // AsyncMutex; the previous one is dropped with its lock held at most
+    // until any in-flight agent coroutine finishes.
+    let mut convo = Arc::new(AsyncMutex::new(convo));
     let mut agent: Option<Agent> = None;
 
     // Raw mode, bracketed paste, and the kitty keyboard protocol (which
@@ -561,10 +568,10 @@ pub async fn run(cfg: &Config, convo: Convo, banners: Vec<String>) -> crate::Res
                 match maybe {
                     Some(ev) => match ev {
                         crossterm::event::Event::Key(k) => {
-                            handle(step(&mut app, Ev::Key(k)), cfg, &convo, &mut agent, &sink);
+                            apply_outcome(handle(step(&mut app, Ev::Key(k)), &cfg, &convo, &mut agent, &sink), &mut cfg, &mut convo, &mut app, &sink);
                         }
                         crossterm::event::Event::Paste(p) => {
-                            handle(step(&mut app, Ev::Paste(p)), cfg, &convo, &mut agent, &sink);
+                            apply_outcome(handle(step(&mut app, Ev::Paste(p)), &cfg, &convo, &mut agent, &sink), &mut cfg, &mut convo, &mut app, &sink);
                         }
                         // a resize needs no arm of its own: the Input arm
                         // polls the size every frame and redraws the viewport
@@ -631,23 +638,274 @@ fn draw_overlay(term: &mut ratatui::Terminal<Backend>, app: &App) -> io::Result<
     Ok(())
 }
 
-/// Perform an update's side effect: submit spawns the agent coroutine,
-/// cancel fires its token.
+/// The outcome of `handle` — what the main loop needs to do next.
+/// `Submit` already starts the agent coroutine inside `handle`, so the
+/// only outcomes that escape are the ones the loop itself must act on:
+/// cancel a running task, switch to a new (cfg, convo, banners), or do
+/// nothing.
+#[derive(Default)]
+#[allow(clippy::large_enum_variant)] // Switch carries a full Config + Convo; the
+                                      // other arms are empty. The trade-off is fine:
+                                      // None / Cancel are the common case (zero cost)
+                                      // and Switch is the rare path that pays for it.
+enum HandleOutcome {
+    #[default]
+    None,
+    Cancel,
+    /// Replace cfg / convo / banners with the ones in here. The previous
+    /// Convo is dropped (its session file is already on disk from the
+    /// last `persist`); the new Convo starts a fresh session file under
+    /// the same project subdirectory.
+    Switch {
+        cfg: Config,
+        convo: Convo,
+        banners: Vec<String>,
+        /// A short status line the loop will show in the transcript so
+        /// the user sees what just happened (model name, protocol).
+        announce: String,
+    },
+}
+
+impl std::fmt::Debug for HandleOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Config / Convo don't impl Debug — and we don't need them in
+        // test failure messages; the variant tag is enough.
+        match self {
+            HandleOutcome::None => write!(f, "None"),
+            HandleOutcome::Cancel => write!(f, "Cancel"),
+            HandleOutcome::Switch { announce, .. } => write!(f, "Switch {{ announce: {announce:?} }}"),
+        }
+    }
+}
+
+/// Apply the outcome of `handle` to the loop's mutable state. The
+/// switch arm is the one that mutates: the loop's `cfg` and `convo`
+/// are replaced, the `info` row of the pane is refreshed, and a
+/// transcript note announces what happened.
+fn apply_outcome(
+    outcome: HandleOutcome,
+    cfg: &mut Config,
+    convo: &mut Arc<AsyncMutex<Convo>>,
+    app: &mut App,
+    sink: &ChannelSink,
+) {
+    match outcome {
+        HandleOutcome::None | HandleOutcome::Cancel => {}
+        HandleOutcome::Switch { cfg: new_cfg, convo: new_convo, banners, announce } => {
+            *cfg = new_cfg;
+            *convo = Arc::new(AsyncMutex::new(new_convo));
+            app.info = model::Info {
+                model: cfg.model.clone(),
+                effort: cfg.effort_label().map(str::to_owned),
+                context_limit: cfg.context_size,
+            };
+            for b in banners {
+                sink.show(Msg::Banner(b));
+            }
+            sink.show(Msg::Note { sev: Sev::Warn, text: format!(" {announce} ") });
+            // the next frame's `painted` will diff against the new
+            // `app.info` and redraw the pane — no explicit dirty flag.
+        }
+    }
+}
+
+/// Parse a `/`-prefixed input line into a slash command + its args.
+/// A line that is not a slash command returns `None`; the caller
+/// falls through to the normal submit path (a regular task).
+fn parse_slash(line: &str) -> Option<SlashCmd<'_>> {
+    let line = line.trim();
+    let rest = line.strip_prefix('/')?;
+    let mut it = rest.split_whitespace();
+    let name = it.next()?;
+    Some(SlashCmd { name, args: it.collect() })
+}
+
+#[derive(Debug)]
+struct SlashCmd<'a> {
+    name: &'a str,
+    args: Vec<&'a str>,
+}
+
+/// Dispatch a slash command. The dispatcher is small and grows by
+/// accretion — every new command adds a match arm and nothing else.
+/// Unknown commands surface in the transcript as a `Note` so the user
+/// sees the typo (no silent failure).
+fn dispatch_slash(
+    cmd: SlashCmd<'_>,
+    cfg: &Config,
+    convo: &Arc<AsyncMutex<Convo>>,
+    sink: &ChannelSink,
+) -> HandleOutcome {
+    match cmd.name {
+        "exit" | "quit" => {
+            // the loop owns the quit flag; we just stop the current
+            // agent and let the loop see Cancel → drain → exit
+            HandleOutcome::Cancel
+        }
+        "model" => match slash_model(cmd.args, cfg, convo) {
+            Ok(o) => o,
+            Err(e) => {
+                sink.show(Msg::Note { sev: Sev::Err, text: format!(" {e} ") });
+                HandleOutcome::None
+            }
+        },
+        "help" => {
+            sink.show(Msg::Note {
+                sev: Sev::Warn,
+                text: " commands: /model [<provider>/<model>] · /exit · /help ".into(),
+            });
+            HandleOutcome::None
+        }
+        other => {
+            sink.show(Msg::Note { sev: Sev::Warn, text: format!(" unknown command: /{other} · try /help ") });
+            HandleOutcome::None
+        }
+    }
+}
+
+/// `/model` switches the active profile. The new Config + a fresh Convo
+/// ride back through `HandleOutcome::Switch`; the loop swaps them in.
+/// With no args we surface the current selection and the available
+/// profiles; with one arg we look it up under `<provider>/<model>`.
+fn slash_model(
+    args: Vec<&str>,
+    cfg: &Config,
+    convo: &Arc<AsyncMutex<Convo>>,
+) -> Result<HandleOutcome, String> {
+    let settings = Settings::load().map_err(|e| e.to_string())?;
+    let current_key = settings
+        .active
+        .clone()
+        .or_else(|| {
+            settings
+                .providers
+                .keys()
+                .next()
+                .cloned()
+        });
+
+    let selected_key = match args.as_slice() {
+        [] => {
+            // list: print every profile and return None so the current
+            // active stays — picking a row happens on the next /model call.
+            // (A TUI picker is a future affordance; today the list is text.)
+            let mut lines = String::from("/model — providers:");
+            for (k, p) in &settings.providers {
+                let mark = if Some(k) == current_key.as_ref() { " *" } else { "  " };
+                let base = p.base_url.as_deref().unwrap_or("(vendor default)");
+                lines.push_str(&format!("\n  {mark}{k}  proto={}  base={base}", p.protocol));
+            }
+            return Err(lines); // re-uses Err as "show this in the transcript"
+        }
+        [one] => one.to_string(),
+        _ => return Err("/model takes at most one argument: <provider>/<model>".into()),
+    };
+    let profile = settings.providers.get(&selected_key)
+        .ok_or_else(|| {
+            let known: Vec<&str> = settings.providers.keys().map(String::as_str).collect();
+            format!(
+                "no profile named '{selected_key}' (known: {})",
+                known.join(", ")
+            )
+        })?;
+    if Some(&selected_key) == current_key.as_ref() {
+        return Err(format!("already on {selected_key}"));
+    }
+
+    // Build the new Config from the chosen profile. We start from the
+    // vendor defaults (which base_url / model / protocol to use), then
+    // overlay what the profile pins. Args/env were already resolved
+    // into `cfg`, so we keep its effort / max_tokens / context_size /
+    // streaming / cache / thinking — the *behaviour* knobs survive a
+    // profile switch unchanged.
+    let mut new_cfg = cfg.clone();
+    new_cfg.protocol = protocol_of(&profile.protocol)
+        .ok_or_else(|| format!("unknown protocol '{}'", profile.protocol))?;
+    new_cfg.api_key = profile.api_key.clone();
+    new_cfg.base_url = profile
+        .base_url
+        .clone()
+        .or_else(|| new_cfg.protocol.default_base().map(str::to_owned))
+        .ok_or_else(|| format!("profile '{selected_key}' has no base_url and the vendor does not default one"))?;
+    // model id — derive from the profile key (the part after the slash)
+    let model_id = selected_key.split_once('/').map(|(_, m)| m.to_string())
+        .ok_or_else(|| format!("profile key '{selected_key}' is not '<provider>/<model>'"))?;
+    new_cfg.model = model_id;
+
+    // Close the current session: persist one last time so any agent turn
+    // in flight is on disk, then drop the in-memory convo. The file is
+    // already closed by Convo's Drop.
+    let mut c = match convo.try_lock() {
+        Ok(g) => g,
+        Err(_) => return Err("cannot switch profile while an agent turn is running — wait for it to finish (or /exit)".into()),
+    };
+    if let Err(e) = c.persist() {
+        return Err(format!("could not close current session: {e}"));
+    }
+    drop(c);
+
+    // Persist the new active. Loading+rewriting preserves any unknown
+    // future fields; if settings.json doesn't exist yet we create the
+    // bare structure.
+    let mut next_settings = settings;
+    next_settings.active = Some(selected_key.clone());
+    next_settings.save().map_err(|e| format!("save settings.json: {e}"))?;
+
+    // Open a fresh session under the new identity. The session module's
+    // `Session::new` is a fresh file under the project subdirectory;
+    // the previous file stays on disk under its own id.
+    let prov = crate::session::Provenance {
+        model: new_cfg.model.clone(),
+        protocol: new_cfg.protocol_label().into(),
+        base_url: new_cfg.base_url.clone(),
+    };
+    let new_session = crate::session::Session::new(&prov, crate::config::HISTORY_FORMAT);
+    let announce = format!(
+        "switched to {} (new session {})",
+        selected_key,
+        new_session.id()
+    );
+    let banner = match new_session.path() {
+        Some(p) => format!("session {} · {}", new_session.id(), p.display()),
+        None => format!("session {} · no home directory: this conversation stays in memory", new_session.id()),
+    };
+    let new_convo = crate::session::Convo::persistent(new_session, vec![]);
+    Ok(HandleOutcome::Switch { cfg: new_cfg, convo: new_convo, banners: vec![banner], announce })
+}
+
+/// Translate a protocol name string into the `Protocol` enum, falling
+/// through VENDORS so adding a vendor lands here without a touch.
+fn protocol_of(name: &str) -> Option<crate::api::Protocol> {
+    VENDORS.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, p)| *p)
+}
+
+/// Perform an update's side effect. `Submit` is fully consumed inside
+/// (the agent coroutine is spawned) and yields no outcome — the loop
+/// keeps its current cfg and convo. Slash commands on the input line
+/// resolve here too: dispatching `/model` returns `Switch` with the
+/// newly-built Config and Convo; the loop swaps them in.
 fn handle(
     action: Action,
     cfg: &Config,
     convo: &Arc<AsyncMutex<Convo>>,
     agent: &mut Option<Agent>,
     sink: &ChannelSink,
-) {
+) -> HandleOutcome {
     match action {
-        Action::None => {}
+        Action::None => HandleOutcome::None,
         Action::Cancel => {
             if let Some(a) = agent {
                 a.token.cancel();
             }
+            HandleOutcome::Cancel
         }
         Action::Submit(line) => {
+            // Slash commands share the input line with regular tasks —
+            // they never reach the agent. Dispatch first, and only fall
+            // through to a real submit when the line is just a task.
+            if let Some(cmd) = parse_slash(&line) {
+                return dispatch_slash(cmd, cfg, convo, sink);
+            }
             let cfg = cfg.clone();
             let convo = convo.clone();
             let token = Arc::new(crate::cancel::CancelToken::new());
@@ -673,6 +931,7 @@ fn handle(
                 sink.show(Msg::TaskEnd);
             });
             *agent = Some(Agent { token, job });
+            HandleOutcome::None
         }
     }
 }
@@ -1499,5 +1758,100 @@ mod tests {
         // the env flag alone flips the answer, regardless of stdout
         assert!(!wanted());
         if let Some(v) = prev { std::env::set_var("JINGWEI_NO_TUI", v); } else { std::env::remove_var("JINGWEI_NO_TUI"); }
+    }
+
+    // ---- slash command parser & dispatcher -----------------------------
+
+    #[test]
+    fn parse_slash_recognises_a_leading_slash() {
+        let cmd = parse_slash("/model foo bar").expect("slash line");
+        assert_eq!(cmd.name, "model");
+        assert_eq!(cmd.args, vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn parse_slash_returns_none_for_plain_text() {
+        // a normal task — not a slash command — must fall through to submit
+        assert!(parse_slash("count files").is_none());
+        assert!(parse_slash("").is_none());
+        // leading whitespace + a slash is still a slash command once
+        // trimmed; the user typing "/model" with accidental indent is
+        // a command, not a plain task. The test pins that the parser
+        // owns the trim, so dispatchers can rely on a clean prefix.
+        assert!(parse_slash("  /model").is_some());
+    }
+
+    #[test]
+    fn parse_slash_keeps_the_original_case_of_args() {
+        let cmd = parse_slash("/Model MINIMAX/M3").unwrap();
+        assert_eq!(cmd.name, "Model");
+        assert_eq!(cmd.args, vec!["MINIMAX/M3"]);
+    }
+
+    #[test]
+    fn slash_dispatch_unknown_command_yields_no_switch() {
+        // `/garbage` does not exist; the dispatcher surfaces a warning
+        // and returns None so the loop keeps its current cfg / convo.
+        let cfg = Config { api_key: "k".into(), base_url: "https://x".into(), model: "m".into(),
+            protocol: crate::api::Protocol::MINIMAX, cache: crate::api::CacheMode::Auto,
+            thinking: crate::api::Thinking::Preserve, effort: None,
+            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true };
+        let convo = Arc::new(AsyncMutex::new(crate::session::Convo::ephemeral()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        let cmd = SlashCmd { name: "garbage", args: vec![] };
+        let outcome = dispatch_slash(cmd, &cfg, &convo, &sink);
+        // we don't read the warning Note — the sink it would land on is
+        // a fake channel — but we pin the outcome, which is what the
+        // loop acts on.
+        assert!(matches!(outcome, HandleOutcome::None), "garbage must not switch");
+    }
+
+    #[test]
+    fn slash_help_announces_available_commands() {
+        let cfg = Config { api_key: "k".into(), base_url: "https://x".into(), model: "m".into(),
+            protocol: crate::api::Protocol::MINIMAX, cache: crate::api::CacheMode::Auto,
+            thinking: crate::api::Thinking::Preserve, effort: None,
+            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true };
+        let convo = Arc::new(AsyncMutex::new(crate::session::Convo::ephemeral()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        let cmd = SlashCmd { name: "help", args: vec![] };
+        let outcome = dispatch_slash(cmd, &cfg, &convo, &sink);
+        assert!(matches!(outcome, HandleOutcome::None));
+    }
+
+    #[test]
+    fn protocol_of_matches_case_insensitively() {
+        assert!(protocol_of("minimax").is_some());
+        assert!(protocol_of("MINIMAX").is_some());
+        assert!(protocol_of("Zai").is_some());
+        assert!(protocol_of("deepseek").is_some());
+        assert!(protocol_of("nope").is_none());
+    }
+
+    #[test]
+    fn slash_model_with_unknown_profile_yields_an_error_string() {
+        // No settings.json on disk → slash_model reports a clear error,
+        // returns HandleOutcome::None (no switch).
+        let _lock = crate::test_util::env_lock();
+        let _prev = std::env::var("HOME").ok();
+        let dir = crate::test_util::temp_dir("slash_unknown_profile");
+        std::env::set_var("HOME", dir);
+        // No settings file written — slash_model loads an empty Settings.
+        let cfg = Config { api_key: "k".into(), base_url: "https://x".into(), model: "m".into(),
+            protocol: crate::api::Protocol::MINIMAX, cache: crate::api::CacheMode::Auto,
+            thinking: crate::api::Thinking::Preserve, effort: None,
+            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true };
+        let convo = Arc::new(AsyncMutex::new(crate::session::Convo::ephemeral()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let _sink = ChannelSink::new(tx);
+        let r = slash_model(vec!["minimax/MiniMax-M3"], &cfg, &convo);
+        match r {
+            Err(e) => assert!(e.contains("no profile named"), "got: {e}"),
+            Ok(_) => panic!("must error without settings"),
+        }
+        // restore HOME so other tests are not affected
+        if let Some(v) = _prev { std::env::set_var("HOME", v); } else { std::env::remove_var("HOME"); }
     }
 }

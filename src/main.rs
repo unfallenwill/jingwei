@@ -344,7 +344,7 @@ async fn run() -> Result<()> {
     if interactive {
         // A terminal gets the TUI; pipes, tests, and one-shots get the log.
         return if tui::wanted() {
-            tui::run(&cfg, convo, banners).await
+            tui::run(cfg, convo, banners).await
         } else {
             plain::plain_repl(&cfg, convo, banners).await
         };

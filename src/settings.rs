@@ -98,14 +98,6 @@ impl Settings {
         Ok(())
     }
 
-    /// `true` when the on-disk file does not exist (or home is unknown).
-    pub(crate) fn missing() -> bool {
-        match Self::path() {
-            None => true,
-            Some(p) => !p.exists(),
-        }
-    }
-
     /// Remove the on-disk file. Errors when home is unknown or the file
     /// is missing — those are user-visible "cannot reset" conditions.
     pub(crate) fn reset() -> Result<()> {

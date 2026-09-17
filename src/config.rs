@@ -219,6 +219,11 @@ TUI (interactive, on a terminal):
     in the review view: ↑↓/j/k, PgUp/PgDn, g/G scroll
     Ctrl-C              interrupt the running task (twice: exit) · /exit
                         or Ctrl-D quit
+    /model [<key>]       switch the active profile — <key> is <provider>/<model>
+                        from ~/.jingwei/settings.json; bare /model lists. A
+                        switch closes the current session file and opens a
+                        new one under the same project subdirectory.
+    /help                list slash commands
     JINGWEI_NO_TUI=1    log-style REPL instead of the TUI
 
 EXAMPLES:
