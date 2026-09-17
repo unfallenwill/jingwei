@@ -167,13 +167,14 @@ pub fn pane(app: &App, w: u16, h: u16) -> Pane {
     for _ in lines.len()..app.status.pane_floor {
         lines.push(Line::from(""));
     }
-    lines.push(rule(w));
-    // The slash-command menu hangs between the top rule and the input
-    // block. No menu — the gap collapses as before. When the menu is
-    // up, the input stays at its row and the menu grows upward.
+    // The slash-command menu hangs above the top rule — between the
+    // live area (think tail, partial, padding) and the input frame.
+    // The input row stays at its row; the menu just overlays the rows
+    // above the frame, so the frame around the input never grows.
     if let Some(c) = &app.completion {
         lines.extend(menu_rows(c, w));
     }
+    lines.push(rule(w));
 
     let cursor = match &app.status.task {
         // while a task runs, one locked row shows the task; no caret
@@ -637,15 +638,28 @@ fn note_style(bg: (u8, u8, u8), err: bool) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::super::model::App;
+    use super::super::model::{App, CompletionItem, CompletionKind};
     use crate::display::Usage;
-    use super::super::update::{update, Ev, Action};
+    use super::super::update::{set_completion, dismiss_completion, update, Ev, Action};
     use super::*;
     use crate::display::Msg;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, KeyEventKind, KeyEventState};
 
     /// The width bar_text was pinned against before it learned the pane's.
     const BAR_W: usize = 76;
+
+    /// A handful of slash commands the menu renders one-per-row. Used to
+    /// exercise the layout (where the menu lands relative to the frame)
+    /// without touching settings or the hub.
+    fn fake_completion_candidates() -> Vec<CompletionItem> {
+        vec![
+            CompletionItem { insert: "exit".into(),  label: "/exit".into(),  description: "leave".into(),                trailing_space: false },
+            CompletionItem { insert: "quit".into(),  label: "/quit".into(),  description: "leave".into(),                trailing_space: false },
+            CompletionItem { insert: "model".into(), label: "/model".into(), description: "switch profile".into(),       trailing_space: true  },
+            CompletionItem { insert: "mcp".into(),   label: "/mcp".into(),   description: "manage servers".into(),       trailing_space: true  },
+            CompletionItem { insert: "help".into(),  label: "/help".into(),  description: "show this menu".into(),       trailing_space: false },
+        ]
+    }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> Ev {
         Ev::Key(KeyEvent { code, modifiers: mods, kind: KeyEventKind::Press, state: KeyEventState::NONE })
@@ -920,6 +934,42 @@ mod tests {
         let locked = &texts[texts.len() - 3];
         assert!(locked.starts_with("❯ busy …"), "multi-line task locks one row: {locked:?}");
         assert!(p.cursor.is_none(), "no caret while the row is locked");
+    }
+
+    #[test]
+    fn menu_hangs_above_the_top_rule_and_leaves_the_frame_in_place() {
+        // The slash-command menu grows the pane upward, not between the
+        // rules — so the frame around the input (top rule + input row +
+        // bottom rule + bar) sits at the same rows whether the menu is
+        // up or not. What was "the input row pushed open by the menu" is
+        // now "the menu just added rows above the top rule".
+        let mut a = App::new();
+        type_str(&mut a, "/");
+        set_completion(&mut a, CompletionKind::Command, "", fake_completion_candidates());
+        let open = texts_of(&pane(&a, 80, 24).lines);
+        // p.lines = [...menu rows..., top_rule, input, bottom_rule, bar]
+        let input_row_open = open.len() - 3;
+        let top_rule_open = open.len() - 4;
+        let menu_rows_open = top_rule_open;
+        assert!(menu_rows_open >= 1, "at least one menu row is showing: {open:?}");
+        // the rows above the top rule are menu rows — the first carries the
+        // highlight glyph, the rest the dimmed gutter
+        assert!(open[0].starts_with("▸ "), "the first menu row is the highlighted one: {open:?}");
+        for t in &open[1..menu_rows_open] {
+            assert!(t.starts_with("  "), "non-selected menu rows carry the dim gutter: {t:?}");
+            assert!(!t.starts_with("─────"), "the top rule only follows the menu: {t:?}");
+        }
+        assert!(open[top_rule_open].starts_with("─────"), "the top rule still frames the input: {open:?}");
+        assert!(open[input_row_open].starts_with('❯'), "the input row carries the prompt under the rule: {open:?}");
+        assert!(open[open.len() - 2].starts_with("─────"), "the bottom rule stays one row above the bar: {open:?}");
+
+        // Esc dismisses the menu — the frame is back at the bottom of the pane.
+        dismiss_completion(&mut a);
+        let closed = texts_of(&pane(&a, 80, 24).lines);
+        assert_eq!(closed.len(), 4, "without the menu, the pane is the bare frame: {closed:?}");
+        assert_eq!(closed[0], open[top_rule_open], "the top rule moved from row {top_rule_open} to row 0");
+        assert_eq!(closed[1], open[input_row_open], "the input row is the same content, just higher up");
+        assert!(closed[2].starts_with("─────"), "bottom rule: {closed:?}");
     }
 
     #[test]
