@@ -10,24 +10,14 @@
 // races against the child's pipe drains as races against the agent loop's
 // between-turn wait, because they are the same coroutine.
 
+use crate::api::blocking;
 use crate::cancel::CancelToken;
-use crate::tools::dispatch;
+use crate::tools::{bash_output, dispatch};
 use serde_json::Value;
 use std::io::Read;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 use tokio::sync::mpsc;
-
-/// Combined-output shape shared by the blocking registry tool and the
-/// cancellable coroutine version below.
-fn bash_output(status: Option<&ExitStatus>, out: &str, err: &str) -> String {
-    let mut s = format!("exit={}\n{out}", status.and_then(|st| st.code()).unwrap_or(-1));
-    if !err.is_empty() {
-        if !s.ends_with('\n') { s.push('\n'); }
-        s.push_str(err);
-    }
-    s
-}
 
 /// A child's pipe, drained on its own thread. Chunks stream back over an
 /// *async* channel — not one final buffer — so partial output survives even
@@ -115,7 +105,21 @@ pub(crate) async fn run_bash(command: &str, token: &CancelToken) -> String {
             Ok(None) => {}
             Err(e) => return format!("error: {e}"),
         }
-        if killed { break child.wait().ok(); } // kill sent: this returns promptly
+        if killed {
+            // Reap the killed child on the blocking pool: `Child::wait`
+            // is a synchronous stdlib call and would otherwise freeze
+            // this coroutine — and with it the single-thread tokio
+            // scheduler the runtime runs on. The cancellation that
+            // triggered the kill already raced us here; we just want
+            // the ExitStatus without paying for it on the runtime
+            // thread. The blocking pool handles the wait; the
+            // cancel token can still interrupt the await. A second
+            // cancellation landing while we reap surfaces as
+            // `Err(Error::Interrupted)`, which we collapse to `None`
+            // and let the post-loop `killed` check turn into the
+            // "[interrupted by user]" note.
+            break blocking(token, move || Ok(child.wait().ok())).await.unwrap_or_default();
+        }
         // The wait itself is a suspension point — a sleep raced against
         // cancellation, so waiting for the child is interruptible too.
         tokio::select! {
@@ -137,6 +141,12 @@ pub(crate) async fn run_bash(command: &str, token: &CancelToken) -> String {
 /// Execute one tool call inside the agent coroutine. bash is cancellable (its
 /// child process is killed); the file tools are quick, run on the blocking
 /// pool, and are simply abandoned if cancellation wins the race.
+///
+/// Cancellation formats are deliberately different — the model can tell
+/// what happened from the prefix alone: bash preserves whatever output
+/// had already arrived (so the marker sits *after* the bytes, and reads
+/// like a note the tool appended) while the file tools had no partial
+/// output to keep (so the whole tool result is a single line saying so).
 pub(crate) async fn run_tool(name: &str, input: &Value, token: &CancelToken) -> String {
     if name == "bash" {
         return run_bash(input["command"].as_str().unwrap_or(""), token).await;
@@ -146,14 +156,16 @@ pub(crate) async fn run_tool(name: &str, input: &Value, token: &CancelToken) -> 
     let job = tokio::task::spawn_blocking(move || dispatch(&name, &input));
     tokio::select! {
         out = job => out.unwrap_or_else(|e| format!("error: {e}")),
-        _ = token.cancelled() => "error: interrupted by user".into(),
+        _ = token.cancelled() => "[interrupted by user]".into(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::bash_output;
     use crate::test_util::block_on;
+    use std::process::ExitStatus;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -378,5 +390,20 @@ mod tests {
             run_tool("bash", &serde_json::json!({"command": "sleep 30"}), &token).await
         });
         assert!(out.contains("[interrupted by user]"), "got: {out}");
+    }
+
+    #[test]
+    fn run_tool_non_bash_cancellation_returns_the_marker() {
+        // the non-bash path's select races the spawn_blocking against
+        // the cancel — a pre-cancelled token always wins. The marker is
+        // the same word bash uses, so the model sees one shape for "this
+        // turn did not finish" no matter which tool ran.
+        let token = Arc::new(CancelToken::new());
+        token.cancel();
+        let out = block_on(async {
+            run_tool("write_file", &serde_json::json!({"path": "/tmp/jingwei_cancel_marker", "content": "x"}), &token).await
+        });
+        assert_eq!(out, "[interrupted by user]",
+            "non-bash cancellation uses the bash marker: {out}");
     }
 }

@@ -169,16 +169,19 @@ pub fn is_exit(line: &str) -> bool {
     line.trim() == EXIT_COMMAND
 }
 
-/// Should we color at all? Honors `NO_COLOR`/`JINGWEI_NO_COLOR`, requires a
-/// terminal, and `JINGWEI_COLOR=always|1|true` forces color on (useful when
-/// jingwei's output rides a pipe into a color-aware pager).
+/// Should we color at all? Honors `NO_COLOR`/`JINGWEI_NO_COLOR`, gates
+/// on `stderr` being a terminal (the only stream `paint` writes to —
+/// the fatal-error banner in `main`), and `JINGWEI_COLOR=always|1|true`
+/// forces color on (useful when stderr rides a pipe into a color-aware
+/// pager). `stdout` is intentionally not in the gate: this function is
+/// about one specific banner, and a tty-stderr / piped-stdout layout
+/// should still paint a coloured fatal line.
 pub fn color_on() -> bool {
     if matches!(env::var("JINGWEI_COLOR").as_deref(), Ok("always" | "1" | "true")) {
         return true;
     }
     env::var_os("NO_COLOR").is_none()
         && env::var_os("JINGWEI_NO_COLOR").is_none()
-        && io::stdout().is_terminal()
         && io::stderr().is_terminal()
 }
 

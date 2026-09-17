@@ -149,15 +149,20 @@ fn ask_optional(output: &mut dyn Write, input: &mut dyn BufRead, prompt: &str, h
 }
 
 /// Like `ask`, but turns off echo on stdin so the API key is not
-/// reflected back to the terminal. Reads from stdin directly —
-/// `BufRead` (a trait object the wizard hands around) does not carry
-/// an fd of its own, so the termios dance has to operate on the real
-/// Stdin. The test path goes through `ask_test_secret`, which skips
-/// the echo toggle.
+/// reflected back to the terminal. Reads from `input` (the wizard's
+/// `&mut dyn BufRead`, which is a `StdinLock` in production) — going
+/// through `io::stdin()` directly would deadlock on stdin's internal
+/// `Mutex`: `StdinLock` holds that mutex for its lifetime, and
+/// `Stdin::read_line` re-acquires it, so the second acquisition never
+/// returns. The termios toggle only needs the fd number, which we
+/// pull from `io::stdin().as_raw_fd()` (a constant `STDIN_FILENO` that
+/// doesn't touch the mutex). The test path skips the echo toggle
+/// entirely — `input` is a `Cursor` over a script of lines, with no
+/// real terminal to talk to.
 #[cfg(not(test))]
-fn ask_secret(prompt: &str) -> Result<String> {
-    print!("{prompt}: ");
-    io::stdout().flush().map_err(|e| Error::Msg(format!("flush: {e}")))?;
+fn ask_secret_api_key(output: &mut dyn Write, input: &mut dyn BufRead, prompt: &str) -> Result<String> {
+    write!(output, "{prompt}: ")?;
+    output.flush().map_err(|e| Error::Msg(format!("flush: {e}")))?;
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -165,14 +170,14 @@ fn ask_secret(prompt: &str) -> Result<String> {
         // piped / redirected stdin: tcgetattr fails with ENOTTY → fall through
         if unsafe { turn_echo_off(fd) }.is_ok() {
             let mut buf = String::new();
-            let res = io::stdin().read_line(&mut buf);
+            let res = input.read_line(&mut buf);
             let _ = unsafe { turn_echo_on(fd) };
             println!();
             return res.map(|_| buf.trim().to_string()).map_err(|e| Error::Msg(format!("read: {e}")));
         }
     }
     let mut buf = String::new();
-    io::stdin().read_line(&mut buf).map_err(|e| Error::Msg(format!("read: {e}")))?;
+    input.read_line(&mut buf).map_err(|e| Error::Msg(format!("read: {e}")))?;
     Ok(buf.trim().to_string())
 }
 
@@ -186,11 +191,6 @@ fn ask_secret_api_key(output: &mut dyn Write, input: &mut dyn BufRead, prompt: &
     let mut buf = String::new();
     input.read_line(&mut buf).map_err(|e| Error::Msg(format!("read: {e}")))?;
     Ok(buf.trim().to_string())
-}
-
-#[cfg(not(test))]
-fn ask_secret_api_key(_output: &mut dyn Write, _input: &mut dyn BufRead, prompt: &str) -> Result<String> {
-    ask_secret(prompt)
 }
 
 #[cfg(all(unix, not(test)))]

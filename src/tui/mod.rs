@@ -906,6 +906,20 @@ fn handle(
             if let Some(cmd) = parse_slash(&line) {
                 return dispatch_slash(cmd, cfg, convo, sink);
             }
+            // The narrow race: the agent's `Msg::TaskBegin` rides the
+            // channel back to update `app.working()`; between sending
+            // it and the loop reading it, the user could press Enter
+            // again — the agent Option already holds a live job, and
+            // spawning a second one would orphan the first. Two
+            // coroutines then race the convo lock and both push into
+            // history; the file would be torn. Refuse instead.
+            if agent.is_some() {
+                sink.show(Msg::Note {
+                    sev: Sev::Warn,
+                    text: " a task is already running — wait for it to finish or Ctrl-C to cancel ".into(),
+                });
+                return HandleOutcome::None;
+            }
             let cfg = cfg.clone();
             let convo = convo.clone();
             let token = Arc::new(crate::cancel::CancelToken::new());
@@ -1520,8 +1534,8 @@ mod tests {
         let cells = row_cells(&buf, 0);
         let xs: Vec<u16> = cells.iter().map(|(x, _, _)| *x).collect();
         // two wide glyphs: emitted at x=0 (width 2), then x=2 (width 2)
-        assert!(!xs.iter().any(|x| *x == 1), "the trailing half of 精 is skipped");
-        assert!(!xs.iter().any(|x| *x == 3), "the trailing half of 卫 is skipped");
+        assert!(!xs.contains(&1), "the trailing half of 精 is skipped");
+        assert!(!xs.contains(&3), "the trailing half of 卫 is skipped");
         assert!(xs.contains(&0) && xs.contains(&2));
     }
 
@@ -1636,6 +1650,54 @@ mod tests {
     }
 
     // ---- Agent::reap: panic becomes a visible note ------------------------
+
+    #[test]
+    fn handle_submit_refuses_when_an_agent_is_already_running() {
+        // the narrow race window: a first Submit spawned an agent; a
+        // second Submit arriving before the channel carries TaskBegin
+        // back to the state must not orphan the first one. The first
+        // agent slot is preserved, the second Submit emits a warning
+        // and returns None.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        let cfg = crate::config::Config {
+            api_key: "k".into(), base_url: "http://127.0.0.1:1".into(), model: "m".into(),
+            protocol: crate::api::Protocol::MINIMAX,
+            cache: crate::api::CacheMode::Auto,
+            thinking: crate::api::Thinking::Preserve,
+            effort: None,
+            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+        };
+        let convo = Arc::new(AsyncMutex::new(Convo::ephemeral()));
+        // a pre-existing agent slot, as if the first Submit had already
+        // run and the spawned coroutine were still in flight
+        let mut agent: Option<Agent> = None;
+        let first_token = Arc::new(crate::cancel::CancelToken::new());
+        crate::test_util::block_on(async {
+            // spawn inside a runtime: the second handle() call also lives
+            // inside the block_on so any tasks it spawns have a home
+            let first_job = tokio::spawn(async {});
+            agent = Some(Agent { token: first_token.clone(), job: first_job });
+            handle(Action::Submit("second task".into()), &cfg, &convo, &mut agent, &sink);
+        });
+        // the original agent is still there — same token, not replaced
+        assert!(agent.is_some());
+        assert_eq!(Arc::as_ptr(&agent.as_ref().unwrap().token), Arc::as_ptr(&first_token));
+        // and a warning landed in the sink, naming the cause
+        let mut saw_warn = false;
+        while let Ok(m) = rx.try_recv() {
+            if let Msg::Note { sev: Sev::Warn, ref text } = m {
+                assert!(text.contains("already running"), "warn text: {text}");
+                saw_warn = true;
+            }
+        }
+        assert!(saw_warn, "the refused submit must surface a warning");
+        // tidy up
+        if let Some(a) = agent {
+            a.token.cancel();
+            a.job.abort();
+        }
+    }
 
     #[test]
     fn agent_reap_surfaces_a_panicking_join_as_an_error_note() {

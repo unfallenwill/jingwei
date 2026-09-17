@@ -268,7 +268,14 @@ pub(crate) fn sse_channel(resp: ureq::Response) -> mpsc::Receiver<String> {
     rx
 }
 
-async fn blocking<T, F>(token: &CancelToken, f: F) -> Result<T>
+/// Run a synchronous closure on the blocking pool with the same
+/// cancellation shape the streaming callers already use: the work
+/// runs on a worker thread, the await is a real suspension point, and
+/// the token races it so a Ctrl-C mid-reap returns `Interrupted`
+/// instead of blocking the await. Shared between the api transport
+/// (where every HTTP body lives) and the bash tool (where reaping
+/// the killed child would otherwise freeze the single-thread runtime).
+pub(crate) async fn blocking<T, F>(token: &CancelToken, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,

@@ -10,6 +10,7 @@
 // map. The migration lives in `migrate_v1_to_v2` so older settings keep
 // working — the field set is the only thing that moved.
 
+use crate::api::{Protocol, VENDORS};
 use crate::file_io::write_atomic;
 use crate::{Error, Result};
 use serde_json::{json, Value};
@@ -63,7 +64,8 @@ impl Settings {
     }
 
     /// Find the active profile, or the only one if `active` is unset —
-    /// the latter covers a freshly-migrated v1 file that named no active.
+    /// the latter covers a hand-edited file with one surviving profile
+    /// and no `active` key (the v1 migration always sets one).
     pub(crate) fn active_profile(&self) -> Option<(&str, &Profile)> {
         if let Some(k) = &self.active {
             return self.providers.get_key_value(k).map(|(k, v)| (k.as_str(), v));
@@ -210,8 +212,10 @@ pub(crate) struct ActiveArgs {
 }
 
 fn redact(s: &str) -> String {
-    if s.len() <= 4 { return "****".into(); }
-    // keep the last 4 chars so the user can tell keys apart at a glance
+    // keep the last 4 chars when there are any, so the user can tell
+    // keys apart at a glance — only fully obscure the very short ones
+    // where any tail would reveal the key
+    if s.len() < 4 { return "****".into(); }
     let tail = &s[s.len() - 4..];
     format!("****{tail}")
 }
@@ -223,7 +227,10 @@ fn parse_v2(v: &Value) -> Result<Settings> {
     let mut s = Settings::empty();
     if let Some(a) = v.get("active").and_then(Value::as_str) { s.active = Some(a.to_string()); }
     if let Some(e) = v.get("effort").and_then(Value::as_str) { s.effort = Some(e.to_string()); }
-    if let Some(m) = v.get("max_tokens").and_then(Value::as_u64) { s.max_tokens = Some(m as u32); }
+    if let Some(m) = v.get("max_tokens").and_then(Value::as_u64) {
+        s.max_tokens = Some(u32::try_from(m).map_err(|_| Error::Msg(
+            format!("settings.json: max_tokens {m} does not fit in u32")))?);
+    }
     if let Some(c) = v.get("context_size").and_then(Value::as_u64) { s.context_size = Some(c); }
     let providers = v.get("providers").and_then(Value::as_object).ok_or_else(|| {
         Error::Msg("settings.json: missing `providers` map".into())
@@ -233,6 +240,14 @@ fn parse_v2(v: &Value) -> Result<Settings> {
         s.providers.insert(k.clone(), p);
     }
     Ok(s)
+}
+
+/// Resolve a protocol name string into the `Protocol` newtype, falling
+/// through VENDORS so adding a vendor lands here without a touch. Used
+/// by the v1 migration to look up the current default model for a
+/// vendor the legacy file named by name.
+fn protocol_of(name: &str) -> Option<Protocol> {
+    VENDORS.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, p)| *p)
 }
 
 fn parse_profile(v: &Value) -> Result<Profile> {
@@ -259,14 +274,17 @@ fn parse_v1_then_migrate(v: &Value) -> Result<Settings> {
     if api_key.is_empty() {
         return Err(Error::Msg("settings.json (v1): missing `api_key` — cannot migrate".into()));
     }
-    // Fall back to a vendor-default model so the key has a value; the
-    // active profile's model is whatever was on disk.
+    // Fall back to the vendor's current default model so the key has a
+    // value; the active profile's model is whatever was on disk. Reading
+    // from the api port keeps this in lock-step with the live vendor —
+    // the migration does not carry its own copy of the flagship names.
     let model = if model.is_empty() {
-        match protocol.as_str() {
-            "minimax" => "MiniMax-M3".to_string(),
-            "zai" => "glm-5.3-flash".to_string(),
-            _ => "deepseek-chat".to_string(),
-        }
+        protocol_of(&protocol)
+            .and_then(|p| p.default_model().map(str::to_owned))
+            .unwrap_or_else(|| match protocol.as_str() {
+                "deepseek" => "deepseek-chat".to_string(),
+                other => format!("{other}-model"),
+            })
     } else { model };
     let key = format!("{protocol}/{model}");
     let mut providers = BTreeMap::new();
@@ -275,7 +293,11 @@ fn parse_v1_then_migrate(v: &Value) -> Result<Settings> {
         active: Some(key),
         providers,
         effort: v.get("effort").and_then(Value::as_str).map(str::to_string),
-        max_tokens: v.get("max_tokens").and_then(Value::as_u64).map(|n| n as u32),
+        max_tokens: match v.get("max_tokens").and_then(Value::as_u64) {
+            Some(n) => Some(u32::try_from(n).map_err(|_| Error::Msg(
+                format!("settings.json (v1): max_tokens {n} does not fit in u32")))?),
+            None => None,
+        },
         context_size: v.get("context_size").and_then(Value::as_u64),
     })
 }
@@ -483,6 +505,59 @@ mod tests {
         assert!(!d.contains("1234567890"), "tail not visible: {d}");
         let d = s.describe(true);
         assert!(d.contains("sk-1234567890abcdef"), "reveal shows it: {d}");
+    }
+
+    #[test]
+    fn redact_keeps_the_tail_for_keys_at_or_above_four_chars() {
+        // the visible tail is what lets the user tell two similarly-
+        // named keys apart — a 4-char key just barely qualifies.
+        assert_eq!(redact("abcd"), "****abcd", "exactly four: tail visible");
+        assert_eq!(redact("xyz9"), "****xyz9");
+        assert_eq!(redact("ab"), "****", "too short: nothing visible");
+        assert_eq!(redact(""), "****");
+    }
+
+    #[test]
+    fn max_tokens_overflow_is_rejected_not_silently_truncated() {
+        // the old `as u32` path would turn 99999999999 into 1215752191
+        // and save that as if it were correct — a quiet data-corruption
+        // bug. The fix surfaces it with a name in the error.
+        let v = serde_json::json!({
+            "$schema_version": 2,
+            "active": "minimax/m",
+            "providers": { "minimax/m": {"protocol": "minimax", "api_key": "k", "base_url": null} },
+            "max_tokens": 9_999_999_999u64,
+        });
+        let err = super::parse_v2(&v).unwrap_err().to_string();
+        assert!(err.contains("max_tokens"), "field is named: {err}");
+        assert!(err.contains("u32"), "the kind of overflow: {err}");
+        // and the boundary itself stays well-formed
+        let v_ok = serde_json::json!({
+            "$schema_version": 2,
+            "active": "minimax/m",
+            "providers": { "minimax/m": {"protocol": "minimax", "api_key": "k", "base_url": null} },
+            "max_tokens": u32::MAX,
+        });
+        let s = super::parse_v2(&v_ok).unwrap();
+        assert_eq!(s.max_tokens, Some(u32::MAX));
+    }
+
+    #[test]
+    fn v1_migration_uses_the_vendors_current_default_model() {
+        // the migration reads Protocol::default_model() — adding a vendor
+        // or moving its flagship lands here without a touch. The deepseek
+        // path keeps a literal fallback (api has no default for it), and
+        // the unknown-protocol path stays sane.
+        let _lock = crate::test_util::env_lock();
+        let dir = temp_dir("settings_migrate_default_model");
+        let _home = HomeGuard::set(&dir);
+        let v1 = r#"{ "api_key": "sk-x", "protocol": "zai" }"#;
+        std::fs::create_dir_all(Settings::path().unwrap().parent().unwrap()).unwrap();
+        std::fs::write(Settings::path().unwrap(), v1).unwrap();
+        let s = Settings::load().unwrap();
+        let key = s.active.as_deref().unwrap();
+        assert_eq!(key, format!("zai/{}", crate::api::Protocol::ZAI.default_model().unwrap()),
+            "the migration names the live vendor default, not a stale string");
     }
 }
 
