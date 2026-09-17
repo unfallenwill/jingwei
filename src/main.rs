@@ -751,44 +751,8 @@ mod tests {
 
     // ---- coroutine cancellation ----
 
-    #[test]
-    fn cancel_token_flips_and_wakes_a_suspended_coroutine() {
-        block_on(async {
-            let token = Arc::new(CancelToken::new());
-            assert!(!token.is_cancelled());
-            let t = token.clone();
-            tokio::task::spawn_blocking(move || {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                t.cancel();
-            });
-            token.cancelled().await; // suspends until the other thread cancels
-            assert!(token.is_cancelled());
-            token.cancelled().await; // already cancelled: resolves immediately
-        });
-    }
-
-    #[test]
-    fn bash_coroutine_is_killed_by_cancellation() {
-        let cmd = if cfg!(windows) {
-            "echo started & ping -n 30 127.0.0.1 > nul"
-        } else {
-            "echo started; sleep 30"
-        };
-        let start = std::time::Instant::now();
-        let out = block_on(async {
-            let token = Arc::new(CancelToken::new());
-            let t = token.clone();
-            tokio::task::spawn_blocking(move || {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                t.cancel();
-            });
-            run_bash(cmd, &token).await
-        });
-        assert!(out.contains("[interrupted by user]"), "got: {out}");
-        assert!(out.contains("started"), "partial output must survive: {out}");
-        assert!(start.elapsed() < std::time::Duration::from_secs(10),
-            "a 30s command was cancelled; took {:?}", start.elapsed());
-    }
+    // bash kill/cancel tests live in tool_runtime::tests (the natural
+    // home for them) with tighter timing ceilings.
 
     #[test]
     fn agent_loop_interrupted_mid_stream_keeps_history_valid() {
@@ -855,38 +819,8 @@ mod tests {
         assert_eq!(hist(&history)[2]["content"][0]["tool_use_id"], json!("t1"));
     }
 
-    /// Regression: a grandchild holding the pipes (backgrounded process,
-    /// daemon) must not be able to wedge the coroutine when the user
-    /// interrupts. Runs the coroutine on its own thread and cancels from
-    /// outside; a hang is reported by the timeout, not the test runner.
-    #[test]
-    fn bash_cancel_with_grandchild_holding_pipe() {
-        // sh exits immediately; the backgrounded sleep keeps stdout open.
-        let cmd = if cfg!(windows) {
-            "echo started & start /b ping -n 30 127.0.0.1 > nul"
-        } else {
-            "sleep 30 & echo started"
-        };
-        let token = Arc::new(CancelToken::new());
-        let t = token.clone();
-        let (tx, done) = std::sync::mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all().build().unwrap();
-            let out = rt.block_on(run_bash(cmd, &t));
-            let _ = tx.send(out);
-        });
-        std::thread::sleep(Duration::from_millis(500)); // let the child exit
-        token.cancel();                                  // the user hits Ctrl-C
-        match done.recv_timeout(Duration::from_secs(5)) {
-            Ok(out) => {
-                assert!(out.contains("started"), "got: {out}");
-                assert!(out.contains("[interrupted by user]"), "got: {out}");
-            }
-            Err(_) => panic!("coroutine wedged: cancellation never reached run_bash — \
-                collect() must suspend, not block the scheduler thread"),
-        }
-    }
+    // bash+grandchild test lives in tool_runtime::tests; see cmd/conn
+    // there for a deeper timeout note.
 
     #[test]
     fn error_display() {
@@ -952,12 +886,27 @@ mod tests {
     // ---- Error: the type's display & conversions -------------------------
 
     #[test]
-    fn error_display_strings_for_every_variant() {
-        // the four Display arms not covered elsewhere
-        assert_eq!(format!("{}", Error::Json(serde_json::from_str::<u32>("abc").unwrap_err())),
-            serde_json::from_str::<u32>("abc").unwrap_err().to_string());
-        assert_eq!(format!("{}", Error::Io(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))),
-            "denied");
+    fn error_display_strings_are_actually_distinct() {
+        // each variant has its own Display shape — the test pins them
+        // so a refactor can't silently turn two variants into the same
+        // string (which would defeat the user's ability to tell what
+        // kind of failure they're looking at).
+        assert_eq!(format!("{}", Error::Interrupted), "interrupted");
+        // The passthrough variants delegate to their inner Display; the
+        // outer prefix is the variant's own word — we just check the
+        // inner value shows up verbatim, no "error: " or similar wrapper
+        // added by Error's Display.
+        let io = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert_eq!(format!("{}", Error::Io(io)), "denied");
+        // Error::Json's body is the inner error verbatim
+        let json_err = serde_json::from_str::<u32>("abc").unwrap_err();
+        let json_str = format!("{}", json_err);
+        assert_eq!(format!("{}", Error::Json(json_err)), json_str);
+        // Error::Msg shows the wrapped message verbatim
+        assert_eq!(format!("{}", Error::Msg("hi".into())), "hi");
+        // Error::Api prefix error shape: "api {code}: {body}"
+        assert_eq!(format!("{}", Error::Api(503, "unavailable".into())),
+            "api 503: unavailable");
     }
 
     #[test]

@@ -1167,25 +1167,48 @@ mod tests {
         let mut s = fake_stage(15, 4, 80, 24); // 15 + 2 + 4 = 21 <= 24
         let lines = vec![Line::from("hello"), Line::from("world")];
         s.flush(&lines).unwrap();
-        // no scroll: top moves below the new rows
+        // the pane sits below the new rows, with no scroll
         assert_eq!(s.top, 17);
-        assert!(String::from_utf8_lossy(&s.frame).contains("hello"));
-        assert!(String::from_utf8_lossy(&s.frame).contains("world"));
+        // no scroll bytes — flush_plan emitted NO line feeds
+        assert!(!String::from_utf8_lossy(&s.frame).contains('\r'),
+            "no scroll bytes on the wire: {:?}", s.frame);
+        // the rows landed in order, in place
+        let body = String::from_utf8_lossy(&s.frame);
+        let hello_at = body.find("hello").expect("hello painted");
+        let world_at = body.find("world").expect("world painted");
+        assert!(hello_at < world_at, "rows painted in order: {body:?}");
     }
 
     #[test]
     fn flush_scrolls_and_paints_when_the_screen_fills() {
-        // 30 rows into a screen 24 rows tall, pane 4 rows: must scroll
+        // 30 rows into a screen 24 rows tall, pane 4 rows: the plan must
+        // scroll the transcript under itself and paint every row exactly
+        // once, in order, with the pane still on-screen at the bottom.
         let mut s = fake_stage(20, 4, 80, 24);
-        let lines: Vec<Line<'static>> = (0..30).map(|i| Line::from(format!("r{i}"))).collect();
+        let lines: Vec<Line<'static>> = (0..30).map(|i| Line::from(format!("r{i:02}"))).collect();
         s.flush(&lines).unwrap();
-        // every line was painted exactly once: 30 distinct strings show up
         let body = String::from_utf8_lossy(&s.frame);
+        // every row painted exactly once, in order — no row missing,
+        // no row duplicated, no row out of order. ratatui emits a small
+        // reset-cursor escape after the last cell, so we don't require
+        // the cursor to land at end-of-string (that would couple us to
+        // ratatui's exact byte sequence).
+        let mut cursor = 0usize;
         for i in 0..30 {
-            assert!(body.contains(&format!("r{i}")), "line {i} must reach the frame");
+            let token = format!("r{i:02}");
+            let at = body[cursor..].find(&token)
+                .unwrap_or_else(|| panic!("line {i} (r{i:02}) not found after cursor {cursor}: {body:?}"));
+            cursor += at + token.len();
+            // the same row must NOT appear again after this point
+            assert!(body[cursor..].find(&token).is_none(),
+                "line {i} (r{i:02}) appears twice: {body:?}");
         }
-        // pane still fits
+        // pane still fits on screen
         assert!(s.top + s.height <= 24, "pane top {} + height {} > 24", s.top, s.height);
+        // at least one scroll step happened — the screen would have
+        // overflowed without one
+        let scroll_count = body.matches("\r\n").count();
+        assert!(scroll_count > 0, "screen overflow produced zero scrolls: {body:?}");
     }
 
     #[test]

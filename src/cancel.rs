@@ -59,15 +59,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_a_fresh_unset_token() {
-        let t: CancelToken = Default::default();
-        assert!(!t.is_cancelled(), "a default token is not cancelled");
-    }
-
-    #[test]
-    fn new_is_a_fresh_unset_token() {
-        let t = CancelToken::new();
-        assert!(!t.is_cancelled());
+    fn new_and_default_both_yield_an_uncancelled_token() {
+        // Default::default() delegates to Self::new(), so the two
+        // constructors are equivalent — one test covers both.
+        let direct = CancelToken::new();
+        let defaulted: CancelToken = Default::default();
+        assert!(!direct.is_cancelled());
+        assert!(!defaulted.is_cancelled());
     }
 
     #[test]
@@ -80,19 +78,33 @@ mod tests {
 
     #[test]
     fn clones_share_the_same_cancel_state() {
+        // the CancelToken holds Arc<AtomicBool> + Arc<Notify>; the derived
+        // Clone must produce another handle to the same state, not a
+        // separate one. We check both directions (cancel-from-original,
+        // cancel-from-clone) so a buggy manual Clone that pointed each
+        // clone at its own flag would fail.
         let a = CancelToken::new();
         let b = a.clone();
         a.cancel();
         assert!(b.is_cancelled(), "a clone sees the cancellation");
+        // also: cancelling through a clone flips the original's flag
+        let x = CancelToken::new();
+        let y = x.clone();
+        y.cancel();
+        assert!(x.is_cancelled(), "cancelling through a clone flips the original");
     }
 
     #[test]
     fn cancelled_returns_immediately_when_already_cancelled() {
+        // the `if self.is_cancelled() { return; }` short-circuit at the
+        // top of the loop: a token that was cancelled before the call
+        // must resolve without ever awaiting the Notify. 5ms is generous
+        // — the check is a single atomic load.
         let t = CancelToken::new();
         t.cancel();
         let started = std::time::Instant::now();
         crate::test_util::block_on(async { t.cancelled().await });
-        assert!(started.elapsed() < std::time::Duration::from_millis(50),
+        assert!(started.elapsed() < std::time::Duration::from_millis(5),
             "an already-cancelled token resolves immediately: {:?}", started.elapsed());
     }
 

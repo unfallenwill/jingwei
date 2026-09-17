@@ -159,11 +159,16 @@ mod tests {
 
     #[test]
     fn bash_coroutine_is_killed_by_cancellation() {
+        // The cancel arrives at 300ms; the child must be killed and the
+        // coroutine returned well before the 30-second sleep would
+        // naturally finish. A 2-second ceiling catches "didn't kill the
+        // child" and "killed it but the pipe drain hung" — both are
+        // real regressions. Anything under 2s is fast enough that the
+        // test stays in single-digit seconds.
         let token = Arc::new(CancelToken::new());
         let start = Instant::now();
         let out = block_on(async {
             let t = token.clone();
-            // Cancel from a separate blocking thread, like Ctrl-C would.
             tokio::task::spawn_blocking(move || {
                 std::thread::sleep(Duration::from_millis(300));
                 t.cancel();
@@ -171,7 +176,8 @@ mod tests {
             run_bash("echo started; sleep 30", &token).await
         });
         assert!(out.contains("[interrupted by user]"), "got: {out}");
-        assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+        assert!(start.elapsed() < Duration::from_secs(2),
+            "cancel at 300ms, kill+collect should finish well under 2s: {:?}", start.elapsed());
     }
 
     #[test]
@@ -277,33 +283,59 @@ mod tests {
 
     #[test]
     fn drain_pipe_returns_after_grace_when_eof_is_false_and_nothing_arrives() {
-        // drain_pipe without EOF and an empty source: collect waits a
-        // short grace and gives up, returning what little arrived
-        let mut d = drain_pipe(Some(feeder(vec![])));
+        // drain_pipe without EOF and a *hanging* source: collect waits
+        // the grace period and gives up, returning what little arrived.
+        // (An empty feeder EOFs immediately, so the sender drops and
+        // recv() returns None — that path is the EOF case, not the
+        // grace case.) PIPE_GRACE is 300ms; if it grows, this test
+        // pins the contract.
+        let mut d = drain_pipe(Some(hanging_reader()));
         let start = Instant::now();
         block_on(async {
             let got = d.collect(&CancelToken::new(), false).await;
             assert!(got.is_empty(), "nothing arrived: {got:?}");
         });
-        // PIPE_GRACE = 300ms; we allow a generous upper bound to dodge CI
-        assert!(start.elapsed() < Duration::from_secs(2), "grace was {:?} — should be near 300ms", start.elapsed());
+        let elapsed = start.elapsed();
+        // close to grace, not zero (we actually waited) and not 2x grace
+        assert!(elapsed >= Duration::from_millis(250),
+            "grace must wait: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(600),
+            "grace should be ~300ms, not unbounded: {elapsed:?}");
+    }
+
+    /// A Read that sleeps for 5 seconds and then returns EOF — keeps
+    /// the pipe open long enough that recv() never returns None, so the
+    /// grace timeout is the only thing that unblocks collect.
+    fn hanging_reader() -> impl Read + Send + 'static {
+        struct Hang(std::sync::Mutex<Option<std::io::Empty>>);
+        impl Read for Hang {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_secs(5));
+                // after the sleep, return EOF on the inner cursor
+                let mut e = self.0.lock().unwrap().take().unwrap();
+                e.read(_buf)
+            }
+        }
+        Hang(std::sync::Mutex::new(Some(std::io::empty())))
     }
 
     #[test]
-    fn drain_pipe_eof_collect_salvages_a_chunk_arriving_within_grace() {
-        // the eof=true branch: a chunk arrives on the channel while the
-        // cancel token is already tripped. The select lands on the cancel
-        // arm, then the grace window still pulls whatever the reader
-        // produced before EOF.
-        let mut d = drain_pipe(Some(feeder(b"late bytes".to_vec())));
+    fn drain_pipe_eof_collect_with_cancelled_token_returns_buffered_bytes() {
+        // the eof=true + pre-cancelled path: the select's cancel arm
+        // wins immediately, then the grace window pulls whatever the
+        // reader thread has already pushed. Sleep first so the
+        // synchronous feeder has time to deliver — without it the
+        // grace window can elapse before any byte is queued and the
+        // salvage path is never exercised.
+        let mut d = drain_pipe(Some(feeder(b"salvaged".to_vec())));
         let token = CancelToken::new();
         token.cancel();
         block_on(async {
+            // give the reader thread time to push bytes into the channel
+            tokio::time::sleep(Duration::from_millis(100)).await;
             let got = d.collect(&token, true).await;
-            // either we salvaged the chunk or the grace ran out — both
-            // are acceptable; the point is we returned, didn't hang
-            assert!(got == "late bytes" || got.is_empty(),
-                "got: {got:?} (cancel tripped before collect)");
+            assert_eq!(got, "salvaged",
+                "queued bytes must survive a pre-cancelled token: {got:?}");
         });
     }
 

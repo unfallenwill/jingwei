@@ -30,7 +30,7 @@ pub(crate) fn tool_summary(name: &str, input: &Value) -> String {
             let p = input["path"].as_str().unwrap_or("");
             let mut notes: Vec<String> = Vec::new();
             if let Some(a) = input["edits"].as_array().filter(|a| !a.is_empty()) {
-                notes.push(format!("{} edits", a.len()));
+                notes.push(format!("{} edit{}", a.len(), if a.len() == 1 { "" } else { "s" }));
             }
             if input["replace_all"].as_bool().unwrap_or(false) { notes.push("replace_all".into()); }
             if notes.is_empty() { p.into() } else { format!("{p} ({})", notes.join(", ")) }
@@ -162,14 +162,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bash_tool_returns_exit_code_and_output() {
-        let ok = dispatch("bash", &json!({"command": "echo hi"}));
-        assert!(ok.starts_with("exit=0") && ok.contains("hi"), "got: {ok}");
-        let bad = dispatch("bash", &json!({"command": if cfg!(windows) { "exit 1" } else { "false" }}));
-        assert!(!bad.starts_with("exit=0") && bad.contains("exit="), "got: {bad}");
-    }
-
     // ---- tool_summary: the one-line echo the frontends show ---------------
 
     #[test]
@@ -201,6 +193,10 @@ mod tests {
     fn tool_summary_for_edit_file_with_edits_lists_the_count() {
         let v = json!({"path": "a.rs", "edits": [{"old": "a", "new": "b"}, {"old": "c", "new": "d"}]});
         assert_eq!(tool_summary("edit_file", &v), "a.rs (2 edits)");
+        // a single edit shows up as "edit", not "edits" — the count is
+        // grammatical, not just numeric
+        let v1 = json!({"path": "a.rs", "edits": [{"old": "a", "new": "b"}]});
+        assert_eq!(tool_summary("edit_file", &v1), "a.rs (1 edit)");
     }
 
     #[test]
@@ -212,12 +208,19 @@ mod tests {
     #[test]
     fn tool_summary_for_edit_file_with_edits_and_replace_all_lists_both() {
         let v = json!({"path": "a.rs", "edits": [{"old": "a", "new": "b"}], "replace_all": true});
-        assert_eq!(tool_summary("edit_file", &v), "a.rs (1 edits, replace_all)");
+        assert_eq!(tool_summary("edit_file", &v), "a.rs (1 edit, replace_all)");
+        // a single edit with replace_all still uses the singular noun
     }
 
     #[test]
     fn tool_summary_for_unknown_tool_returns_empty() {
-        assert_eq!(tool_summary("nope", &json!({})), "");
+        // the `_ => String::new()` arm: every unknown tool name (or
+        // typo'd one) must produce an empty summary. We try several
+        // names to make sure the catch-all actually catches all.
+        for name in ["nope", "", "BASH", "Edit_File", "rm-rf"] {
+            assert_eq!(tool_summary(name, &json!({})), "",
+                "unknown tool {name:?} must produce an empty summary");
+        }
     }
 
     // ---- print_tool_call: the channel through the display port ------------

@@ -722,33 +722,73 @@ mod tests {
     // ---- the vendor rules: minimax/zai/deepseek accepts ------------------
 
     #[test]
-    fn minimax_accepts_anything_except_effort_with_strip_thinking() {
-        // the happy path
-        assert!(minimax_accepts(CacheMode::Auto, Thinking::Preserve, None).is_ok());
-        assert!(minimax_accepts(CacheMode::Active, Thinking::Preserve, None).is_ok());
+    fn minimax_accepts_only_refuses_effort_with_strip_thinking() {
+        // minimax's only rule: effort requires PreserveThinking. Cache
+        // mode is irrelevant on the Messages wire. The truth table is
+        // 2 cache × 2 thinking × 5 effort combinations; we cover the
+        // cases that would catch a swap of the condition.
+        // cache=Active, thinking=Preserve: every effort is fine
+        for e in [None, Some(Effort::Low), Some(Effort::Medium), Some(Effort::High), Some(Effort::Max)] {
+            assert!(minimax_accepts(CacheMode::Active, Thinking::Preserve, e).is_ok(),
+                "active+preserve+{e:?} should pass");
+        }
+        // cache=Auto, thinking=Strip: only None effort passes
         assert!(minimax_accepts(CacheMode::Auto, Thinking::Strip, None).is_ok());
-        // the only refusal: effort demands preserved thinking
-        assert!(minimax_accepts(CacheMode::Auto, Thinking::Strip, Some(Effort::High)).is_err());
         assert!(minimax_accepts(CacheMode::Auto, Thinking::Strip, Some(Effort::Low)).is_err());
+        assert!(minimax_accepts(CacheMode::Auto, Thinking::Strip, Some(Effort::Medium)).is_err());
+        assert!(minimax_accepts(CacheMode::Auto, Thinking::Strip, Some(Effort::High)).is_err());
+        assert!(minimax_accepts(CacheMode::Auto, Thinking::Strip, Some(Effort::Max)).is_err());
+        // cache=Auto, thinking=Preserve: every effort is fine
+        for e in [None, Some(Effort::Low), Some(Effort::Medium), Some(Effort::High), Some(Effort::Max)] {
+            assert!(minimax_accepts(CacheMode::Auto, Thinking::Preserve, e).is_ok(),
+                "auto+preserve+{e:?} should pass");
+        }
+        // cache=Active, thinking=Strip: same rule (cache is ignored)
+        assert!(minimax_accepts(CacheMode::Active, Thinking::Strip, None).is_ok());
+        assert!(minimax_accepts(CacheMode::Active, Thinking::Strip, Some(Effort::High)).is_err());
     }
 
     #[test]
     fn zai_rejects_active_cache_and_effort_with_strip() {
-        // cache active: refused
-        assert!(zai_accepts(CacheMode::Active, Thinking::Preserve, None).is_err());
-        // effort with strip: refused
-        assert!(zai_accepts(CacheMode::Auto, Thinking::Strip, Some(Effort::Medium)).is_err());
-        // happy path: cache auto + preserved thinking + no effort
-        assert!(zai_accepts(CacheMode::Auto, Thinking::Preserve, None).is_ok());
-        // effort with preserved thinking is allowed
-        assert!(zai_accepts(CacheMode::Auto, Thinking::Preserve, Some(Effort::High)).is_ok());
+        // zai: cache=Active is always refused; otherwise the same
+        // effort+strip rule as minimax.
+        // cache=Active: every combo is refused
+        for (t, e) in [(Thinking::Preserve, None), (Thinking::Strip, None),
+                       (Thinking::Preserve, Some(Effort::High)),
+                       (Thinking::Strip, Some(Effort::Low))] {
+            assert!(zai_accepts(CacheMode::Active, t, e).is_err(),
+                "active+{t:?}+{e:?} should fail");
+        }
+        // cache=Auto, thinking=Preserve: every effort is fine
+        for e in [None, Some(Effort::Low), Some(Effort::Medium), Some(Effort::High), Some(Effort::Max)] {
+            assert!(zai_accepts(CacheMode::Auto, Thinking::Preserve, e).is_ok(),
+                "auto+preserve+{e:?} should pass");
+        }
+        // cache=Auto, thinking=Strip: only None effort passes
+        assert!(zai_accepts(CacheMode::Auto, Thinking::Strip, None).is_ok());
+        for e in [Some(Effort::Low), Some(Effort::Medium), Some(Effort::High), Some(Effort::Max)] {
+            assert!(zai_accepts(CacheMode::Auto, Thinking::Strip, e).is_err(),
+                "auto+strip+{e:?} should fail");
+        }
     }
 
     #[test]
     fn deepseek_rejects_active_cache_and_effort_with_strip() {
-        assert!(deepseek_accepts(CacheMode::Active, Thinking::Preserve, None).is_err());
-        assert!(deepseek_accepts(CacheMode::Auto, Thinking::Strip, Some(Effort::Max)).is_err());
-        assert!(deepseek_accepts(CacheMode::Auto, Thinking::Preserve, None).is_ok());
-        assert!(deepseek_accepts(CacheMode::Auto, Thinking::Preserve, Some(Effort::High)).is_ok());
+        // deepseek: same two-rule policy as zai.
+        for (t, e) in [(Thinking::Preserve, None), (Thinking::Strip, None),
+                       (Thinking::Preserve, Some(Effort::High)),
+                       (Thinking::Strip, Some(Effort::Low))] {
+            assert!(deepseek_accepts(CacheMode::Active, t, e).is_err(),
+                "active+{t:?}+{e:?} should fail");
+        }
+        for e in [None, Some(Effort::Low), Some(Effort::Medium), Some(Effort::High), Some(Effort::Max)] {
+            assert!(deepseek_accepts(CacheMode::Auto, Thinking::Preserve, e).is_ok(),
+                "auto+preserve+{e:?} should pass");
+        }
+        assert!(deepseek_accepts(CacheMode::Auto, Thinking::Strip, None).is_ok());
+        for e in [Some(Effort::Low), Some(Effort::Medium), Some(Effort::High), Some(Effort::Max)] {
+            assert!(deepseek_accepts(CacheMode::Auto, Thinking::Strip, e).is_err(),
+                "auto+strip+{e:?} should fail");
+        }
     }
 }

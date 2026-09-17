@@ -109,15 +109,16 @@ mod tests {
     }
 
     #[test]
-    fn write_atomic_to_a_path_with_no_filename_uses_the_default_name() {
-        // a bare path with no file_name: write_atomic still produces a
-        // tmp file with the fallback name
+    fn write_atomic_with_a_path_whose_parent_has_no_filename() {
+        // a bare path: the temp file's name is the fallback "file", and
+        // the target's name is also "file" — both must use the same
+        // fallback so the rename lands on the right target.
         let dir = temp_dir("noname");
-        let leaf = "";
-        let full = format!("{}{}", dir.to_str().unwrap(), std::path::Path::new(leaf).to_str().unwrap_or(""));
-        // the path with an empty filename creates a file called "file" in
-        // the temp dir — we just want to see that write_atomic did not
-        // panic; the rename may or may not succeed depending on the FS
-        let _ = write_atomic(&full, "x");
+        let target = dir.join("file"); // the file_name() = "file", the literal name
+        // write_atomic asks for the target's file_name(), which is
+        // Some("file") even when the path is bare. After a successful
+        // write, the file exists at the target.
+        write_atomic(target.to_str().unwrap(), "v").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v");
     }
 }

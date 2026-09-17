@@ -921,18 +921,18 @@ mod tests {
     }
 
     #[test]
-    fn current_dir_string_returns_a_nonempty_string() {
-        let cwd = current_dir_string();
-        assert!(!cwd.is_empty(), "current_dir_string is empty");
+    fn current_dir_string_returns_the_process_working_directory() {
+        // the function reads `std::env::current_dir()` and displays it;
+        // the test pins the contract — what comes back must be the same
+        // directory that `current_dir()` itself produces, displayed.
+        let expected = std::env::current_dir().unwrap().display().to_string();
+        let got = current_dir_string();
+        assert_eq!(got, expected, "current_dir_string mirrors current_dir()");
+        // and same_dir agrees when canonicalized
+        assert!(same_dir(&got, &expected));
     }
 
-    #[test]
-    fn same_dir_returns_true_for_two_spelling_of_cwd() {
-        let cwd = current_dir_string();
-        assert!(same_dir(&cwd, &cwd));
-        // a missing path returns false from canonicalize: string equality still wins
-        assert!(same_dir(&cwd, &cwd));
-    }
+    
 
     #[test]
     fn msg_word_pluralizes_at_one() {
