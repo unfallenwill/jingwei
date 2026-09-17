@@ -1057,4 +1057,424 @@ mod tests {
             }
         }
     }
+
+    // ---- the stage's geometry and frame machinery ------------------------
+
+    /// Build a stage with the fields tests want. `Stage::new` queries the
+    /// real terminal — impossible under cargo test, so the geometry that
+    /// drives every method is set by hand.
+    fn fake_stage(top: u16, height: u16, width: u16, screen: u16) -> Stage {
+        Stage { frame: Vec::new(), top, height, width, screen }
+    }
+
+    #[test]
+    fn begin_resize_records_new_geometry_and_anchors_pane_at_bottom() {
+        let mut s = fake_stage(0, 0, 0, 0);
+        // resize to 80×24, pane 4 rows, no transcript reprinted above
+        s.begin_resize(80, 24, 4, 0);
+        assert_eq!((s.width, s.screen, s.height, s.top), (80, 24, 4, 20));
+        // with a 6-row tail: pane at 14, 4 rows, screen 24
+        s.begin_resize(80, 24, 4, 6);
+        assert_eq!(s.top, 24 - 4 - 6);
+        // width below the floor: Stage widens to 8 so no row ever lands in
+        // a buffer with width zero
+        s.begin_resize(2, 24, 4, 0);
+        assert_eq!(s.width, 8);
+        // height 0: clamped to 1 so set_height has a non-empty pane
+        s.begin_resize(80, 0, 0, 0);
+        assert_eq!(s.screen, 1);
+        assert_eq!(s.height, 1);
+    }
+
+    #[test]
+    fn set_height_clamps_to_screen_and_one() {
+        let mut s = fake_stage(20, 4, 80, 24);
+        // height 0 → clamped up to 1, no shrinks/grows trigger
+        s.set_height(0).unwrap();
+        assert_eq!(s.height, 1);
+        // reset to a smaller height before the next clamp test, so the
+        // bounded-by-screen path runs without scrolling
+        let mut s = fake_stage(20, 4, 80, 24);
+        // height above screen → clamped down (this case scrolls — see the
+        // grow-scroll test for its behavior; here we only check the clamp)
+        s.set_height(100).unwrap();
+        assert_eq!(s.height, 24);
+        // a height equal to current is a no-op: frame doesn't grow
+        let after_clamp = s.frame.len();
+        s.set_height(s.height).unwrap();
+        assert_eq!(s.frame.len(), after_clamp, "no-op on equal height");
+    }
+
+    #[test]
+    fn set_height_shrink_clears_rows_the_pane_gives_up() {
+        // pane 4 rows starting at row 20: shrink to 2 clears rows 22 and 23
+        let mut s = fake_stage(20, 4, 80, 24);
+        s.set_height(2).unwrap();
+        assert_eq!(s.height, 2);
+        let body = String::from_utf8(s.frame.clone()).unwrap();
+        // one MoveTo per cleared row, then an erase to end of line on each
+        assert_eq!(body.matches("\x1b[23;1H").count(), 1, "row 22 cleared");
+        assert_eq!(body.matches("\x1b[24;1H").count(), 1, "row 23 cleared");
+        assert_eq!(body.matches("\x1b[K").count(), 2, "two erases");
+    }
+
+    #[test]
+    fn set_height_grow_scrolls_when_pane_would_fall_off_screen() {
+        // pane anchored at row 18 of 24 with 6 rows — growing it to 10 rows
+        // would push the bottom to row 28; stage scrolls 4 lines first so
+        // the new top sits at screen - new_h
+        let mut s = fake_stage(18, 6, 80, 24);
+        s.set_height(10).unwrap();
+        assert_eq!(s.height, 10);
+        assert_eq!(s.top, 24 - 10, "pane re-anchored under the scroll");
+        let body = String::from_utf8(s.frame.clone()).unwrap();
+        assert!(body.contains("\x1b[24;1H"), "scroll from the last row");
+        assert_eq!(body.matches("\r\n").count(), 4, "exactly 4 line feeds");
+    }
+
+    #[test]
+    fn set_height_grow_above_screen_does_not_scroll() {
+        // pane anchored at row 18 with height 2: growing to height 6 fits
+        // exactly (18 + 6 = 24), so no scroll is needed
+        let mut s = fake_stage(18, 2, 80, 24);
+        s.set_height(6).unwrap();
+        assert_eq!(s.height, 6);
+        assert_eq!(s.top, 18, "top unchanged when growth fits");
+        assert!(s.frame.is_empty(), "no scroll bytes: {:?}", s.frame);
+    }
+
+    #[test]
+    fn scroll_emits_line_feeds_only_when_asked_to() {
+        let mut s = fake_stage(20, 4, 80, 24);
+        s.scroll(0).unwrap();
+        assert!(s.frame.is_empty(), "zero scrolls leave the frame empty");
+        s.scroll(3).unwrap();
+        let body = String::from_utf8(s.frame.clone()).unwrap();
+        assert_eq!(body, "\x1b[24;1H\r\n\r\n\r\n");
+        assert!(!body.contains('\x1b') || body.contains("\x1b[24;1H"), "only the move cursor — no CSI S");
+    }
+
+    #[test]
+    fn flush_with_no_lines_keeps_frame_empty() {
+        let mut s = fake_stage(20, 4, 80, 24);
+        s.flush(&[]).unwrap();
+        assert!(s.frame.is_empty(), "nothing to flush, nothing written");
+    }
+
+    #[test]
+    fn flush_paints_in_place_when_there_is_room() {
+        // top + n + height <= screen, so the plan has zero scroll
+        let mut s = fake_stage(15, 4, 80, 24); // 15 + 2 + 4 = 21 <= 24
+        let lines = vec![Line::from("hello"), Line::from("world")];
+        s.flush(&lines).unwrap();
+        // no scroll: top moves below the new rows
+        assert_eq!(s.top, 17);
+        assert!(String::from_utf8_lossy(&s.frame).contains("hello"));
+        assert!(String::from_utf8_lossy(&s.frame).contains("world"));
+    }
+
+    #[test]
+    fn flush_scrolls_and_paints_when_the_screen_fills() {
+        // 30 rows into a screen 24 rows tall, pane 4 rows: must scroll
+        let mut s = fake_stage(20, 4, 80, 24);
+        let lines: Vec<Line<'static>> = (0..30).map(|i| Line::from(format!("r{i}"))).collect();
+        s.flush(&lines).unwrap();
+        // every line was painted exactly once: 30 distinct strings show up
+        let body = String::from_utf8_lossy(&s.frame);
+        for i in 0..30 {
+            assert!(body.contains(&format!("r{i}")), "line {i} must reach the frame");
+        }
+        // pane still fits
+        assert!(s.top + s.height <= 24, "pane top {} + height {} > 24", s.top, s.height);
+    }
+
+    #[test]
+    fn paint_at_with_zero_lines_writes_nothing() {
+        let mut s = fake_stage(20, 4, 80, 24);
+        s.paint_at(10, &[]).unwrap();
+        assert!(s.frame.is_empty(), "no rows → no bytes");
+    }
+
+    #[test]
+    fn paint_uses_the_pane_top_as_its_row() {
+        let mut s = fake_stage(20, 4, 80, 24);
+        s.paint(&[Line::from("only")]).unwrap();
+        // the painted row lands at top (20) — not at 0
+        let body = String::from_utf8_lossy(&s.frame);
+        assert!(body.contains("only"));
+    }
+
+    #[test]
+    fn put_appends_a_command_to_the_frame() {
+        let mut s = fake_stage(20, 4, 80, 24);
+        s.put(crossterm::style::Print::<&str>("marker"));
+        assert!(s.frame.ends_with(b"marker"), "{:?}", s.frame);
+    }
+
+    #[test]
+    fn open_frame_hides_the_caret_before_writes() {
+        let mut s = fake_stage(20, 4, 80, 24);
+        s.open_frame();
+        // Hide writes \x1b[?25l — every frame starts with it
+        assert!(s.frame.starts_with(b"\x1b[?25l"), "{:?}", s.frame);
+    }
+
+    // ---- row_cells / needs_paint: the rendering helpers -------------------
+
+    #[test]
+    fn row_cells_offsets_to_the_given_row() {
+        let buf = render_buf(&[Line::from("hi")], 10);
+        let cells = row_cells(&buf, 7);
+        for (_, y, _) in &cells {
+            assert_eq!(*y, 7, "every cell stamped with `at`");
+        }
+    }
+
+    #[test]
+    fn row_cells_steps_over_wide_grapheme_trailing_halves() {
+        // a 3-wide glyph at columns 0..3: row_cells pushes only the first
+        // half; it never inserts the blank that would shove the next cell
+        let buf = render_buf(&[Line::from("精卫")], 6);
+        let cells = row_cells(&buf, 0);
+        let xs: Vec<u16> = cells.iter().map(|(x, _, _)| *x).collect();
+        // two wide glyphs: emitted at x=0 (width 2), then x=2 (width 2)
+        assert!(!xs.iter().any(|x| *x == 1), "the trailing half of 精 is skipped");
+        assert!(!xs.iter().any(|x| *x == 3), "the trailing half of 卫 is skipped");
+        assert!(xs.contains(&0) && xs.contains(&2));
+    }
+
+    #[test]
+    fn row_cells_empty_buffer_returns_nothing() {
+        let buf = render_buf(&[], 10);
+        assert!(row_cells(&buf, 0).is_empty());
+    }
+
+    #[test]
+    fn needs_paint_returns_true_on_grow_even_when_pane_matches() {
+        // the bug this pins: a frame that paints *nothing* of its own (no
+        // transcript rows) but had a previous frame still repaints because
+        // transcript rows landed; a tick that doesn't grow never repaints
+        let p = view::Pane { lines: vec![Line::from("a")], cursor: None };
+        let painted = ((80u16, 24u16), p.clone());
+        assert!(needs_paint(true, Some(&painted), 80, 24, &p), "grew → paint");
+        assert!(!needs_paint(false, Some(&painted), 80, 24, &p), "no grow, no change → skip");
+    }
+
+    #[test]
+    fn needs_paint_first_frame_without_history_paints() {
+        let p = view::Pane { lines: vec![], cursor: None };
+        assert!(needs_paint(false, None, 80, 24, &p), "no prior paint → paint");
+    }
+
+    #[test]
+    fn needs_paint_resize_paints_even_when_pane_lines_match() {
+        let p = view::Pane { lines: vec![Line::from("a")], cursor: None };
+        let painted = ((80u16, 24u16), p.clone());
+        assert!(needs_paint(false, Some(&painted), 60, 24, &p), "width changed → paint");
+        assert!(needs_paint(false, Some(&painted), 80, 30, &p), "height changed → paint");
+    }
+
+    #[test]
+    fn needs_paint_cursor_move_paints() {
+        let a = view::Pane { lines: vec![Line::from("a")], cursor: Some(view::Cursor { row: 1, col: 5 }) };
+        let b = view::Pane { lines: vec![Line::from("a")], cursor: Some(view::Cursor { row: 1, col: 6 }) };
+        let painted = ((80u16, 24u16), a.clone());
+        assert!(needs_paint(false, Some(&painted), 80, 24, &b), "cursor moved → paint");
+    }
+
+    // ---- handle: the action dispatcher ------------------------------------
+
+    /// A handle that lets a test inspect the agent that was spawned.
+    fn run_handle(action: Action) -> (ChannelSink, Option<Agent>) {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        let cfg = crate::config::Config {
+            api_key: "k".into(), base_url: "http://127.0.0.1:1".into(), model: "m".into(),
+            protocol: crate::api::Protocol::MINIMAX,
+            cache: crate::api::CacheMode::Auto,
+            thinking: crate::api::Thinking::Preserve,
+            effort: None,
+            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+        };
+        let mut convo = Convo::ephemeral();
+        convo.history.push(crate::ir::Message::User("seed".into()));
+        let convo = Arc::new(AsyncMutex::new(convo));
+        let mut agent: Option<Agent> = None;
+        handle(action, &cfg, &convo, &mut agent, &sink);
+        (sink, agent)
+    }
+
+    #[test]
+    fn handle_none_is_a_no_op() {
+        let (_sink, agent) = run_handle(Action::None);
+        assert!(agent.is_none(), "no agent spawned on None");
+    }
+
+    #[test]
+    fn handle_cancel_with_no_agent_does_not_panic() {
+        // the test of `if let Some(a) = agent` — absent agent is a silent
+        // no-op (the action runs against a now-empty agent slot)
+        let (_sink, agent) = run_handle(Action::Cancel);
+        assert!(agent.is_none());
+    }
+
+    #[test]
+    fn handle_submit_starts_an_agent_and_emits_task_begin() {
+        // a Submit lands a TaskBegin in the sink and fills `agent`. The
+        // spawned task races an unreachable host, so we cancel it before
+        // returning — what we assert here is the *start* of the action,
+        // not its end
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        let cfg = crate::config::Config {
+            api_key: "k".into(), base_url: "http://127.0.0.1:1".into(), model: "m".into(),
+            protocol: crate::api::Protocol::MINIMAX,
+            cache: crate::api::CacheMode::Auto,
+            thinking: crate::api::Thinking::Preserve,
+            effort: None,
+            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+        };
+        let mut convo = Convo::ephemeral();
+        convo.history.push(crate::ir::Message::User("seed".into()));
+        let convo = Arc::new(AsyncMutex::new(convo));
+        let mut agent: Option<Agent> = None;
+        // handle → tokio::spawn requires a runtime in this thread
+        crate::test_util::block_on(async {
+            handle(Action::Submit("hello world".into()), &cfg, &convo, &mut agent, &sink);
+        });
+        assert!(agent.is_some(), "submit sets the agent slot");
+        // a task begin landed in the sink
+        let got = rx.try_recv().expect("TaskBegin emitted by submit");
+        assert!(matches!(got, Msg::TaskBegin(ref t) if t == "hello world"));
+        // tidy up: cancel the running coroutine before the test ends
+        if let Some(a) = agent {
+            a.token.cancel();
+            a.job.abort();
+        }
+    }
+
+    // ---- Agent::reap: panic becomes a visible note ------------------------
+
+    #[test]
+    fn agent_reap_surfaces_a_panicking_join_as_an_error_note() {
+        // the test of the `if let Err(e) = self.job.await` arm: a spawned
+        // task that panics comes back as JoinError, which reap turns into
+        // an error note instead of letting the error fall silent
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        let token = Arc::new(crate::cancel::CancelToken::new());
+        crate::test_util::block_on(async move {
+            let handle = tokio::spawn(async { panic!("intentional") });
+            let a = Agent { token, job: handle };
+            a.reap(&sink).await;
+        });
+        let got = rx.try_recv().expect("a note must be emitted on panic");
+        assert!(matches!(got, Msg::Note { sev: Sev::Err, ref text } if text.contains("panicked")));
+    }
+
+    #[test]
+    fn agent_reap_is_silent_on_a_clean_join() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        let token = Arc::new(crate::cancel::CancelToken::new());
+        crate::test_util::block_on(async move {
+            let handle = tokio::spawn(async { /* fine */ });
+            let a = Agent { token, job: handle };
+            a.reap(&sink).await;
+        });
+        assert!(rx.try_recv().is_err(), "no note on a clean join");
+    }
+
+    // ---- history file: save → load round trip -----------------------------
+
+    /// Point home_dir() at a temp dir for the lifetime of the test. The
+    /// loader and saver both consult home_dir(), so the override has to
+    /// land before either is called. The guard removes both on drop.
+    struct HomeOverride(std::path::PathBuf);
+    impl Drop for HomeOverride {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn override_home(tag: &str) -> (HomeOverride, std::path::PathBuf) {
+        let p = crate::test_util::temp_dir(&format!("tui_home_{tag}"));
+        let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        std::env::set_var(var, &p);
+        (HomeOverride(p.clone()), p)
+    }
+
+    fn restore_home(prev: Option<std::ffi::OsString>) {
+        let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        match prev {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
+    }
+
+    #[test]
+    fn load_history_returns_empty_when_no_file_exists() {
+        let prev = if cfg!(windows) { std::env::var_os("USERPROFILE") } else { std::env::var_os("HOME") };
+        let (_g, _p) = override_home("missing");
+        assert!(load_history().is_empty());
+        restore_home(prev);
+    }
+
+    #[test]
+    fn save_then_load_history_round_trips() {
+        let prev = if cfg!(windows) { std::env::var_os("USERPROFILE") } else { std::env::var_os("HOME") };
+        let (_g, dir) = override_home("round");
+        let entries = vec!["first task".to_string(), "second\nmultiline".into(), "with \\ backslash".into()];
+        save_history(&entries);
+        let loaded = load_history();
+        assert_eq!(loaded, entries, "the loader recovers the saver's bytes exactly");
+        // one line per entry, on disk
+        let body = std::fs::read_to_string(dir.join(".jingwei_history")).unwrap();
+        assert_eq!(body.lines().count(), entries.len());
+        restore_home(prev);
+    }
+
+    #[test]
+    fn load_history_skips_blank_and_whitespace_only_lines() {
+        let prev = if cfg!(windows) { std::env::var_os("USERPROFILE") } else { std::env::var_os("HOME") };
+        let (_g, dir) = override_home("blank");
+        let mut body = String::new();
+        body.push_str(&escape("keep me"));
+        body.push('\n');
+        body.push_str("   \n");
+        body.push('\n');
+        body.push_str(&escape("also keep"));
+        body.push('\n');
+        std::fs::write(dir.join(".jingwei_history"), body).unwrap();
+        let loaded = load_history();
+        assert_eq!(loaded, vec!["keep me".to_string(), "also keep".to_string()]);
+        restore_home(prev);
+    }
+
+    #[test]
+    fn home_dir_returns_none_when_unset() {
+        let _prev = if cfg!(windows) { std::env::var_os("USERPROFILE") } else { std::env::var_os("HOME") };
+        let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        std::env::remove_var(var);
+        assert!(home_dir().is_none());
+        restore_home(_prev);
+    }
+
+    #[test]
+    fn home_dir_reads_the_platform_specific_variable() {
+        let _prev = if cfg!(windows) { std::env::var_os("USERPROFILE") } else { std::env::var_os("HOME") };
+        let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        std::env::set_var(var, "/tmp/some-test-home");
+        assert_eq!(home_dir().unwrap().to_str().unwrap(), "/tmp/some-test-home");
+        restore_home(_prev);
+    }
+
+    // ---- wanted(): stdout-is-a-tty AND no opt-out env --------------------
+
+    #[test]
+    fn wanted_is_false_when_no_tui_env_is_set() {
+        let prev = std::env::var_os("JINGWEI_NO_TUI");
+        std::env::set_var("JINGWEI_NO_TUI", "1");
+        // the env flag alone flips the answer, regardless of stdout
+        assert!(!wanted());
+        if let Some(v) = prev { std::env::set_var("JINGWEI_NO_TUI", v); } else { std::env::remove_var("JINGWEI_NO_TUI"); }
+    }
 }

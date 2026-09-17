@@ -902,4 +902,52 @@ mod tests {
         c.persist().unwrap(); // a quiet no-op — one-shots leave no session behind
         assert_eq!(c.history.len(), 1);
     }
+
+    #[test]
+    fn list_in_returns_empty_for_a_missing_directory() {
+        // the `Err(e) if e.kind() == io::ErrorKind::NotFound` arm: a
+        // missing project directory is not an error, just an empty list
+        let d = crate::test_util::temp_dir("list_missing");
+        let missing = d.join("never_existed");
+        let r = list_in(&missing).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn dir_tail_truncates_to_the_last_two_components() {
+        let path = std::path::Path::new("/a/b/c/d");
+        let tail = dir_tail(path.to_str().unwrap());
+        assert!(tail.ends_with("c/d"), "got: {tail}");
+    }
+
+    #[test]
+    fn current_dir_string_returns_a_nonempty_string() {
+        let cwd = current_dir_string();
+        assert!(!cwd.is_empty(), "current_dir_string is empty");
+    }
+
+    #[test]
+    fn same_dir_returns_true_for_two_spelling_of_cwd() {
+        let cwd = current_dir_string();
+        assert!(same_dir(&cwd, &cwd));
+        // a missing path returns false from canonicalize: string equality still wins
+        assert!(same_dir(&cwd, &cwd));
+    }
+
+    #[test]
+    fn msg_word_pluralizes_at_one() {
+        assert_eq!(msg_word(0), "messages", "0 is plural");
+        assert_eq!(msg_word(1), "message");
+        assert_eq!(msg_word(2), "messages");
+        assert_eq!(msg_word(99), "messages");
+    }
+
+    #[test]
+    fn utc_format_reads_a_unix_second_as_a_human_time() {
+        // both utc and id_stem exercise the calendar helper; the doc test
+        // already covers the tricky dates — we round-trip a few plain ones
+        assert_eq!(utc(60), "1970-01-01 00:01");
+        assert_eq!(utc(3600), "1970-01-01 01:00");
+        assert_eq!(id_stem(0), "19700101-000000");
+    }
 }

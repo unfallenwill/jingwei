@@ -273,3 +273,190 @@ EXAMPLES:
 pub(crate) fn print_help() {
     print!("{HELP}");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::env_lock;
+    use crate::api::{CacheMode, Effort, Protocol, Thinking};
+
+    fn parse(argv: &[&str]) -> Result<Args> {
+        parse_from(argv.iter().map(|s| s.to_string()))
+    }
+
+    fn cfg_effort(effort: Option<Effort>) -> Config {
+        Config {
+            api_key: "k".into(), base_url: "https://x".into(), model: "m".into(),
+            protocol: Protocol::MINIMAX, cache: CacheMode::Auto, thinking: Thinking::Preserve,
+            effort, max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+        }
+    }
+
+    /// `identity` always carries protocol + model + base, and only adds
+    /// `· effort <tier>` when effort is actually set — the banner must not
+    /// trail a stray `· effort` when the wire is silent.
+    #[test]
+    fn identity_includes_protocol_model_and_base_with_optional_effort() {
+        let c = cfg_effort(None);
+        assert_eq!(c.identity(), "minimax · m · https://x");
+        assert_eq!(c.effort_label(), None);
+        let c = cfg_effort(Some(Effort::High));
+        assert_eq!(c.identity(), "minimax · m · effort high · https://x");
+        assert_eq!(c.effort_label(), Some("high"));
+    }
+
+    /// `--resume` with no value is shorthand for `-c`: the resolver sets
+    /// `cont = true` so the caller takes the newest-session path.
+    #[test]
+    fn parse_resume_without_value_falls_back_to_continue() {
+        let a = parse(&["--resume"]).unwrap();
+        assert!(a.resuming(), "bare --resume counts as a resume");
+        assert!(a.cont && a.resume.is_none());
+    }
+
+    /// `--resume <id>` takes the next word; but a following flag is not
+    /// swallowed as a value — it stays available to the loop.
+    #[test]
+    fn parse_resume_stops_at_the_next_flag() {
+        let a = parse(&["--resume", "abc123", "--no-stream"]).unwrap();
+        assert_eq!(a.resume.as_deref(), Some("abc123"));
+        assert!(!a.streaming, "the second flag is still its own flag, not a value");
+    }
+
+    /// Every flag that needs a value errors when the value is missing —
+    /// the error names the flag so the user sees what to fix.
+    #[test]
+    fn parse_flags_that_take_values_error_when_missing() {
+        for flag in ["--api-key", "--base-url", "--model", "--protocol", "--cache",
+                     "--thinking", "--effort", "--max-tokens", "--context-size", "--max-turns"] {
+            match parse(&[flag]) {
+                Ok(_) => panic!("{flag} without value should fail"),
+                Err(e) => assert!(e.to_string().contains(flag), "{flag}: got {e}"),
+            }
+        }
+        match parse(&["--max-tokens", "abc"]) {
+            Ok(_) => panic!("--max-tokens abc should fail"),
+            Err(e) => assert!(e.to_string().contains("--max-tokens expects a number")),
+        }
+    }
+
+    /// An unknown flag spells what it did not recognize — `try --help` so
+    /// the user has a way out.
+    #[test]
+    fn parse_unknown_flag_says_what_it_got_and_points_at_help() {
+        match parse(&["--frobnicate"]) {
+            Ok(_) => panic!("--frobnicate should fail"),
+            Err(e) => {
+                let s = e.to_string();
+                assert!(s.contains("unknown flag: --frobnicate"));
+                assert!(s.contains("--help"));
+            }
+        }
+    }
+
+    /// `is_flag` is the seam two arms ask of a word — bare `-` is not a flag
+    /// (it's a placeholder, not an option), and the empty string isn't either.
+    #[test]
+    fn is_flag_recognizes_dash_lead_only() {
+        assert!(is_flag("--x") && is_flag("-x"));
+        assert!(!is_flag("-"), "a lone dash is not a flag");
+        assert!(!is_flag(""));
+        assert!(!is_flag("x"), "no dash, no flag");
+    }
+
+    /// `build_config` rejects `--max-turns 0`: a zero-iteration loop is
+    /// not an agent, it is a silent no-op.
+    #[test]
+    fn build_config_rejects_zero_max_turns() {
+        let args = parse(&["--max-turns", "0"]).unwrap();
+        match build_config(&args) {
+            Ok(_) => panic!("--max-turns 0 should fail"),
+            Err(e) => assert!(e.to_string().contains("--max-turns must be at least 1")),
+        }
+    }
+
+    /// `opt_enum_of`'s `Some(s)` arm: when the env var is set, the resolver
+    /// honors it even though no flag was passed. Parsed case-insensitively.
+    #[test]
+    fn effort_resolves_from_env_case_insensitively() {
+        let _env = env_lock();
+        std::env::set_var("JINGWEI_API_KEY", "k");
+        std::env::set_var("JINGWEI_EFFORT", "HIGH");
+        let args = parse(&[]).unwrap();
+        let cfg = build_config(&args).unwrap();
+        assert_eq!(cfg.effort, Some(Effort::High));
+        std::env::remove_var("JINGWEI_EFFORT");
+        std::env::remove_var("JINGWEI_API_KEY");
+    }
+
+    /// `opt_enum_of`'s absent path: no flag, no env → `None` (the wire
+    /// stays silent and the endpoint's default rules apply).
+    #[test]
+    fn effort_absent_flag_and_env_stays_none() {
+        let _env = env_lock();
+        std::env::set_var("JINGWEI_API_KEY", "k");
+        std::env::remove_var("JINGWEI_EFFORT");
+        let args = parse(&[]).unwrap();
+        let cfg = build_config(&args).unwrap();
+        assert!(cfg.effort.is_none());
+        std::env::remove_var("JINGWEI_API_KEY");
+    }
+
+    // ---- enum_of: the variant resolver -----------------------------------
+
+    #[test]
+    fn enum_of_falls_back_to_env_when_no_flag() {
+        // no flag for thinking: the env var resolves the value
+        let _env = env_lock();
+        std::env::set_var("JINGWEI_API_KEY", "k");
+        std::env::set_var("JINGWEI_THINKING", "strip");
+        std::env::remove_var("JINGWEI_CACHE");
+        let args = parse(&["--protocol", "minimax", "--base-url", "https://x", "-m", "m"]).unwrap();
+        let cfg = build_config(&args).unwrap();
+        assert_eq!(cfg.thinking, Thinking::Strip);
+        std::env::remove_var("JINGWEI_API_KEY");
+        std::env::remove_var("JINGWEI_THINKING");
+    }
+
+    #[test]
+    fn enum_of_rejects_unknown_values_with_the_known_list() {
+        // the error names the flag and lists what is accepted — it comes
+        // from build_config, not parse_from (which has nothing to reject)
+        let _env = env_lock();
+        std::env::set_var("JINGWEI_API_KEY", "k");
+        let args = parse(&["--cache", "turbo"]).unwrap();
+        match build_config(&args) {
+            Err(e) => {
+                let s = e.to_string();
+                assert!(s.contains("invalid cache 'turbo'"), "got: {s}");
+                assert!(s.contains("auto, active"), "got: {s}");
+            }
+            Ok(_) => panic!("--cache turbo should fail"),
+        }
+        std::env::remove_var("JINGWEI_API_KEY");
+    }
+
+    #[test]
+    fn protocol_label_and_identity_string_agree() {
+        let c = cfg_effort(None);
+        assert_eq!(c.protocol_label(), "minimax");
+        assert!(c.identity().starts_with("minimax · m · "), "got: {}", c.identity());
+    }
+
+    #[test]
+    fn parse_collects_bare_words_into_prompt() {
+        // anything that does not look like a flag goes into the prompt
+        // (and `is_flag` requires the dash to be the first character)
+        let a = parse(&["count", "*.rs", "and", "more"]).unwrap();
+        assert_eq!(a.prompt, vec!["count", "*.rs", "and", "more"]);
+    }
+
+    #[test]
+    fn streaming_defaults_to_true_when_no_flag() {
+        // the resolver defaults streaming to true; both -s and -S override it
+        assert!(parse(&[]).unwrap().streaming);
+        assert!(parse(&["-s"]).unwrap().streaming);
+        assert!(!parse(&["-S"]).unwrap().streaming);
+        assert!(!parse(&["--no-stream"]).unwrap().streaming);
+    }
+}

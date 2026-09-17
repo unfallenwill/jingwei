@@ -63,3 +63,133 @@ pub(crate) fn stale(p: &str) -> Option<String> {
          the change again against what it actually says (writing over content you have not seen \
          is how someone's uncommitted work disappears)"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::temp_dir;
+
+    /// The ledger is process-global; tests that touch it must serialize
+    /// with each other so one test's ledger entry does not bleed into
+    /// another's path lookup.
+    fn ledger_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_util::env_lock()
+    }
+
+    #[test]
+    fn ledger_default_is_empty() {
+        let _g = ledger_lock();
+        // a path we know nothing about: the ledger has never seen it
+        let path = temp_dir("fresh").join("never_seen.txt");
+        assert!(ledger().get(&path).is_none());
+    }
+
+    #[test]
+    fn ledger_note_stores_and_recalls_fingerprints() {
+        let _g = ledger_lock();
+        let path = temp_dir("note").join("f.txt");
+        ledger_note(path.to_str().unwrap(), b"hello world");
+        let got = ledger().get(&ledger_key(path.to_str().unwrap())).copied();
+        assert!(got.is_some(), "the path now maps to a fingerprint");
+        assert_eq!(got.unwrap(), fingerprint(b"hello world"));
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_changes() {
+        let a = fingerprint(b"hello");
+        let b = fingerprint(b"world");
+        assert_ne!(a, b, "different bytes yield different fingerprints");
+        // same bytes: same fingerprint (the test this guards)
+        assert_eq!(fingerprint(b"x"), fingerprint(b"x"));
+    }
+
+    #[test]
+    fn ledger_key_resolves_a_relative_path_against_cwd() {
+        // `./a.rs` joins the resolved cwd with the file name
+        let k = ledger_key("./f.txt");
+        let cwd = std::env::current_dir().unwrap();
+        assert!(k.starts_with(&cwd), "./a path resolves under cwd: {k:?}");
+    }
+
+    #[test]
+    fn ledger_key_keeps_the_filename_as_written_when_no_parent() {
+        // a bare name: the parent is empty, falls back to the path as given
+        let k = ledger_key("file.rs");
+        assert!(k.ends_with("file.rs"), "the file name is preserved: {k:?}");
+    }
+
+    #[test]
+    fn ledger_key_canonicalizes_an_existing_absolute_parent() {
+        // an absolute path's parent canonicalizes to itself; the file
+        // name is kept as written
+        let dir = temp_dir("absolute");
+        let k = ledger_key(dir.join("f.txt").to_str().unwrap());
+        assert!(k.starts_with(dir.canonicalize().unwrap().to_str().unwrap()), "abs path: {k:?}");
+    }
+
+    #[test]
+    fn stale_is_none_for_a_file_we_have_never_seen() {
+        let _g = ledger_lock();
+        let dir = temp_dir("stale_fresh");
+        let p = dir.join("fresh.txt");
+        std::fs::write(&p, "v").unwrap();
+        // the ledger has no entry for this path
+        assert!(stale(p.to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn stale_is_none_for_a_missing_file_even_after_a_read() {
+        // a read of a file that doesn't exist leaves nothing in the
+        // ledger; a follow-up check finds nothing to compare
+        let _g = ledger_lock();
+        let dir = temp_dir("stale_missing");
+        let p = dir.join("never_existed.txt");
+        // the read call here is the one the agent makes
+        assert!(crate::tools::dispatch("read_file", &serde_json::json!({"path": p.to_str().unwrap()})).starts_with("error:"));
+        assert!(stale(p.to_str().unwrap()).is_none(),
+            "a file we never saw has nothing to check: {:?}",
+            stale(p.to_str().unwrap()));
+    }
+
+    #[test]
+    fn stale_fires_when_the_file_moved_since_we_last_saw_it() {
+        let _g = ledger_lock();
+        let dir = temp_dir("stale_moved");
+        let p = dir.join("f.txt");
+        std::fs::write(&p, "first version").unwrap();
+        // the ledger now remembers the bytes
+        ledger_note(p.to_str().unwrap(), b"first version");
+        // the file moves under us
+        std::fs::write(&p, "second version").unwrap();
+        let msg = stale(p.to_str().unwrap());
+        assert!(msg.is_some(), "the file changed: {msg:?}");
+        let s = msg.unwrap();
+        assert!(s.starts_with("error:"));
+        assert!(s.contains(p.to_str().unwrap()));
+    }
+
+    #[test]
+    fn stale_silent_when_nothing_changed() {
+        let _g = ledger_lock();
+        let dir = temp_dir("stale_same");
+        let p = dir.join("f.txt");
+        std::fs::write(&p, "stable").unwrap();
+        ledger_note(p.to_str().unwrap(), b"stable");
+        assert!(stale(p.to_str().unwrap()).is_none(),
+            "the bytes match what we read: stable has not moved");
+    }
+
+    #[test]
+    fn ledger_keeps_two_different_files_independent() {
+        let _g = ledger_lock();
+        let dir = temp_dir("independent");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "alpha").unwrap();
+        std::fs::write(&b, "beta").unwrap();
+        ledger_note(a.to_str().unwrap(), b"alpha");
+        ledger_note(b.to_str().unwrap(), b"beta");
+        assert_eq!(ledger().get(&ledger_key(a.to_str().unwrap())).copied(), Some(fingerprint(b"alpha")));
+        assert_eq!(ledger().get(&ledger_key(b.to_str().unwrap())).copied(), Some(fingerprint(b"beta")));
+    }
+}

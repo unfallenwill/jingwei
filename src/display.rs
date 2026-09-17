@@ -245,6 +245,7 @@ impl Show for ChannelSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::block_on;
 
     #[test]
     fn thought_folded_previews_content_and_counts_the_hidden() {
@@ -312,6 +313,43 @@ mod tests {
         // cutting near "é" (e + U+0301) takes or leaves the whole grapheme — never the mark alone
         assert_eq!(truncate_cols("ab\u{301}cd", 4), "ab\u{301}…");
         assert_eq!(truncate_cols("ab\u{301}cd", 5), "ab\u{301}c…");
+    }
+
+    #[test]
+    fn paint_emits_ansi_when_color_is_forced_and_a_passthrough_otherwise() {
+        let _env = crate::test_util::env_lock();
+        std::env::set_var("JINGWEI_COLOR", "always");
+        let on = paint("err", ERR_BG, true);
+        assert!(on.starts_with("\x1b[") && on.contains("err") && on.ends_with("\x1b[39m"), "got: {on:?}");
+        // the white-text vs dark-text fork: 97 (white) vs 30 (near-black)
+        let dark = paint("warn", WARN_BG, false);
+        assert!(dark.contains("\x1b[30m"), "white=false picks 30: {dark:?}");
+        // and off: a strict passthrough through the
+        std::env::remove_var("JINGWEI_COLOR");
+        std::env::set_var("NO_COLOR", "1");
+        let off = paint("err", ERR_BG, true);
+        assert_eq!(off, "err");
+        std::env::remove_var("NO_COLOR");
+    }
+
+    #[test]
+    fn channel_sink_forwards_messages_through_the_sender() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        sink.show(Msg::Text("hi".into()));
+        sink.show(Msg::Done);
+        // drop the sink so the sender closes — otherwise `rx.recv().await`
+        // would block forever, the test would hang, and the whole suite stalls.
+        drop(sink);
+        let got = block_on(async {
+            let mut out = vec![];
+            while let Some(m) = rx.recv().await {
+                out.push(m);
+            }
+            out
+        });
+        assert!(matches!(got[0], Msg::Text(ref t) if t == "hi"));
+        assert!(matches!(got.last(), Some(Msg::Done)));
     }
 
     #[test]

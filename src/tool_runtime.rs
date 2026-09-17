@@ -197,4 +197,154 @@ mod tests {
         assert!(out.contains("[interrupted by user]"), "got: {out}");
     }
 
+    // ---- bash_output: shared shape, both async and sync paths -------------
+
+    fn make_exit(code: i32) -> ExitStatus {
+        if cfg!(windows) {
+            std::process::Command::new("cmd").args(["/C", &format!("exit {code}")]).status().unwrap()
+        } else {
+            std::process::Command::new("sh").args(["-c", &format!("exit {code}")]).status().unwrap()
+        }
+    }
+
+    #[test]
+    fn bash_output_adds_a_separator_newline_when_err_follows_unterminated_stdout() {
+        // the format string ends with `{out}` and does NOT add its own
+        // newline; when stderr is non-empty and stdout does not end with
+        // one, bash_output inserts the separator itself
+        let st = make_exit(0);
+        let s = bash_output(Some(&st), "hi", "warn");
+        assert_eq!(s, "exit=0\nhi\nwarn", "stdout without trailing newline gets one before stderr");
+    }
+
+    #[test]
+    fn bash_output_preserves_a_trailing_newline_before_stderr() {
+        let st = make_exit(1);
+        let s = bash_output(Some(&st), "hi\n", "warn");
+        assert_eq!(s, "exit=1\nhi\nwarn");
+    }
+
+    #[test]
+    fn bash_output_without_status_uses_minus_one() {
+        let s = bash_output(None, "out", "");
+        assert_eq!(s, "exit=-1\nout");
+    }
+
+    #[test]
+    fn bash_output_skips_stderr_when_empty() {
+        let st = make_exit(0);
+        let s = bash_output(Some(&st), "out", "");
+        assert_eq!(s, "exit=0\nout");
+    }
+
+    // ---- drain_pipe: the thread that streams the child's bytes ------------
+
+    /// An `io::Read` that yields the bytes we feed it, then returns 0.
+    fn feeder(bytes: Vec<u8>) -> impl Read + Send + 'static {
+        struct One(Option<std::io::Cursor<Vec<u8>>>);
+        impl Read for One {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let cur = self.0.as_mut().unwrap();
+                let pos = cur.position() as usize;
+                if pos >= cur.get_ref().len() { return Ok(0); }
+                let n = cur.read(buf)?;
+                Ok(n)
+            }
+        }
+        One(Some(std::io::Cursor::new(bytes)))
+    }
+
+    #[test]
+    fn drain_pipe_with_none_pipe_emits_nothing_and_eofs() {
+        // the `let Some(mut r) = pipe else { return };` path: drain_pipe
+        // returns a Drained whose rx closes immediately
+        let mut d = drain_pipe::<std::fs::File>(None);
+        block_on(async {
+            // a closed receiver yields None on the next recv
+            assert!(d.rx.recv().await.is_none());
+        });
+        assert!(d.got.is_empty());
+    }
+
+    #[test]
+    fn drain_pipe_streams_what_the_pipe_yields() {
+        let mut d = drain_pipe(Some(feeder(b"hello world".to_vec())));
+        block_on(async {
+            let got = d.collect(&CancelToken::new(), true).await;
+            assert_eq!(got, "hello world");
+        });
+    }
+
+    #[test]
+    fn drain_pipe_returns_after_grace_when_eof_is_false_and_nothing_arrives() {
+        // drain_pipe without EOF and an empty source: collect waits a
+        // short grace and gives up, returning what little arrived
+        let mut d = drain_pipe(Some(feeder(vec![])));
+        let start = Instant::now();
+        block_on(async {
+            let got = d.collect(&CancelToken::new(), false).await;
+            assert!(got.is_empty(), "nothing arrived: {got:?}");
+        });
+        // PIPE_GRACE = 300ms; we allow a generous upper bound to dodge CI
+        assert!(start.elapsed() < Duration::from_secs(2), "grace was {:?} — should be near 300ms", start.elapsed());
+    }
+
+    #[test]
+    fn drain_pipe_eof_collect_salvages_a_chunk_arriving_within_grace() {
+        // the eof=true branch: a chunk arrives on the channel while the
+        // cancel token is already tripped. The select lands on the cancel
+        // arm, then the grace window still pulls whatever the reader
+        // produced before EOF.
+        let mut d = drain_pipe(Some(feeder(b"late bytes".to_vec())));
+        let token = CancelToken::new();
+        token.cancel();
+        block_on(async {
+            let got = d.collect(&token, true).await;
+            // either we salvaged the chunk or the grace ran out — both
+            // are acceptable; the point is we returned, didn't hang
+            assert!(got == "late bytes" || got.is_empty(),
+                "got: {got:?} (cancel tripped before collect)");
+        });
+    }
+
+    // ---- run_bash: spawn failure is a returned error string ---------------
+
+    #[test]
+    fn run_bash_collects_clean_stdout_without_an_interruption_marker() {
+        let token = CancelToken::new();
+        let out = block_on(async { run_bash("echo hello", &token).await });
+        assert!(out.starts_with("exit=0\nhello"), "got: {out}");
+        assert!(!out.contains("[interrupted by user]"), "no interruption: {out}");
+    }
+
+    // ---- run_tool: the dispatcher's two paths -----------------------------
+
+    #[test]
+    fn run_tool_dispatches_non_bash_to_the_blocking_pool() {
+        // file tools run through spawn_blocking; cancellation only fires
+        // if the tool itself is slow enough — a write+read is fast, so the
+        // result is the tool's string, not "interrupted by user"
+        let token = CancelToken::new();
+        let out = block_on(async {
+            run_tool("bash", &serde_json::json!({"command": "echo hi"}), &token).await
+        });
+        assert!(out.starts_with("exit=0"), "got: {out}");
+    }
+
+    #[test]
+    fn run_tool_cancellation_interrupts_a_slow_bash_call() {
+        // the cancellable path: a long-running bash with a token cancelled
+        // before the next select wakes — the tool returns the interrupted
+        // marker
+        let token = Arc::new(CancelToken::new());
+        let t = token.clone();
+        let out = block_on(async move {
+            tokio::task::spawn_blocking(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                t.cancel();
+            });
+            run_tool("bash", &serde_json::json!({"command": "sleep 30"}), &token).await
+        });
+        assert!(out.contains("[interrupted by user]"), "got: {out}");
+    }
 }

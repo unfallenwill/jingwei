@@ -295,4 +295,86 @@ mod tests {
         let out = run(vec![Msg::Note { sev: Sev::Warn, text: " trimmed history ".into() }]);
         assert_eq!(out, vec![(Stream::Err, " trimmed history ".to_string())]);
     }
+
+    #[test]
+    fn banner_message_is_a_plain_stdout_line() {
+        let out = run(vec![Msg::Banner("jingwei".into())]);
+        assert_eq!(out, vec![(Stream::Out, "jingwei".into())]);
+    }
+
+    #[test]
+    fn usage_and_out_tokens_are_swallowed() {
+        // the plain log has no status bar — usage messages emit nothing
+        let out = run(vec![
+            Msg::Usage(crate::display::Usage { input: 1, output: 2, cache_read: 0, cache_write: 0 }),
+            Msg::OutTokens(42),
+        ]);
+        assert!(out.is_empty(), "usage / OutTokens do not produce output: {out:?}");
+    }
+
+    #[test]
+    fn think_with_no_end_emits_nothing_until_done() {
+        // thinking that arrives but never gets ThinkEnd: the partial
+        // accumulator stays buffered; a later Done folds it. Both phases
+        // run on the same Plain so the buffer carries across.
+        let mut p = Plain::new();
+        let mut out = vec![];
+        out.extend(p.feed(Msg::Think("line one\n".into())));
+        assert!(out.is_empty(), "no ThinkEnd yet: {out:?}");
+        out.extend(p.feed(Msg::Think("line two".into())));
+        out.extend(p.feed(Msg::Done));
+        // the fold shows the first line and counts the rest
+        assert!(out.iter().any(|(_, l)| l == "▸ thought #1 · line one … +1"),
+            "got: {out:?}");
+    }
+
+    #[test]
+    fn tool_call_with_no_output_lines_just_prints_the_summary() {
+        // fewer than PLAIN_TOOL_LINES lines: only the summary header, no
+        // fold marker at the end
+        let out = run(vec![Msg::Tool {
+            name: "read_file".into(),
+            summary: "f.txt".into(),
+            output: "just one line".into(),
+        }]);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0].1, "[read_file] f.txt");
+        assert_eq!(out[1].1, "│ just one line");
+    }
+
+    #[test]
+    fn consecutive_thinks_concatenate_into_one_marker() {
+        // multiple Think deltas before a single ThinkEnd: one marker,
+        // not several — a run-packing reader doesn't try to fold half
+        // a thought
+        let out = run(vec![
+            Msg::Think("first\n".into()),
+            Msg::Think("second".into()),
+            Msg::ThinkEnd,
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, "▸ thought #1 · first … +1");
+    }
+
+    #[test]
+    fn text_split_across_two_messages_folds_at_the_newline() {
+        // "hello" and " world\n" arrive as two deltas: only one line lands
+        let out = run(vec![
+            Msg::Text("hello".into()),
+            Msg::Text(" world\n".into()),
+        ]);
+        assert_eq!(out, vec![(Stream::Out, "hello world".into())]);
+    }
+
+    #[test]
+    fn tool_call_after_open_text_ends_the_open_line_first() {
+        // text mid-line, then a tool call: the partial line must land
+        // before the tool's header, so the tool output reads clean
+        let out = run(vec![
+            Msg::Text("thinking aloud".into()),
+            Msg::Tool { name: "bash".into(), summary: "$ ls".into(), output: "f\n".into() },
+        ]);
+        assert_eq!(out[0], (Stream::Out, "thinking aloud".into()));
+        assert_eq!(out[1].1, "[bash] $ ls");
+    }
 }

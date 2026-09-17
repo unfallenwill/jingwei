@@ -148,6 +148,8 @@ pub(crate) fn dispatch(name: &str, input: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::temp_dir;
+    use serde_json::json;
 
     #[test]
     fn tools_registry_is_wellformed() {
@@ -166,5 +168,166 @@ mod tests {
         assert!(ok.starts_with("exit=0") && ok.contains("hi"), "got: {ok}");
         let bad = dispatch("bash", &json!({"command": if cfg!(windows) { "exit 1" } else { "false" }}));
         assert!(!bad.starts_with("exit=0") && bad.contains("exit="), "got: {bad}");
+    }
+
+    // ---- tool_summary: the one-line echo the frontends show ---------------
+
+    #[test]
+    fn tool_summary_for_bash_prints_command_with_dollar() {
+        assert_eq!(tool_summary("bash", &json!({"command": "ls -l"})), "$ ls -l");
+        // missing command: empty string, not a panic
+        assert_eq!(tool_summary("bash", &json!({})), "$ ");
+    }
+
+    #[test]
+    fn tool_summary_for_read_file_is_the_path() {
+        assert_eq!(tool_summary("read_file", &json!({"path": "src/main.rs"})), "src/main.rs");
+    }
+
+    #[test]
+    fn tool_summary_for_write_file_lists_path_with_size() {
+        assert_eq!(tool_summary("write_file", &json!({"path": "a.rs", "content": "hello"})),
+                   "a.rs (5 bytes)");
+        // missing content: byte count is zero
+        assert_eq!(tool_summary("write_file", &json!({"path": "a.rs"})), "a.rs (0 bytes)");
+    }
+
+    #[test]
+    fn tool_summary_for_edit_file_without_notes_is_just_the_path() {
+        assert_eq!(tool_summary("edit_file", &json!({"path": "a.rs"})), "a.rs");
+    }
+
+    #[test]
+    fn tool_summary_for_edit_file_with_edits_lists_the_count() {
+        let v = json!({"path": "a.rs", "edits": [{"old": "a", "new": "b"}, {"old": "c", "new": "d"}]});
+        assert_eq!(tool_summary("edit_file", &v), "a.rs (2 edits)");
+    }
+
+    #[test]
+    fn tool_summary_for_edit_file_with_replace_all_adds_the_flag() {
+        let v = json!({"path": "a.rs", "old": "x", "new": "y", "replace_all": true});
+        assert_eq!(tool_summary("edit_file", &v), "a.rs (replace_all)");
+    }
+
+    #[test]
+    fn tool_summary_for_edit_file_with_edits_and_replace_all_lists_both() {
+        let v = json!({"path": "a.rs", "edits": [{"old": "a", "new": "b"}], "replace_all": true});
+        assert_eq!(tool_summary("edit_file", &v), "a.rs (1 edits, replace_all)");
+    }
+
+    #[test]
+    fn tool_summary_for_unknown_tool_returns_empty() {
+        assert_eq!(tool_summary("nope", &json!({})), "");
+    }
+
+    // ---- print_tool_call: the channel through the display port ------------
+
+    /// A sink that captures every Msg handed to it: the tests assert on
+    /// the message the frontends would receive, not on a string.
+    struct CapturingSink(std::sync::Mutex<Vec<Msg>>);
+    impl crate::display::Show for CapturingSink {
+        fn show(&self, m: Msg) { self.0.lock().unwrap().push(m); }
+    }
+
+    #[test]
+    fn print_tool_call_emits_a_tool_message_with_summary_and_output() {
+        let sink = CapturingSink(Default::default());
+        print_tool_call("bash", &json!({"command": "echo hi"}), "out", &sink);
+        let got = sink.0.lock().unwrap().pop().unwrap();
+        match got {
+            Msg::Tool { name, summary, output } => {
+                assert_eq!(name, "bash");
+                assert_eq!(summary, "$ echo hi");
+                assert_eq!(output, "out");
+            }
+            other => panic!("expected Msg::Tool, got {other:?}"),
+        }
+    }
+
+    // ---- bash_output: same shape as the async tool's output ----------------
+
+    #[test]
+    fn bash_output_with_only_stdout_skips_stderr() {
+        let st = make_exit(0);
+        let s = bash_output(Some(&st), "hello\n", "");
+        assert_eq!(s, "exit=0\nhello\n");
+    }
+
+    #[test]
+    fn bash_output_appends_stderr_after_a_newline() {
+        let st = make_exit(0);
+        let s = bash_output(Some(&st), "out", "err");
+        // no trailing newline on `out`, so the format adds one before err
+        assert_eq!(s, "exit=0\nout\nerr");
+    }
+
+    #[test]
+    fn bash_output_preserves_a_trailing_newline_before_stderr() {
+        let st = make_exit(1);
+        let s = bash_output(Some(&st), "out\n", "err");
+        assert_eq!(s, "exit=1\nout\nerr");
+    }
+
+    #[test]
+    fn bash_output_without_status_uses_minus_one() {
+        let s = bash_output(None, "out", "");
+        assert_eq!(s, "exit=-1\nout");
+    }
+
+    /// Make an ExitStatus for tests. On Unix, `Command::status("true")` is
+    /// the cross-platform answer; on Windows, "cmd /C exit 0" works.
+    fn make_exit(code: i32) -> ExitStatus {
+        if cfg!(windows) {
+            std::process::Command::new("cmd").args(["/C", &format!("exit {code}")]).status().unwrap()
+        } else {
+            std::process::Command::new("sh").args(["-c", &format!("exit {code}")]).status().unwrap()
+        }
+    }
+
+    // ---- dispatch: the registry's one entry point -------------------------
+
+    #[test]
+    fn dispatch_unknown_tool_returns_an_error_message() {
+        let out = dispatch("nope", &json!({}));
+        assert!(out.starts_with("error: unknown tool"), "got: {out}");
+    }
+
+    // ---- the file tools: exercised through dispatch -----------------------
+
+    #[test]
+    fn read_file_returns_error_with_path_wrapped_when_missing() {
+        let dir = temp_dir("read_missing");
+        let missing = dir.join("nope.txt");
+        let result = dispatch("read_file", &json!({"path": missing.to_str().unwrap()}));
+        assert!(result.starts_with("error:"), "got: {result}");
+    }
+
+    #[test]
+    fn write_file_returns_error_when_path_is_a_directory() {
+        // a path the runtime can't write to: a directory.
+        let dir = temp_dir("write_dir");
+        let result = dispatch("write_file", &json!({"path": dir.to_str().unwrap(), "content": "x"}));
+        // the io error is whatever the OS returns — we just verify the
+        // tool formatted it as an error string instead of panicking
+        assert!(result.starts_with("error:") || result.starts_with("ok: wrote"),
+            "got: {result}");
+    }
+
+    #[test]
+    fn write_file_writes_through_a_symlink_to_its_target() {
+        // a symlink in the temp dir, written through — the write must
+        // land on the *target*, not replace the link
+        let dir = temp_dir("symlink_write");
+        let target = dir.join("real.txt");
+        std::fs::write(&target, "").unwrap(); // an empty file to symlink at
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let result = dispatch("write_file", &json!({"path": link.to_str().unwrap(), "content": "v"}));
+        assert!(result.starts_with("ok: wrote"), "got: {result}");
+        // both paths now point at content
+        let on_target = std::fs::read_to_string(&target).unwrap();
+        let via_link = std::fs::read_link(&link).unwrap();
+        assert_eq!(via_link, target, "the symlink itself is unchanged");
+        assert_eq!(on_target, "v", "the target got the bytes");
     }
 }

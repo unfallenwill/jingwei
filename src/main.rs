@@ -948,4 +948,165 @@ mod tests {
         assert!(err.to_string().contains("bad model"), "got: {err}");
         assert_eq!(reqs.lock().unwrap().len(), 1, "no second request");
     }
+
+    // ---- Error: the type's display & conversions -------------------------
+
+    #[test]
+    fn error_display_strings_for_every_variant() {
+        // the four Display arms not covered elsewhere
+        assert_eq!(format!("{}", Error::Json(serde_json::from_str::<u32>("abc").unwrap_err())),
+            serde_json::from_str::<u32>("abc").unwrap_err().to_string());
+        assert_eq!(format!("{}", Error::Io(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))),
+            "denied");
+    }
+
+    #[test]
+    fn error_from_ureq_wraps_a_status_into_api() {
+        // the Status arm of From<ureq::Error>: the status code and body
+        // ride along as the Error::Api variant
+        let body = r#"{"error":"model gone"}"#;
+        let r = ureq::Response::new(404, "Not Found", body).unwrap();
+        let err: Error = ureq::Error::Status(404, r).into();
+        match err {
+            Error::Api(code, ref b) => {
+                assert_eq!(code, 404);
+                assert!(b.contains("model gone"), "body carries: {b}");
+            }
+            other => panic!("expected Error::Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_from_ureq_wraps_other_kinds_into_http() {
+        // transport / DNS / decode errors: they ride as Error::Http.
+        // Transport cannot be constructed outside ureq, so we trigger a
+        // real one — a request to a closed port.
+        let err: Error = ureq::get("http://127.0.0.1:1/nope").call().unwrap_err().into();
+        assert!(matches!(err, Error::Http(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn error_from_io_preserves_the_io_kind() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "nope");
+        let err: Error = io.into();
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    // ---- truncate: the bounded-output safety net --------------------------
+
+    #[test]
+    fn truncate_passes_through_short_strings() {
+        assert_eq!(truncate("hello"), "hello");
+        assert_eq!(truncate(""), "");
+        assert_eq!(truncate(&"x".repeat(MAX_TOOL_OUTPUT)), "x".repeat(MAX_TOOL_OUTPUT));
+    }
+
+    #[test]
+    fn truncate_strips_after_cap_with_marker() {
+        let big = "a".repeat(MAX_TOOL_OUTPUT + 100);
+        let t = truncate(&big);
+        assert!(t.contains(&format!("…[truncated, {} bytes total]", big.len())));
+        assert!(t.len() <= MAX_TOOL_OUTPUT + 64, "the marker is bounded: {t}");
+    }
+
+    // ---- est_tokens / fit_context: the trim machinery --------------------
+
+    #[test]
+    fn est_tokens_is_zero_when_history_cannot_be_serialized() {
+        // the or-default path: history that fails to serialize still
+        // returns 0, not a panic
+        let h: Vec<Message> = vec![];
+        assert_eq!(est_tokens(&h), 0);
+    }
+
+    #[test]
+    fn est_tokens_grows_with_content_size() {
+        // a longer user message bulks a larger estimate
+        let s = "x".repeat(3_000);
+        let h = vec![Message::User(s)];
+        let small = est_tokens(&[Message::User("hi".into())]);
+        let big = est_tokens(&h);
+        assert!(big > small, "more bytes → more tokens: small={small}, big={big}");
+    }
+
+    #[test]
+    fn oldest_tool_result_returns_none_when_history_has_no_results() {
+        let h = vec![Message::User("t".into())];
+        assert!(oldest_tool_result(&h).is_none());
+    }
+
+    #[test]
+    fn oldest_tool_result_skips_empty_tool_results() {
+        // a ToolResults with no entries does not count
+        let h = vec![
+            Message::User("go".into()),
+            Message::Assistant(vec![Block::Text("ok".into())]),
+            Message::ToolResults(vec![]),
+            Message::ToolResults(vec![crate::ir::ToolResult { id: "t".into(), content: "ok".into() }]),
+        ];
+        let (mi, _) = oldest_tool_result(&h).expect("the second ToolResults has entries");
+        assert_eq!(mi, 3);
+    }
+
+    #[test]
+    fn drop_result_and_pair_drops_both_use_and_result() {
+        let mut h = hv(vec![
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]}),
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}),
+        ]);
+        drop_result_and_pair(&mut h, 2, 0);
+        // the tool_use and its tool_result both gone; the user message survives
+        assert_eq!(h.len(), 1, "the empty assistant + result messages collapse: {h:?}");
+        assert!(matches!(&h[0], Message::User(_)));
+    }
+
+    #[test]
+    fn drop_result_and_pair_keeps_thinking_blocks_for_other_calls() {
+        // a batch where thinking was reasoning towards *two* calls:
+        // dropping the first result must not lose the thinking block —
+        // it's still the reasoning for the second call
+        let mut h = hv(vec![
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "two calls"},
+                {"type": "tool_use", "id": "t1", "name": "bash", "input": {}},
+                {"type": "tool_use", "id": "t2", "name": "read_file", "input": {"path": "x"}}]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "id": "t1", "content": "ok"},
+                {"type": "tool_result", "id": "t2", "content": "y"}]}),
+        ]);
+        // find t1's position in the result message
+        let (mi, _) = oldest_tool_result(&h).unwrap();
+        // bi to be 0 (first result), t1 at bi=0
+        drop_result_and_pair(&mut h, mi, 0);
+        let j = hist(&h).to_string();
+        assert!(!j.contains("\"id\": \"t1\""), "t1's tool_use is gone");
+        assert!(j.contains("t2"), "t2's pair survives");
+        assert!(j.contains("two calls"), "the thinking block survives t2's sake");
+    }
+
+    #[test]
+    fn drop_result_and_pair_returns_silently_on_wrong_index() {
+        // mi points at a non-ToolResults: the function must not panic
+        let mut h = hv(vec![json!({"role": "user", "content": "go"})]);
+        let before = h.clone();
+        drop_result_and_pair(&mut h, 0, 0);
+        assert_eq!(hist(&h), hist(&before));
+    }
+
+    #[test]
+    fn fit_context_returns_false_when_history_already_fits() {
+        let h = hv(vec![json!({"role": "user", "content": "hi"})]);
+        assert!(!fit_context(&mut h.clone(), u64::MAX));
+        let mut h2 = h.clone();
+        assert!(!fit_context(&mut h2, est_tokens(&h) + 1000));
+    }
+
+    #[test]
+    fn fit_context_returns_false_when_there_is_nothing_to_trim() {
+        // an over-limit history with no tool_results: nothing changes
+        let mut h = hv(vec![json!({"role": "user", "content": "go"})]);
+        assert!(!fit_context(&mut h, 0));
+    }
 }

@@ -452,3 +452,303 @@ fn deepseek_accepts(cache: CacheMode, thinking: Thinking, effort: Option<Effort>
 pub(crate) mod minimax;
 pub(crate) mod zai;
 pub(crate) mod deepseek;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Block, Message};
+    use serde_json::json;
+
+    // ---- Protocol: the dispatcher's typed handle --------------------------
+
+    #[test]
+    fn protocol_label_names_each_vendor() {
+        assert_eq!(Protocol::MINIMAX.label(), "minimax");
+        assert_eq!(Protocol::ZAI.label(), "zai");
+        assert_eq!(Protocol::DEEPSEEK.label(), "deepseek");
+    }
+
+    #[test]
+    fn protocol_default_base_lists_each_endpoint() {
+        assert_eq!(Protocol::MINIMAX.default_base(), Some("https://api.minimax.cn/anthropic"));
+        assert_eq!(Protocol::ZAI.default_base(), Some("https://open.bigmodel.cn/api/paas/v4"));
+        assert_eq!(Protocol::DEEPSEEK.default_base(), Some("https://api.deepseek.com"));
+    }
+
+    #[test]
+    fn protocol_default_model_lists_known_flagships_but_lets_deepseek_pick() {
+        assert_eq!(Protocol::MINIMAX.default_model(), Some("MiniMax-M3"));
+        assert_eq!(Protocol::ZAI.default_model(), Some("glm-5.3-flash"));
+        // deepseek: flagship is the caller's choice, no default
+        assert!(Protocol::DEEPSEEK.default_model().is_none());
+    }
+
+    #[test]
+    fn protocol_eq_and_debug_use_the_label() {
+        assert_eq!(Protocol::MINIMAX, Protocol::MINIMAX);
+        assert_ne!(Protocol::MINIMAX, Protocol::ZAI);
+        assert_eq!(format!("{:?}", Protocol::DEEPSEEK), "deepseek");
+    }
+
+    #[test]
+    fn vendors_table_matches_the_implementations() {
+        let names: Vec<&str> = VENDORS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["minimax", "zai", "deepseek"]);
+        // every wire's handle is the matching constant
+        assert_eq!(VENDORS[0].1, Protocol::MINIMAX);
+        assert_eq!(VENDORS[1].1, Protocol::ZAI);
+        assert_eq!(VENDORS[2].1, Protocol::DEEPSEEK);
+    }
+
+    // ---- Effort: the budget knob -----------------------------------------
+
+    #[test]
+    fn effort_label_is_lowercase() {
+        assert_eq!(Effort::Low.label(), "low");
+        assert_eq!(Effort::Medium.label(), "medium");
+        assert_eq!(Effort::High.label(), "high");
+        assert_eq!(Effort::Max.label(), "max");
+    }
+
+    #[test]
+    fn effort_budget_clamps_into_the_messages_wire_rules() {
+        // at least 1024, strictly under max_tokens, never zero
+        let b = Effort::Low.budget(16_000);
+        assert_eq!(b, 1024, "low is the floor");
+        assert!(b < 16_000, "the reply always has room");
+        // medium is 8192; high is 32768; max = max_tokens - 1024
+        assert_eq!(Effort::Medium.budget(16_000), 8192);
+        assert_eq!(Effort::High.budget(64_000), 32768);
+        assert_eq!(Effort::Max.budget(64_000), 64_000 - 1024);
+    }
+
+    #[test]
+    fn effort_budget_never_exceeds_max_tokens_minus_a_floor() {
+        // when max_tokens is tiny, the clamp pins budget to the floor
+        // (1024) — the messages wire requires at least that much, even
+        // when the reply budget cannot fit it
+        let b = Effort::Max.budget(2_000);
+        assert!(b >= 1024, "the messages wire requires at least 1024: {b}");
+        assert!(b <= 2_000, "the reply budget is never exceeded: {b}");
+    }
+
+    // ---- helpers the chat-completions wires share -------------------------
+
+    #[test]
+    fn chat_url_strips_a_trailing_slash() {
+        let cfg = crate::config::Config {
+            api_key: "k".into(),
+            base_url: "https://api.example.com/".into(),
+            model: "m".into(),
+            protocol: Protocol::ZAI,
+            cache: CacheMode::Auto, thinking: Thinking::Preserve, effort: None,
+            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+        };
+        assert_eq!(chat_url(&cfg), "https://api.example.com/chat/completions");
+        // no trailing slash
+        let cfg2 = crate::config::Config { base_url: "https://api.example.com".into(), ..cfg.clone() };
+        assert_eq!(chat_url(&cfg2), "https://api.example.com/chat/completions");
+    }
+
+    #[test]
+    fn chat_messages_prepends_the_system_prompt() {
+        let cfg = crate::config::Config {
+            api_key: "k".into(), base_url: "x".into(), model: "m".into(),
+            protocol: Protocol::ZAI,
+            cache: CacheMode::Auto, thinking: Thinking::Preserve, effort: None,
+            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+        };
+        let msgs = vec![Message::User("hi".into())];
+        let out = chat_messages("you are a bot", &msgs, &cfg);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "you are a bot");
+        assert_eq!(out[1]["role"], "user");
+    }
+
+    #[test]
+    fn chat_tools_returns_an_array_of_schemas() {
+        let schemas = vec![json!({"name": "a"}), json!({"name": "b"})];
+        let v = chat_tools(&schemas);
+        assert!(v.is_array());
+        assert_eq!(v.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn chat_to_internal_parses_reasoning_text_and_tool_calls() {
+        let v = json!({
+            "choices": [{"message": {
+                "reasoning_content": "I think",
+                "content": "answer",
+                "tool_calls": [
+                    {"id": "tc1", "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}}
+                ]
+            }}],
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        // a minimal usage_of stub
+        let usage_of = |u: &Value| (u.clone(), crate::display::Usage::default());
+        let r = chat_to_internal(&v, usage_of);
+        assert_eq!(r.blocks.len(), 3, "thinking, text, tool_use");
+        match &r.blocks[0] {
+            Block::Thinking { text, .. } => assert_eq!(text, "I think"),
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+        match &r.blocks[1] {
+            Block::Text(t) => assert_eq!(t, "answer"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        match &r.blocks[2] {
+            Block::ToolUse { id, name, input } => {
+                assert_eq!(id, "tc1");
+                assert_eq!(name, "bash");
+                assert_eq!(input["command"], "ls");
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_to_internal_drops_empty_reasoning_and_content() {
+        let v = json!({
+            "choices": [{"message": {
+                "reasoning_content": "",
+                "content": "answer only"
+            }}],
+            "usage": {}
+        });
+        let usage_of = |_: &Value| (Value::Null, crate::display::Usage::default());
+        let r = chat_to_internal(&v, usage_of);
+        assert_eq!(r.blocks.len(), 1);
+        assert!(matches!(&r.blocks[0], Block::Text(t) if t == "answer only"));
+    }
+
+    // ---- empty_usage / merge_usage / response_from_value -----------------
+
+    #[test]
+    fn empty_usage_is_four_zeros() {
+        let v = empty_usage();
+        assert_eq!(v["input_tokens"], 0);
+        assert_eq!(v["output_tokens"], 0);
+        assert_eq!(v["cache_read_input_tokens"], 0);
+        assert_eq!(v["cache_creation_input_tokens"], 0);
+    }
+
+    #[test]
+    fn merge_usage_merges_fields_when_both_are_objects() {
+        let mut usage = empty_usage();
+        let mut src = serde_json::Map::new();
+        src.insert("input_tokens".into(), json!(42));
+        src.insert("output_tokens".into(), json!(7));
+        merge_usage(&mut usage, Some(&src));
+        assert_eq!(usage["input_tokens"], 42);
+        assert_eq!(usage["output_tokens"], 7);
+    }
+
+    #[test]
+    fn merge_usage_is_a_no_op_when_src_is_none() {
+        let mut usage = empty_usage();
+        let before = usage.clone();
+        merge_usage(&mut usage, None);
+        assert_eq!(usage, before);
+    }
+
+    #[test]
+    fn merge_usage_is_a_no_op_when_dst_is_not_an_object() {
+        // empty_usage is an object; overwrite it with a non-object to
+        // exercise the `if let (Some(dst), Some(src))` guard
+        let mut usage = json!(42);
+        let mut src = serde_json::Map::new();
+        src.insert("input_tokens".into(), json!(1));
+        merge_usage(&mut usage, Some(&src));
+        assert_eq!(usage, json!(42), "not an object: nothing to merge into");
+    }
+
+    #[test]
+    fn response_from_value_reads_content_and_usage() {
+        let v = json!({
+            "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "thinking", "thinking": "think", "signature": "sig"}
+            ],
+            "usage": {"input_tokens": 3}
+        });
+        let r = response_from_value(&v);
+        assert_eq!(r.blocks.len(), 2);
+        assert_eq!(r.usage["input_tokens"], 3);
+    }
+
+    #[test]
+    fn response_from_value_missing_content_yields_empty_blocks() {
+        let r = response_from_value(&json!({}));
+        assert!(r.blocks.is_empty());
+    }
+
+    // ---- strip_thinking: the wire-side filter -----------------------------
+
+    #[test]
+    fn strip_thinking_drops_thinking_blocks_from_assistant_turns() {
+        let blocks = vec![
+            Block::Thinking { text: "thought".into(), signature: Some("s".into()) },
+            Block::Text("answer".into()),
+            Block::ToolUse { id: "t".into(), name: "bash".into(), input: json!({}) },
+        ];
+        let msgs = vec![Message::Assistant(blocks)];
+        let stripped = strip_thinking(&msgs);
+        match &stripped[0] {
+            Message::Assistant(bs) => {
+                assert_eq!(bs.len(), 2, "thinking dropped, text and tool_use kept");
+                assert!(matches!(&bs[0], Block::Text(t) if t == "answer"));
+                assert!(matches!(&bs[1], Block::ToolUse { .. }));
+            }
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strip_thinking_keeps_user_and_tool_results_intact() {
+        // the `other => other.clone()` arm: user and tool-results pass
+        // through without inspection
+        let msgs = vec![
+            Message::User("task".into()),
+            Message::ToolResults(vec![crate::ir::ToolResult { id: "t".into(), content: "ok".into() }]),
+        ];
+        let stripped = strip_thinking(&msgs);
+        assert_eq!(stripped.len(), 2);
+        assert!(matches!(&stripped[0], Message::User(t) if t == "task"));
+        assert!(matches!(&stripped[1], Message::ToolResults(rs) if rs.len() == 1));
+    }
+
+    // ---- the vendor rules: minimax/zai/deepseek accepts ------------------
+
+    #[test]
+    fn minimax_accepts_anything_except_effort_with_strip_thinking() {
+        // the happy path
+        assert!(minimax_accepts(CacheMode::Auto, Thinking::Preserve, None).is_ok());
+        assert!(minimax_accepts(CacheMode::Active, Thinking::Preserve, None).is_ok());
+        assert!(minimax_accepts(CacheMode::Auto, Thinking::Strip, None).is_ok());
+        // the only refusal: effort demands preserved thinking
+        assert!(minimax_accepts(CacheMode::Auto, Thinking::Strip, Some(Effort::High)).is_err());
+        assert!(minimax_accepts(CacheMode::Auto, Thinking::Strip, Some(Effort::Low)).is_err());
+    }
+
+    #[test]
+    fn zai_rejects_active_cache_and_effort_with_strip() {
+        // cache active: refused
+        assert!(zai_accepts(CacheMode::Active, Thinking::Preserve, None).is_err());
+        // effort with strip: refused
+        assert!(zai_accepts(CacheMode::Auto, Thinking::Strip, Some(Effort::Medium)).is_err());
+        // happy path: cache auto + preserved thinking + no effort
+        assert!(zai_accepts(CacheMode::Auto, Thinking::Preserve, None).is_ok());
+        // effort with preserved thinking is allowed
+        assert!(zai_accepts(CacheMode::Auto, Thinking::Preserve, Some(Effort::High)).is_ok());
+    }
+
+    #[test]
+    fn deepseek_rejects_active_cache_and_effort_with_strip() {
+        assert!(deepseek_accepts(CacheMode::Active, Thinking::Preserve, None).is_err());
+        assert!(deepseek_accepts(CacheMode::Auto, Thinking::Strip, Some(Effort::Max)).is_err());
+        assert!(deepseek_accepts(CacheMode::Auto, Thinking::Preserve, None).is_ok());
+        assert!(deepseek_accepts(CacheMode::Auto, Thinking::Preserve, Some(Effort::High)).is_ok());
+    }
+}

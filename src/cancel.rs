@@ -53,3 +53,85 @@ impl CancelToken {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_a_fresh_unset_token() {
+        let t: CancelToken = Default::default();
+        assert!(!t.is_cancelled(), "a default token is not cancelled");
+    }
+
+    #[test]
+    fn new_is_a_fresh_unset_token() {
+        let t = CancelToken::new();
+        assert!(!t.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_is_idempotent() {
+        let t = CancelToken::new();
+        t.cancel();
+        t.cancel();
+        assert!(t.is_cancelled());
+    }
+
+    #[test]
+    fn clones_share_the_same_cancel_state() {
+        let a = CancelToken::new();
+        let b = a.clone();
+        a.cancel();
+        assert!(b.is_cancelled(), "a clone sees the cancellation");
+    }
+
+    #[test]
+    fn cancelled_returns_immediately_when_already_cancelled() {
+        let t = CancelToken::new();
+        t.cancel();
+        let started = std::time::Instant::now();
+        crate::test_util::block_on(async { t.cancelled().await });
+        assert!(started.elapsed() < std::time::Duration::from_millis(50),
+            "an already-cancelled token resolves immediately: {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn cancelled_suspends_and_wakes_on_cancel() {
+        // the second branch of the loop: register the waiter, re-check the
+        // flag, await the notification. A cancel arriving during the await
+        // must wake the coroutine.
+        let t = Arc::new(CancelToken::new());
+        let tc = t.clone();
+        crate::test_util::block_on(async move {
+            let waiter = {
+                let t = t.clone();
+                tokio::spawn(async move { t.cancelled().await })
+            };
+            // give the waiter a beat to reach the notify
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tc.cancel();
+            let start = std::time::Instant::now();
+            waiter.await.unwrap();
+            assert!(start.elapsed() < std::time::Duration::from_millis(100),
+                "the waiter woke promptly: {:?}", start.elapsed());
+        });
+    }
+
+    #[test]
+    fn cancelled_wakes_only_after_the_flag_is_set() {
+        // the first branch of the loop: `if self.is_cancelled() { return; }`
+        let t = CancelToken::new();
+        crate::test_util::block_on(async {
+            // immediate: the flag is still false, so we have to wait —
+            // a sibling cancel wakes us up
+            let tc = t.clone();
+            let waiter = tokio::spawn(async move { t.cancelled().await });
+            tokio::task::spawn_blocking(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                tc.cancel();
+            });
+            waiter.await.unwrap();
+        });
+    }
+}
