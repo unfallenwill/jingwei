@@ -13,14 +13,16 @@
 mod api;
 mod cancel;
 mod config;
-mod file_io;
-mod format;
 mod display;
 mod edit;
+mod file_io;
+mod format;
 mod ir;
 mod ledger;
+mod login;
 mod plain;
 mod session;
+mod settings;
 mod tool_runtime;
 mod tools;
 mod tui;
@@ -28,11 +30,13 @@ mod tui;
 #[cfg(test)] mod test_util;
 use crate::api::call_api as api_call_api;
 use crate::cancel::CancelToken;
-use crate::config::{Args, Config, build_config, parse_from};
+use crate::config::{Args, Config, build_config};
 use crate::display::{Msg, Sev, Show};
 use crate::ir::{Block, Message, ToolResult};
+use crate::settings::Settings;
 use crate::tool_runtime::run_tool;
 use crate::tools::{print_tool_call, tools};
+use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::env;
 use std::io;
@@ -132,8 +136,204 @@ const SYSTEM: &str = "You are jingwei (精卫), a coding agent with these tools:
     When asked your name, say you are jingwei (精卫). \
     When finished, reply with a concise 1-3 sentence summary of what you did.";
 
+// ---- cli -------------------------------------------------------------------
+
+/// The argv grammar: top-level subcommands for `login` / `list` / `resume`,
+/// and a flat flag set for the default invocation (one-shot or REPL).
+/// clap does the parsing; `args_from_cli` flattens it back into the
+/// internal [`Args`] shape so the rest of the binary — `build_config`,
+/// `begin_session` — never has to learn what clap looks like.
+#[derive(Parser, Debug)]
+#[command(name = "jingwei", disable_help_flag = true, disable_version_flag = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Cmd>,
+
+    // connection
+    #[arg(long)] api_key: Option<String>,
+    #[arg(long)] base_url: Option<String>,
+    #[arg(short = 'm', long)] model: Option<String>,
+    #[arg(long)] protocol: Option<String>,
+
+    // behavior
+    #[arg(long)] cache: Option<String>,
+    #[arg(long)] thinking: Option<String>,
+    #[arg(long)] effort: Option<String>,
+    #[arg(long)] max_tokens: Option<String>,
+    #[arg(long)] context_size: Option<String>,
+    #[arg(long)] max_turns: Option<String>,
+    #[arg(short = 's', long)] stream: bool,
+    #[arg(short = 'S', long)] no_stream: bool,
+
+    // sessions
+    #[arg(short = 'c', long)] r#continue: bool,
+    /// Resume a session by id prefix. Bare `--resume` is like `-c`.
+    /// clap's `Option<Option<String>>` idiom: outer `Some` means "flag
+    /// present", inner `Some` means "value given".
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    resume: Option<Option<String>>,
+    /// List this project's saved sessions.
+    #[arg(long)] list: bool,
+    /// With `--list`, list every project's sessions.
+    #[arg(long)] all: bool,
+
+    // prompt — everything else, captured verbatim. clap's
+    // `trailing_var_arg` lets the prompt begin after `--`, so users
+    // who want to send `--help` as a literal task can still do so
+    // (jingwei "show me -- --help" — the `--` ends flag parsing).
+    #[arg(trailing_var_arg = true)]
+    prompt: Vec<String>,
+
+    // -h / --help — clap's auto-generated help is disabled in favour
+    // of the hand-written one in config::HELP (which lists every vendor
+    // by name and reads the same to a first-time user as the README).
+    #[arg(short = 'h', long, action = clap::ArgAction::SetTrue)]
+    help: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Set up providers / api keys / active model.
+    Login {
+        #[arg(long)] show: bool,
+        #[arg(long)] reset: bool,
+        #[arg(long)] reveal: bool,
+    },
+    /// List sessions for this project.
+    List {
+        #[arg(long)] all: bool,
+    },
+    /// Resume a session by id prefix; bare `resume` is like `-c`.
+    Resume {
+        id: Option<String>,
+    },
+}
+
+/// Translate [`Cli`] into the internal [`Args`] shape. Subcommands are
+/// mapped onto `Args.resume` / `Args.cont` / `Args.list`; numeric flags
+/// stay as strings here and parse later (the resolver knows what to do
+/// with the error text). Bare `--resume` and `--resume <id>` both
+/// funnel through the same path.
+fn args_from_cli(c: Cli) -> Result<Args> {
+    let mut a = Args {
+        streaming: true,
+        ..Default::default()
+    };
+    if c.command.is_some() { a.list = false; } // subcommands carry their own intent
+    match c.command {
+        Some(Cmd::Login { show, reset, reveal }) => {
+            crate::login::run(show, reset, reveal)?;
+            std::process::exit(0);
+        }
+        Some(Cmd::List { all }) => {
+            a.list = true;
+            a.all = all;
+            return Ok(a);
+        }
+        Some(Cmd::Resume { id }) => {
+            match id {
+                Some(s) if !s.is_empty() => a.resume = Some(s),
+                _ => a.cont = true,
+            }
+        }
+        None => {
+            // the default invocation — copy flags into Args
+            a.api_key = c.api_key;
+            a.base_url = c.base_url;
+            a.model = c.model;
+            a.protocol = c.protocol;
+            a.cache = c.cache;
+            a.thinking = c.thinking;
+            a.effort = c.effort;
+            // numeric strings — leave as String, build_config parses them
+            // (we keep them as String here so a parse error gets the same
+            //  message text the old parse_from produced).
+            a.max_tokens = parse_num_flag("--max-tokens", c.max_tokens)?;
+            a.context_size = parse_num_flag("--context-size", c.context_size)?;
+            a.max_turns = parse_num_flag("--max-turns", c.max_turns)?;
+            if c.no_stream { a.streaming = false; }
+            // --resume value handling: bare (Some(None)) → cont; with value → resume
+            if let Some(r) = c.resume {
+                match r {
+                    Some(s) if !s.is_empty() => a.resume = Some(s),
+                    _ => a.cont = true,
+                }
+            }
+            a.cont |= c.r#continue;
+            a.list = c.list;
+            a.all = c.all;
+            a.prompt = c.prompt;
+        }
+    }
+    Ok(a)
+}
+
+/// Parse a numeric flag, naming the flag in the error so the user can
+/// tell which one rejected its value.
+fn parse_num_flag<T>(flag: &str, raw: Option<String>) -> Result<Option<T>>
+where T: std::str::FromStr, T::Err: std::fmt::Display {
+    match raw {
+        None => Ok(None),
+        Some(s) => s.parse::<T>().map(Some).map_err(|_| Error::Msg(format!("{flag} expects a number"))),
+    }
+}
+
+/// Test-only entrypoint: parse an argv slice (no leading program name)
+/// and yield the internal [`Args`] the same way `run()` does. Used by
+/// `config::tests` to exercise the resolver without spinning up clap
+/// from inside `config.rs`.
+#[cfg(test)]
+pub(crate) fn parse_argv(argv: &[&str]) -> Result<Args> {
+    let mut full = vec!["jingwei".to_string()];
+    full.extend(argv.iter().cloned().map(str::to_string));
+    // `try_parse_from` returns `Err(clap::Error)`. We pull a short
+    // summary from it so the message that ends up in `Error::Msg`
+    // names the bad token when clap can.
+    let cli = Cli::try_parse_from(full)
+        .map_err(|e| Error::Msg(short_clap_err(&e)))?;
+    args_from_cli(cli)
+}
+
+/// Reduce a clap error to a single line that mentions the offending
+/// argument when clap can identify one. Long help blocks the user
+/// cannot easily scroll past.
+fn short_clap_err(e: &clap::Error) -> String {
+    use clap::error::ContextKind;
+    use clap::error::ContextValue;
+    let mut bad: Option<String> = None;
+    for (kind, val) in e.context() {
+        if matches!(kind, ContextKind::InvalidArg) {
+            if let ContextValue::String(s) = val {
+                bad = Some(s.clone());
+            }
+        }
+    }
+    match (e.kind(), bad) {
+        (clap::error::ErrorKind::UnknownArgument, Some(a)) => format!("unknown flag: {a}\ntry --help"),
+        (_, Some(a)) => format!("invalid argument {a}: {e}"),
+        (_, None) => e.to_string(),
+    }
+}
+
 async fn run() -> Result<()> {
-    let args = parse_from(env::args().skip(1))?;
+    // parse() exits the process on error; we want our own error path so
+    // the binary's stderr formatting (the red " jingwei: ... " banner)
+    // matches what every other code path uses.
+    let cli = Cli::try_parse_from(env::args()).map_err(|e| Error::Msg(short_clap_err(&e)))?;
+    if cli.help {
+        crate::config::print_help();
+        return Ok(());
+    }
+    let mut args = args_from_cli(cli)?;
+    // Settings is the layer between env and vendor defaults. We fold its
+    // active profile into `args` here so `build_config` (which only reads
+    // args + env) sees a fully-resolved request. The chain is
+    // CLI flag > env var > settings.json active profile > vendor default.
+    if let Some(active) = Settings::load().ok().and_then(|s| s.active_args()) {
+        if args.api_key.is_none() { args.api_key = Some(active.api_key); }
+        if args.base_url.is_none() { args.base_url = active.base_url; }
+        if args.protocol.is_none() { args.protocol = Some(active.protocol); }
+    }
     // --list answers from the disk alone — no credentials needed
     if args.list {
         return session::print_list(args.all);
@@ -535,7 +735,8 @@ mod tests {
     // ---- flags & config ----
 
     fn flags(list: &[&str]) -> Result<Args> {
-        parse_from(list.iter().map(|s| s.to_string()))
+        // clap lives in this module; tests here use the public test seam.
+        crate::parse_argv(list)
     }
 
     #[test]
@@ -610,9 +811,11 @@ mod tests {
     #[test]
     fn enum_flags_case_insensitive_and_list_available_values() {
         let _env = crate::test_util::env_lock();
-        let parse = |extra: &[&str]| parse_from(
-            ["--api-key", "k", "--base-url", "https://x", "-m", "m"].iter()
-                .chain(extra.iter()).map(|s| s.to_string())).unwrap();
+        let parse = |extra: &[&str]| {
+            let mut argv: Vec<&str> = vec!["--api-key", "k", "--base-url", "https://x", "-m", "m"];
+            argv.extend_from_slice(extra);
+            crate::parse_argv(&argv).unwrap()
+        };
         // spellings are case-insensitive in every position
         assert_eq!(build_config(&parse(&["--protocol", "ZAI"])).unwrap().protocol, Protocol::ZAI);
         let cfg = build_config(&parse(&["--cache", "Active", "--thinking", "STRIP"])).unwrap();
