@@ -25,7 +25,7 @@ export JINGWEI_API_KEY=<your-api-key>
 # optional
 export JINGWEI_BASE_URL=...
 export JINGWEI_MODEL=...
-# Defaults: --max-tokens 131072 · --context-size 1000000 · --max-turns 60
+# Defaults: --max-tokens 131072 · --context-size 1000000 · --max-turns 100
 export JINGWEI_PROTOCOL=minimax     # or zai, or deepseek
 export JINGWEI_CACHE=auto           # or active (minimax's cache_control breakpoints)
 export JINGWEI_THINKING=preserve     # or strip
@@ -247,7 +247,7 @@ file jingwei has never seen is written as before, because a gate that fires on
 Every tool call is echoed to the terminal: the tool name, a summary of its
 arguments (the command, the path, …) and the first 20 lines of its output.
 Tool outputs above `MAX_TOOL_OUTPUT` (50 KB) are truncated before they go back
-to the model. The agent loop stops after `--max-turns` (default 60) iterations —
+to the model. The agent loop stops after `--max-turns` (default 100) iterations —
 even 精卫 has a budget.
 
 ## MCP

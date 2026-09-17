@@ -12,7 +12,7 @@ use std::env;
 
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 131_072;
 pub(crate) const DEFAULT_CONTEXT_SIZE: u64 = 1_000_000;
-pub(crate) const DEFAULT_MAX_TURNS: u32 = 60;
+pub(crate) const DEFAULT_MAX_TURNS: u32 = 100;
 
 /// Version of the internal history payload as it lands in session files —
 /// owned here, beside the shape it versions; session.rs embeds it in the
@@ -171,7 +171,7 @@ CONNECTION:
 
 BEHAVIOR:
     --max-tokens <N>    max output tokens per turn (default 131072)
-    --max-turns <N>     stop the agent loop after N turns (default 60)
+    --max-turns <N>     stop the agent loop after N turns (default 100)
     --context-size <N>  trim history when estimated tokens exceed N (default 1000000)
     --cache <MODE>      auto (default, passive server cache) | active (cache_control
                         breakpoints on the Messages wire — minimax's own)
