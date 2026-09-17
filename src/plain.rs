@@ -148,11 +148,11 @@ impl Show for PlainSink {
 /// No editor here, so no input-history file: recall is a TUI feature; this
 /// path keeps the shell's own history (up-arrow) and line editing.
 pub async fn plain_repl(
-    cfg: &crate::Config,
+    cfg: &crate::config::Config,
     mut convo: crate::session::Convo,
     banners: Vec<String>,
 ) -> crate::Result<()> {
-    use crate::{agent_turn, CancelToken};
+    use crate::{agent_turn};
     let sink = PlainSink::new();
     let tty = std::io::stdin().is_terminal();
     sink.show(Msg::Banner("jingwei — 精卫填海，一石一石 · type a task, /exit or Ctrl-D rests, Ctrl-C interrupts".into()));
@@ -189,7 +189,7 @@ pub async fn plain_repl(
         convo.history.push(crate::user_message(&line));
         convo.persist(&sink); // the task is on disk before the first stone moves
         sink.show(Msg::TaskBegin(line));
-        let token = CancelToken::new();
+        let token = crate::cancel::CancelToken::new();
         match agent_turn(cfg, &mut convo.history, &token, &sink).await {
             Err(crate::Error::Interrupted) => {}
             Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),

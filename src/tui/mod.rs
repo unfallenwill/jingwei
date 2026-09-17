@@ -40,7 +40,12 @@ pub mod view;
 
 use crate::display::{ChannelSink, Msg, Sev, Show as DisplayShow};
 use crate::session::Convo;
-use crate::{agent_turn, home_dir, user_message, CancelToken, Config, Error};
+use crate::config::Config;
+use crate::{agent_turn, user_message, Error};
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(std::path::PathBuf::from)
+}
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::style::Print;
 use crossterm::event::{
@@ -68,7 +73,7 @@ type Backend = CrosstermBackend<io::Stdout>;
 /// The running agent: its cancellation token and its coroutine. A struct,
 /// not a tuple — the shell reads it by name.
 struct Agent {
-    token: Arc<CancelToken>,
+    token: Arc<crate::cancel::CancelToken>,
     job: tokio::task::JoinHandle<()>,
 }
 
@@ -645,7 +650,7 @@ fn handle(
         Action::Submit(line) => {
             let cfg = cfg.clone();
             let convo = convo.clone();
-            let token = Arc::new(CancelToken::new());
+            let token = Arc::new(crate::cancel::CancelToken::new());
             let tok = token.clone();
             sink.show(Msg::TaskBegin(line.clone()));
             let sink = sink.clone(); // one for the spawned task, one for the shell

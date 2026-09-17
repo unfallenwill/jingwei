@@ -1017,7 +1017,7 @@ mod tests {
     fn fold_hierarchy_is_structural_not_chromatic() {
         // the claim of the gutter: strip every color and modifier and the
         // block still reads as a block — DIM-blind terminals lose nothing
-        let _env = crate::env_lock();
+        let _env = crate::test_util::env_lock();
         std::env::set_var("JINGWEI_NO_COLOR", "1");
         let mut a = App::new();
         update(&mut a, Ev::Msg(Msg::Think("reasoned".into())));
@@ -1036,7 +1036,7 @@ mod tests {
     #[test]
     fn notes_render_with_severity_background() {
         // this row is *about* color — force it on regardless of the harness
-        let _env = crate::env_lock();
+        let _env = crate::test_util::env_lock();
         std::env::set_var("JINGWEI_COLOR", "always");
         let mut a = App::new();
         update(&mut a, Ev::Msg(Msg::Note { sev: crate::display::Sev::Err, text: "api 429".into() }));
@@ -1049,7 +1049,7 @@ mod tests {
 
     #[test]
     fn no_color_renders_the_same_rows_without_color() {
-        let _env = crate::env_lock();
+        let _env = crate::test_util::env_lock();
         std::env::set_var("JINGWEI_NO_COLOR", "1");
         let mut a = App::new();
         update(&mut a, Ev::Msg(Msg::Note { sev: crate::display::Sev::Err, text: "api 429".into() }));

@@ -47,7 +47,11 @@
 
 use crate::display::{self, Msg, Sev, Show};
 use crate::ir::Message;
-use crate::{home_dir, Error};
+use crate::Error;
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(std::path::PathBuf::from)
+}
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};

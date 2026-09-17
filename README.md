@@ -218,7 +218,27 @@ caching decides how the server bills and accelerates that context.
 | `bash`       | Runs a shell command (`sh -c` on Unix, `cmd /C` on Win). |
 | `read_file`  | Reads a file.                                            |
 | `write_file` | Writes a file, creating parent dirs.                     |
-| `edit_file`  | Replaces the first exact occurrence of a string.         |
+| `edit_file`  | Replaces `old` with `new` — exactly, then line by line ignoring indentation. Names the line numbers when `old` is ambiguous; `replace_all` replaces every occurrence; `edits` applies several pairs in one all-or-nothing call. |
+
+`edit_file` is the tool with the most policy, all of it aimed at keeping the
+work in one trip. It matches exactly first, then line by line with indentation
+ignored — the model may copy a line rather than every byte of it — and shifts
+`new` to the indentation the file actually uses. An ambiguous `old` is refused
+*with the line numbers of every occurrence and the two ways out* (widen the
+context, or `replace_all`) instead of the bare demand that it be unique, which
+only buys a retry with more text pasted in. `edits` carries several pairs in one
+call, resolved in order against one buffer and either all applied or none — that
+is the way to do a rename or a repeated idiom without reaching for `write_file`,
+which is the blunt tool that can quietly overwrite uncommitted work.
+
+The write itself is a temp file plus a rename (as `session.rs` has always done),
+so no crash can leave a truncated file behind. And both `edit_file` and
+`write_file` keep a ledger of the bytes they last saw in each path: if the file
+on disk is not those bytes — the user's editor, a formatter, another agent — the
+write is refused and the tool says to re-read first. That is the one strict
+check that pays for itself. It is deliberately not a read-before-edit gate: a
+file jingwei has never seen is written as before, because a gate that fires on
+"you read it through bash" costs a turn and protects nothing.
 
 Every tool call is echoed to the terminal: the tool name, a summary of its
 arguments (the command, the path, …) and the first 20 lines of its output.
