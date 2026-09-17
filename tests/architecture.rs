@@ -44,8 +44,8 @@ fn layer_of(mod_name: &str) -> Option<Layer> {
     let l = match mod_name {
         "display" | "ir" | "session" => Layer::L0,
         "cancel" | "file_io" | "format" | "ledger" => Layer::L1,
-        "config" => Layer::L3, // tool/config tier; may reach into api for the Vendor port + policy enums
-        "edit" | "tools" | "tool_runtime" => Layer::L3,
+        "config" | "settings" => Layer::L3, // tool/config tier; may reach into api for the Vendor port + policy enums
+        "edit" | "tools" | "tool_runtime" | "login" => Layer::L3,
         "api" | "api::minimax" | "api::zai" | "api::deepseek" => Layer::L4,
         "main" | "plain" | "tui" | "tui::model" | "tui::update" | "tui::view" => Layer::L5,
         "test_util" => Layer::T,

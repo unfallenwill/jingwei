@@ -127,10 +127,13 @@ pub(crate) fn tools() -> Vec<Tool> {
     ]
 }
 
-/// Combined-output shape for the synchronous bash entry. The async one in
-/// `tool_runtime` builds the same string, so the tool's output is the same
-/// whether the call lands on the blocking path or the cancellable one.
-fn bash_output(status: Option<&ExitStatus>, out: &str, err: &str) -> String {
+/// Combined-output shape for the bash tool — shared by the synchronous
+/// registry entry (below) and the cancellable coroutine path in
+/// `tool_runtime`, so the tool's output is the same shape whichever
+/// path the call lands on. The async caller can hand `Some(&status)`
+/// after reaping the child; the sync one hands `Some(&output.status)`
+/// from the std `Command::output` it just consumed.
+pub(crate) fn bash_output(status: Option<&ExitStatus>, out: &str, err: &str) -> String {
     let mut s = format!("exit={}\n{out}", status.and_then(|st| st.code()).unwrap_or(-1));
     if !err.is_empty() {
         if !s.ends_with('\n') { s.push('\n'); }

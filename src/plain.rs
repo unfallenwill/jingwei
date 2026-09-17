@@ -163,7 +163,14 @@ pub async fn plain_repl(
     let stdin = std::io::stdin();
     loop {
         if tty {
-            print!("{}{} ", display::PROMPT_HEAD, display::PROMPT_GUTTER.trim());
+            // The interactive prompt must match the TaskBegin banner
+            // character-for-character — both prefix the same `<head> <gutter> `
+            // string. Earlier versions `.trim()`'d the gutter to drop
+            // the leading space; the result drifted from the banner and
+            // from what `prompt_w()` (TUI-aligned) measures, so a
+            // screenshot of the prompt and the task line did not line
+            // up. Plain keeps the leading space.
+            print!("{}{} ", display::PROMPT_HEAD, display::PROMPT_GUTTER);
             let _ = std::io::stdout().flush();
         }
         let mut line = String::new();

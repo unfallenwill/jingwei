@@ -250,7 +250,21 @@ impl Session {
                 fs::create_dir_all(p)?;
             }
         }
-        let mut f = OpenOptions::new().create(true).append(true).open(self.path.as_deref().unwrap())?;
+        let mut f = if self.persisted == 0 {
+            // The first sync of a fresh session must not append to an
+            // orphan file with the same name — the suffix collision is
+            // unlikely (rand4 = 16-bit) but a stale file from a prior
+            // crash would silently turn into a corrupted second
+            // session under `list_in`. `create_new` refuses an
+            // existing target; the error surfaces as an io error the
+            // caller already knows to handle.
+            if let Some(p) = self.path.as_deref().and_then(Path::parent) {
+                fs::create_dir_all(p)?;
+            }
+            OpenOptions::new().write(true).create_new(true).open(self.path.as_deref().unwrap())?
+        } else {
+            OpenOptions::new().create(true).append(true).open(self.path.as_deref().unwrap())?
+        };
         if self.persisted == 0 {
             writeln!(f, "{}", self.header)?;
         }
@@ -693,6 +707,26 @@ mod tests {
         loaded.sync(&h2).unwrap();
         let (_, hist2) = load_in(&d, Some(s.id())).unwrap();
         assert_eq!(hist2, h2);
+    }
+
+    #[test]
+    fn first_sync_refuses_to_clobber_an_existing_file_with_the_same_name() {
+        // an orphan file at the session's path (a sibling crash left it
+        // behind, a flake in the random suffix landed twice) must not
+        // be silently appended to — the old content would gain a
+        // second header and `list_in` would miscount messages.
+        let d = dir("collision");
+        let mut s = Session::create(Some(&d), &prov(), 1, 0);
+        // a foreign file already at the path the session would use
+        let path = s.path().unwrap().to_owned();
+        std::fs::write(&path, "this is not a session\n").unwrap();
+        let h = history();
+        let err = s.sync(&h).unwrap_err();
+        assert!(matches!(err.kind(), std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied),
+            "create_new surfaces the conflict as an io error: {err}");
+        // and the foreign file is untouched
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "this is not a session\n", "first sync did not overwrite");
     }
 
     #[test]
