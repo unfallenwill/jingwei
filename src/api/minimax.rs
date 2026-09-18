@@ -368,8 +368,6 @@ mod tests {
         let token = crate::cancel::CancelToken::new();
         let cx = make_ctx();
         let (resp, _, _) = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
-        eprintln!("got blocks: {:?}
-usage: {:?}", resp.blocks, resp.usage);
         assert_eq!(resp.blocks.len(), 2);
         assert_eq!(resp.blocks[0].text().unwrap(), "hello world");
         assert_eq!(resp.blocks[1].name(), "bash");
