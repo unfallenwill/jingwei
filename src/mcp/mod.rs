@@ -576,10 +576,10 @@ mod tests {
     /// each one is in.
     #[tokio::test]
     async fn list_reports_one_row_per_server_with_state() {
-        let mut stub1 = Stub::new();
+        let stub1 = Stub::new();
         let mut entry1 = stub1.entry(&[("STUB_TOOLS", "echo,fail")]);
         entry1.name = "alpha".into();
-        let mut stub2 = Stub::new();
+        let stub2 = Stub::new();
         let mut entry2 = stub2.entry(&[("STUB_TOOLS", "noise")]);
         entry2.name = "beta".into();
         let hub = Hub::of_entries(vec![entry1, entry2]).await;

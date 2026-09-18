@@ -1795,7 +1795,7 @@ mod tests {
         let convo = Arc::new(AsyncMutex::new(Convo::ephemeral()));
         // a pre-existing agent slot, as if the first Submit had already
         // run and the spawned coroutine were still in flight
-        let mut agent: Option<Agent> = None;
+        let mut agent: Option<Agent>;
         let first_token = Arc::new(crate::cancel::CancelToken::new());
         let hub = crate::mcp::Hub::empty();
         // tokio::test wraps us in a runtime; spawn the pre-existing agent

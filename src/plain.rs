@@ -487,23 +487,6 @@ mod tests {
 
     use crate::display::Show;
 
-    /// A sink that captures every message handed to it, so the tests
-    /// can assert on what the user actually sees after `/mcp ...`.
-    struct CapturingSink(std::sync::Mutex<Vec<(Stream, String)>>);
-    impl Show for CapturingSink {
-        fn show(&self, m: Msg) {
-            use std::io::Write as _;
-            // Reuse the public Plain fold to land the message on the
-            // right stream, then capture the resulting lines. This keeps
-            // the test honest about what the REPL would print.
-            let sink = crate::plain::PlainSink::new();
-            // We can't read PlainSink's output — only capture the raw
-            // messages and assert on them.
-            let _ = sink;
-            let _ = m;
-        }
-    }
-
     /// Capture sink that records banner / note messages verbatim.
     struct BagSink(std::sync::Mutex<Vec<Msg>>);
     impl Show for BagSink {

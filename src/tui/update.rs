@@ -877,7 +877,6 @@ mod tests {
                 CompletionItem { insert: "alpha".into(), label: "alpha".into(), description: "first server".into(), trailing_space: false },
                 CompletionItem { insert: "beta".into(), label: "beta".into(), description: "second server".into(), trailing_space: false },
             ],
-            _ => vec![],
         }
         .into_iter()
         .filter(|c| c.insert.starts_with(prefix) || c.label.trim_start_matches('/').starts_with(prefix) || prefix.is_empty())
