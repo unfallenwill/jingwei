@@ -21,11 +21,9 @@ struct Route {
     tool: String,
 }
 
-/// The state of one server, as the hub sees it.
-///
-/// A summary view over the internal [`ServerState`]: the external callers
-/// do not need to see the [`Connection`] held inside `Ready`, so the public
-/// type is a flat enum that fits a `Vec` for `/mcp list`.
+/// The state of one server, as the hub sees it. The public summary type:
+/// external callers do not need to see the [`Connection`] held inside the
+/// internal `Ready`, so this flat enum fits a `Vec` for `/mcp list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerState {
     /// It came up and is offering its tools to the model.

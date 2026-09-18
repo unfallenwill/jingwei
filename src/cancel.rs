@@ -45,7 +45,7 @@ impl CancelToken {
     pub(crate) async fn cancelled(&self) {
         loop {
             if self.is_cancelled() { return; }
-            // Register the waiter *before* re-checking the flag, so a cancel
+            // Register the waiter before re-checking the flag, so a cancel
             // landing in between can never be missed.
             let notified = self.notify.notified();
             if self.is_cancelled() { return; }
