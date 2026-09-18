@@ -30,7 +30,6 @@
 //! reading, or the diff method. Each lives in its own commit.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Hard cap on the AGENTS.md body. 64 KB ≈ 20K tokens — enough for real
 /// projects, small enough that the cached prefix stays cheap. A file
@@ -49,23 +48,12 @@ const FILENAME: &str = "AGENTS.md";
 /// agent.
 #[derive(Debug, Clone)]
 pub struct AgentsMdContext {
-    /// The directory we started walking up from. Kept for diagnostics
-    /// ("loaded from <workspace>") and so a future refresh can re-walk
-    /// without the caller having to remember it. Currently the load
-    /// path never reads it back, but a refresh needs it.
-    #[allow(dead_code)]
-    pub(crate) workspace: PathBuf,
     /// Path of the AGENTS.md we loaded, walking up. `None` when no
     /// AGENTS.md was found at any ancestor — agent sees no conventions.
     pub found_path: Option<PathBuf>,
     /// The body, capped at [`MAX_ROOT_BYTES`]. Empty when `found_path`
     /// is `None`.
     pub content: String,
-    /// Unix seconds at load time. The banner and any future context
-    /// message embed this so the model knows how fresh the view is —
-    /// and a future diff needs it for "what changed since".
-    #[allow(dead_code)]
-    pub(crate) loaded_at: u64,
     /// Paths of AGENTS.md files under `workspace` (the cwd where jingwei
     /// was invoked), excluding the closest one already represented by
     /// `found_path`. Bodies are *not* loaded — the model reads them on
@@ -99,22 +87,11 @@ impl AgentsMdContext {
             cur = d.parent().map(|p| p.to_path_buf());
         }
 
-        // Nested AGENTS.md index: tree-wide BFS from `workspace` (the
-        // cwd where jingwei was invoked). The cwd *is* the project
-        // root — we don't depend on `.git` discovery, which is fragile
-        // (other VCSes, no-VCS dirs, worktrees). Hidden directories
-        // (`.git`, `.hg`, …) and common heavy ones (`target`,
-        // `node_modules`, …) are skipped so we don't walk huge trees
-        // for nothing. `found_path` (the closest AGENTS.md) is
-        // excluded; the rest are surfaced as a path-only index the
-        // model reads on demand via `read_file`.
         let nested_paths = collect_tree_agents_md(workspace, found_path.as_ref());
 
         Self {
-            workspace: workspace.to_path_buf(),
             found_path,
             content,
-            loaded_at: now_secs(),
             nested_paths,
         }
     }
@@ -122,12 +99,10 @@ impl AgentsMdContext {
     /// The empty context: same shape, but no file found. The `--no-agents-md`
     /// flag uses this so the rest of the agent runs as if the user simply
     /// had no AGENTS.md — no banner, no extras, no surprise.
-    pub fn empty(workspace: &Path) -> Self {
+    pub fn empty(_workspace: &Path) -> Self {
         Self {
-            workspace: workspace.to_path_buf(),
             found_path: None,
             content: String::new(),
-            loaded_at: now_secs(),
             nested_paths: Vec::new(),
         }
     }
@@ -175,20 +150,11 @@ fn collect_tree_agents_md(root: &Path, exclude: Option<&PathBuf>) -> Vec<PathBuf
             .flatten()
             .filter_map(|e| {
                 let p = e.path();
-                // Skip symlinks: a symlink inside the workspace could
-                // point outside (escaping the project root entirely,
-                // e.g. into `/tmp` or a sibling repo), and a cycle
-                // through symlinks would loop the BFS forever. Using
-                // `symlink_metadata` here is the difference between
-                // "is this entry a symlink?" and "does the underlying
-                // path point to a directory we could resolve?" — the
-                // former is what we want. A regular subdir is not a
-                // symlink, so `file_type().is_symlink()` is false for
-                // the directories we do want to recurse into.
-                let meta = e.metadata().ok()?;
-                if meta.is_symlink() {
-                    return None;
-                }
+                // Skip symlinks: one could escape the project root (into
+                // /tmp or a sibling repo) or cycle and loop the BFS
+                // forever. `file_type().is_symlink()` is the cheapest way
+                // to ask "is this entry itself a link?".
+                if e.metadata().ok()?.is_symlink() { return None; }
                 if p.is_dir() && !is_skippable(&p) { Some(p) } else { None }
             })
             .collect();
@@ -205,15 +171,8 @@ fn collect_tree_agents_md(root: &Path, exclude: Option<&PathBuf>) -> Vec<PathBuf
 /// build/dependency trees.
 fn is_skippable(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return false };
-    if name.starts_with('.') {
-        // `.` and `..` are handled by read_dir; everything else
-        // starting with `.` is skipped (`.hg`, `.idea`, `.cache`, …).
-        return true;
-    }
-    matches!(
-        name,
-        "node_modules" | "target" | "dist" | "build" | ".venv" | "venv" | "__pycache__"
-    )
+    if name.starts_with('.') { return true; } // `.`, `..` handled by read_dir
+    matches!(name, "node_modules" | "target" | "dist" | "build" | ".venv" | "venv" | "__pycache__")
 }
 
 /// Truncate `text` to at most [`MAX_ROOT_BYTES`] bytes on a char
@@ -221,25 +180,15 @@ fn is_skippable(path: &Path) -> bool {
 /// slice. The marker is in the body so it lands in the same prompt
 /// segment as the truncated text.
 fn cap(mut text: String) -> String {
-    if text.len() <= MAX_ROOT_BYTES {
-        return text;
-    }
+    if text.len() <= MAX_ROOT_BYTES { return text; }
     let mut end = MAX_ROOT_BYTES;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    while end > 0 && !text.is_char_boundary(end) { end -= 1; }
     text.truncate(end);
-    text.push_str(&format!(
-        "\n\n[…truncated, AGENTS.md exceeded {} bytes]",
-        MAX_ROOT_BYTES
-    ));
+    text.push_str(&format!("\n\n[…truncated, AGENTS.md exceeded {} bytes]", MAX_ROOT_BYTES));
     text
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs()).unwrap_or(0)
-}
+
 
 // ---- tests -----------------------------------------------------------------
 
