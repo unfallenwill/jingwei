@@ -685,12 +685,10 @@ pub(super) fn tool_name(server: &str, tool: &str) -> String {
         return name;
     }
     let hash = short_hash(&name);
-    let mut cut = MAX_NAME - hash.len() - 1;
-    // A name is ASCII by construction — [`sanitize`] made it so — and this is
-    // belt and braces for a caller that one day does not.
-    while cut > 0 && !name.is_char_boundary(cut) {
-        cut -= 1;
-    }
+    // The name is ASCII by construction ([`sanitize`] just made it so),
+    // so every byte offset is a char boundary — the loop that used to
+    // sit here was belt-and-braces for a caller that one day does not.
+    let cut = MAX_NAME - hash.len() - 1;
     format!("{}~{}", &name[..cut], hash)
 }
 
@@ -699,15 +697,7 @@ pub(super) fn tool_name(server: &str, tool: &str) -> String {
 /// backend) — that is a collision the hub reports rather than a fix to guess
 /// at.
 fn sanitize(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    text.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '_' }).collect()
 }
 
 /// A short, stable hash of a name.
