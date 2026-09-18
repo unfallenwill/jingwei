@@ -973,7 +973,8 @@ fn handle(
                     sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
                 }
                 // the task is on disk before the first stone moves
-                match agent_turn(&cfg, &mut c.history, &tok, &hub, &sink).await {
+                let mut turn = crate::turn::Turn::new(0);
+                match agent_turn(&cfg, &mut c.history, &mut turn, &tok, &hub, &sink).await {
                     Err(Error::Interrupted) => {}
                     Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
                     Ok(()) => {}

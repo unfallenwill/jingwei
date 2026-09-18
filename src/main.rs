@@ -40,7 +40,7 @@ use crate::mcp::Hub;
 use crate::settings::Settings;
 use crate::tool_runtime::run_tool;
 use crate::tools::{print_tool_call, tools};
-use crate::turn::{Turn, TurnState};
+use crate::turn::{Turn, TurnOutcome, TurnState};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::env;
@@ -387,7 +387,8 @@ async fn run_with_hub(args: Args, cfg: Config, hub: Hub) -> Result<()> {
         sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
     }
     let token = CancelToken::new();
-    let res = agent_turn(&cfg, &mut convo.history, &token, &hub, &sink).await;
+    let mut turn = Turn::new(0);
+    let res = agent_turn(&cfg, &mut convo.history, &mut turn, &token, &hub, &sink).await;
     if let Err(e) = convo.persist() {
         sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
     }
@@ -479,13 +480,14 @@ fn user_message(text: &str) -> Message {
 /// place. A second Ctrl-C while it is unwinding exits immediately, for when
 /// even graceful is too slow.
 ///
-/// `turn` is the per-run state machine: a fresh `Turn` enters here in
-/// `Queued` and walks the table as [`run_turn`] drives it. The wrapper
-/// owns the construction so callers see one entry point and never have to
-/// reach for `Turn::new` themselves.
-async fn agent_turn(cfg: &crate::config::Config, history: &mut Vec<Message>, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
-    let mut turn = Turn::new(0);
-    let agent = agent_loop(cfg, history, &mut turn, token, hub, sink);
+/// `turn` is the per-run state machine: the caller hands in a fresh
+/// `Turn` (in `Queued`) and the wrapper drives it through the table via
+/// [`agent_loop`]. The caller can inspect `turn` after the wrapper
+/// returns to read the terminal state — the wrapper exists to own the
+/// cancel select (`tokio::select!` against Ctrl-C) and the double-signal
+/// semantics, not to hide the turn from anyone.
+async fn agent_turn(cfg: &crate::config::Config, history: &mut Vec<Message>, turn: &mut Turn, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
+    let agent = agent_loop(cfg, history, turn, token, hub, sink);
     tokio::pin!(agent);
     tokio::select! {
         res = &mut agent => return res,
@@ -520,7 +522,9 @@ async fn agent_turn(cfg: &crate::config::Config, history: &mut Vec<Message>, tok
 /// drives it through the table — `Queued → InProgress` at the entry, and
 /// the terminal transition on the way out. The mechanics of "do API calls
 /// and run tools" live in [`run_turn`], kept separate so the mapping
-/// between [`Result`] and [`TurnState`] has exactly one home ([`finish_turn`]).
+/// between [`Result`] and [`TurnState`] has exactly one home (caller
+/// translates to [`TurnOutcome`], [`Turn::finish`] maps that onto a
+/// state).
 ///
 /// `hub` is the MCP hub — its `definitions()` is the source of the schemas
 /// the model sees, and its `call()` is what runs when the model asks for a
@@ -536,13 +540,22 @@ async fn agent_loop(cfg: &crate::config::Config, history: &mut Vec<Message>, tur
         .map_err(|e| Error::Msg(e.to_string()))?;
 
     let result = run_turn(cfg, history, token, hub, sink).await;
-    finish_turn(turn, &result);
+    // The Result → TurnOutcome translation lives here because `Error` is
+    // a main-rs type and turn.rs deliberately does not depend on it.
+    // From TurnOutcome onward the mapping is the turn's own concern
+    // ([`Turn::finish`]).
+    let outcome = match &result {
+        Ok(()) => TurnOutcome::Completed,
+        Err(Error::Interrupted) => TurnOutcome::Interrupted,
+        Err(e) => TurnOutcome::Failed(e.to_string()),
+    };
+    turn.finish(outcome);
     result
 }
 
 /// Drive one turn's worth of API calls and tool runs. Pure mechanics — the
 /// [`Turn`] state machine is owned by the caller. Returns whatever
-/// happened; the caller maps it onto a terminal state via [`finish_turn`].
+/// happened; the caller maps it onto a terminal state via [`Turn::finish`].
 async fn run_turn(cfg: &crate::config::Config, history: &mut Vec<Message>, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
     let mut schemas: Vec<Value> = tools().iter()
         .map(|t| json!({"name": t.name, "description": t.desc, "input_schema": t.schema}))
@@ -600,20 +613,7 @@ async fn run_turn(cfg: &crate::config::Config, history: &mut Vec<Message>, token
     Ok(())
 }
 
-/// Move the turn to the terminal state that matches the result. Centralized
-/// so the [`Result`] → [`TurnState`] mapping rule lives in one place; the
-/// table in [`crate::turn`] is the single source of truth for what is
-/// legal. A `TurnError` here means a future change broke the mapping —
-/// silently ignored, because the smoke tests in `turn.rs` pin the table
-/// down before any new return variant can land here.
-fn finish_turn(turn: &mut Turn, result: &Result<()>) {
-    let (next, payload) = match result {
-        Ok(()) => (TurnState::Completed, None),
-        Err(Error::Interrupted) => (TurnState::Interrupted, None),
-        Err(e) => (TurnState::Failed, Some(e.to_string())),
-    };
-    let _ = turn.transition(next, payload);
-}
+
 
 fn truncate(s: &str) -> String {
     if s.len() <= MAX_TOOL_OUTPUT { return s.into(); }
@@ -1176,6 +1176,34 @@ mod tests {
 
     // bash+grandchild test lives in tool_runtime::tests; see cmd/conn
     // there for a deeper timeout note.
+
+    /// The wrapper owns the cancel select; the loop-level tests above
+    /// exercise the mechanics without it. This one drives the wrapper
+    /// end-to-end and asserts on the same Turn the caller owns — so a
+    /// future change that forgets to plumb `&mut turn` through agent_turn,
+    /// or hands a non-fresh turn to agent_loop, fails here.
+    #[test]
+    fn agent_turn_drives_a_fresh_turn_through_to_completed() {
+        let done = r#"{"content":[{"type":"text","text":"all done"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let (port, _) = mock_seq(vec![(200, done.into())]);
+        let mut turn = Turn::new(7);
+        // a wrapper-level run starts in Queued — that's the caller's job
+        // to construct, and the wrapper must not silently rewind it.
+        assert_eq!(turn.state, TurnState::Queued);
+        let mut history = hv(vec![json!({"role": "user", "content": "say hi"})]);
+        block_on(async {
+            let hub = crate::mcp::Hub::empty();
+            agent_turn(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await.unwrap();
+            hub.shutdown().await;
+        });
+        // the wrapper drove Queued → InProgress → Completed on the turn
+        // the caller handed in; the id survives, the timestamps stamp
+        // both ends, and the loop's mechanics ran at least once.
+        assert_eq!(turn.id, 7, "wrapper must not rewind turn id");
+        assert_eq!(turn.state, TurnState::Completed);
+        assert!(turn.started_at.is_some() && turn.ended_at.is_some());
+        assert_eq!(hist(&history).as_array().unwrap().last().unwrap()["role"], json!("assistant"));
+    }
 
     #[test]
     fn error_display() {

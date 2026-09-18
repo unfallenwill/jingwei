@@ -216,7 +216,8 @@ pub async fn plain_repl(
         // the task is on disk before the first stone moves
         sink.show(Msg::TaskBegin(line));
         let token = crate::cancel::CancelToken::new();
-        match agent_turn(cfg, &mut convo.history, &token, &hub, &sink).await {
+        let mut turn = crate::turn::Turn::new(0);
+        match agent_turn(cfg, &mut convo.history, &mut turn, &token, &hub, &sink).await {
             Err(crate::Error::Interrupted) => {}
             Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
             Ok(()) => {}

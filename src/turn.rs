@@ -187,6 +187,42 @@ impl Turn {
     }
 }
 
+/// What happened during the run, expressed in the categories the state
+/// machine distinguishes. The caller translates its own `Result` into
+/// this enum (where the caller's error type lives), then hands it to
+/// [`Turn::finish`] — the table knows how to map an outcome onto a
+/// state, but it does not know any specific error type.
+#[derive(Debug)]
+pub enum TurnOutcome {
+    /// The run ended naturally on a final-text response.
+    Completed,
+    /// Ctrl-C landed at a suspension point inside the run. Same shape
+    /// as `Interrupted` in the table — kept as its own variant so the
+    /// caller's translation is exhaustive against the error type.
+    Interrupted,
+    /// The run ended on an error of some other kind; `0` carries the
+    /// rendered message.
+    Failed(String),
+}
+
+impl Turn {
+    /// Move the turn to the terminal state that matches the outcome.
+    /// Centralizes the `TurnOutcome` → `TurnState` mapping on this side;
+    /// the `Result` → `TurnOutcome` translation stays with the caller's
+    /// error type. From outcome onward everything is the turn's concern.
+    /// A `TurnError` here means a future change broke the mapping — the
+    /// smoke tests pin the table down before any new outcome can land
+    /// here.
+    pub fn finish(&mut self, outcome: TurnOutcome) {
+        let (next, payload) = match outcome {
+            TurnOutcome::Completed => (TurnState::Completed, None),
+            TurnOutcome::Interrupted => (TurnState::Interrupted, None),
+            TurnOutcome::Failed(msg) => (TurnState::Failed, Some(msg)),
+        };
+        let _ = self.transition(next, payload);
+    }
+}
+
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
