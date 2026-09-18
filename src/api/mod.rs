@@ -23,13 +23,11 @@ use std::pin::Pin;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// The boxed future a vendor's `turn` returns. Boxed because the wire is
-/// chosen at runtime — one allocation per request, and the vendor's own
+/// The boxed future a vendor's `turn` returns. Boxed because the wire
+/// is chosen at runtime — one allocation per request, and the vendor's
 /// streaming/blocking machinery stays its own. The third slot is the
-/// rendered wire body that was actually sent: the session records it
-/// verbatim so a reader can see what the model saw on every request,
-/// not just the message stream. Vendors that build a different wire
-/// shape return whatever shape they built.
+/// rendered wire body the vendor actually sent: the session records it
+/// verbatim.
 pub(crate) type Turn<'a> = Pin<Box<dyn Future<Output = Result<(Response, bool, Value)>> + Send + 'a>>;
 
 /// The provider port. One impl per wire; the composition root holds a
@@ -199,10 +197,7 @@ pub(crate) fn strip_thinking(messages: &[Message]) -> Vec<Message> {
 }
 
 fn http() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_read(Duration::from_secs(180))
-        .timeout_write(Duration::from_secs(60))
-        .build()
+    ureq::AgentBuilder::new().timeout_read(Duration::from_secs(180)).timeout_write(Duration::from_secs(60)).build()
 }
 
 /// One POST. The Messages wire authenticates with `x-api-key` and its
@@ -225,17 +220,9 @@ pub(crate) fn backoff(attempt: u32) -> Duration {
     (RETRY_BASE * 2u32.pow(shift)).min(RETRY_MAX)
 }
 
-async fn request<T>(
-    token: &CancelToken,
-    key: &str,
-    url: &str,
-    body: &Value,
-    messages_wire: bool,
-    decode: fn(ureq::Response) -> Result<T>,
-) -> Result<T>
-where
-    T: Send + 'static,
-{
+async fn request<T: Send + 'static>(
+    token: &CancelToken, key: &str, url: &str, body: &Value, messages_wire: bool, decode: fn(ureq::Response) -> Result<T>,
+) -> Result<T> {
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -263,10 +250,7 @@ pub(crate) fn sse_channel(resp: ureq::Response) -> mpsc::Receiver<String> {
             line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let l = line.trim_end_matches(['\r', '\n']).to_string();
-                    if tx.blocking_send(l).is_err() { break; }
-                }
+                Ok(_) => if tx.blocking_send(line.trim_end_matches(['\r', '\n']).to_string()).is_err() { break; }
             }
         }
     });
@@ -276,19 +260,14 @@ pub(crate) fn sse_channel(resp: ureq::Response) -> mpsc::Receiver<String> {
 /// Run a synchronous closure on the blocking pool with the same
 /// cancellation shape the streaming callers already use: the work
 /// runs on a worker thread, the await is a real suspension point, and
-/// the token races it so a Ctrl-C mid-reap returns `Interrupted`
-/// instead of blocking the await. Shared between the api transport
-/// (where every HTTP body lives) and the bash tool (where reaping
-/// the killed child would otherwise freeze the single-thread runtime).
+/// the token races it so a Ctrl-C mid-reap returns `Interrupted`.
+/// Shared between the api transport (every HTTP body) and the bash tool
+/// (reaping the killed child).
 pub(crate) async fn blocking<T, F>(token: &CancelToken, f: F) -> Result<T>
-where
-    F: FnOnce() -> Result<T> + Send + 'static,
-    T: Send + 'static,
+where F: FnOnce() -> Result<T> + Send + 'static, T: Send + 'static,
 {
     tokio::select! {
-        res = tokio::task::spawn_blocking(f) => {
-            res.unwrap_or_else(|e| Err(Error::Msg(format!("worker: {e}"))))
-        }
+        res = tokio::task::spawn_blocking(f) => res.unwrap_or_else(|e| Err(Error::Msg(format!("worker: {e}")))),
         _ = token.cancelled() => Err(Error::Interrupted),
     }
 }
@@ -316,18 +295,12 @@ fn chat_url(cfg: &Config) -> String {
     format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'))
 }
 
-/// Compose the full system-side text for the chat-completions family:
-/// `system_text` joined to each reminder by `"\n\n"`. Reminders own their
-/// own separators (each starts with `"\n\n"`), so a single join produces
-/// `SYSTEM \n\n\n\n# Project conventions... \n\n<body>` for the closest
-/// AGENTS.md — the same wire shape the old `compose_system` produced,
-/// keeping cross-session cache keys stable across the migration.
-///
-/// Used by every chat-completions vendor (`zai`, `deepseek`); the
-/// Messages wire (MiniMax) reads `system_text` and `reminders` itself
-/// because it can render them as separate blocks with per-block
-/// `cache_control`.
-fn chat_system_text(ctx: &Context) -> String {
+/// Compose the full system-side text: `system_text` joined to each
+/// reminder (reminders own their own separators). Used by every
+/// chat-completions vendor and reused by the Messages wire's
+/// inactive-cache branch. The shape mirrors the old `compose_system`
+/// so cross-session cache keys stay stable.
+pub(super) fn chat_system_text(ctx: &Context) -> String {
     let mut out = ctx.system_text.clone();
     for r in &ctx.reminders {
         out.push_str(&r.text);
@@ -335,7 +308,7 @@ fn chat_system_text(ctx: &Context) -> String {
     out
 }
 
-fn chat_messages(ctx: &Context, history: &[Message], _cfg: &Config) -> Vec<Value> {
+fn chat_messages(ctx: &Context, history: &[Message]) -> Vec<Value> {
     let system = chat_system_text(ctx);
     let mut out = Vec::with_capacity(history.len() + 1);
     out.push(json!({"role": "system", "content": system}));
@@ -347,6 +320,13 @@ fn chat_messages(ctx: &Context, history: &[Message], _cfg: &Config) -> Vec<Value
 
 fn chat_tools(schemas: &[Value]) -> Value {
     Value::Array(schemas.to_vec())
+}
+
+/// The streaming options every chat-completions vendor appends:
+/// `stream: true` and the usage-bearing `stream_options`. Kept here
+/// so the two wires spell it once.
+fn chat_stream_opts(stream: bool, body: &mut Value) {
+    if stream { body["stream"] = json!(true); body["stream_options"] = json!({"include_usage": true}); }
 }
 
 async fn chat_blocking(cfg: &Config, body: Value, to_internal: fn(&Value) -> Response, token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
@@ -371,13 +351,11 @@ fn chat_to_internal(v: &Value, usage_of: fn(&Value) -> (Value, Usage)) -> Respon
     if let Some(t) = msg["content"].as_str().filter(|t| !t.is_empty()) {
         blocks.push(Block::Text(t.to_string()));
     }
-    for tc in msg["tool_calls"].as_array().into_iter().flatten() {
-        blocks.push(Block::ToolUse {
-            id: tc["id"].as_str().unwrap_or("").to_string(),
-            name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
-            input: serde_json::from_str::<Value>(tc["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({})),
-        });
-    }
+    blocks.extend(msg["tool_calls"].as_array().into_iter().flatten().map(|tc| Block::ToolUse {
+        id: tc["id"].as_str().unwrap_or("").to_string(),
+        name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
+        input: serde_json::from_str::<Value>(tc["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({})),
+    }));
     let (usage, _) = usage_of(&v["usage"]);
     Response { blocks, usage }
 }
@@ -440,13 +418,11 @@ async fn chat_streaming(cfg: &Config, body: Value, usage_of: fn(&Value) -> (Valu
     let mut blocks = vec![];
     if !reasoning.is_empty() { blocks.push(Block::Thinking { text: reasoning, signature: None }); }
     if !text.is_empty() { blocks.push(Block::Text(text)); }
-    for tc in tool_calls {
-        blocks.push(Block::ToolUse {
-            id: tc["id"].as_str().unwrap_or("").to_string(),
-            name: tc["name"].as_str().unwrap_or("").to_string(),
-            input: serde_json::from_str::<Value>(tc["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({})),
-        });
-    }
+    blocks.extend(tool_calls.into_iter().map(|tc| Block::ToolUse {
+        id: tc["id"].as_str().unwrap_or("").to_string(),
+        name: tc["name"].as_str().unwrap_or("").to_string(),
+        input: serde_json::from_str::<Value>(tc["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({})),
+    }));
     Ok((Response { blocks, usage }, interrupted, body))
 }
 
@@ -584,16 +560,10 @@ mod tests {
 
     #[test]
     fn chat_messages_prepends_the_system_prompt() {
-        let cfg = crate::config::Config {
-            api_key: "k".into(), base_url: "x".into(), model: "m".into(),
-            protocol: Protocol::ZAI,
-            cache: CacheMode::Auto, thinking: Thinking::Preserve, effort: None,
-            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
-        };
         let msgs = vec![Message::User("hi".into())];
         // an empty reminders list ⇒ the system message is just `system_text`
         let cx = crate::test_util::ctx();
-        let out = chat_messages(&cx, &msgs, &cfg);
+        let out = chat_messages(&cx, &msgs);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["role"], "system");
         assert_eq!(out[0]["content"], cx.system_text);

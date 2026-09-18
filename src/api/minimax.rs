@@ -1,11 +1,10 @@
 // The MiniMax vendor: the Messages wire (content blocks, tool_use/result
 // pairs, thinking with a signature, interleaved reasoning, cache_control
-// breakpoints — plus the dialect's own policy words). Probed live before
-// this was written: `thinking: adaptive` and the Anthropic `enabled`
-// spelling both accepted, `disabled` honored on M3, budget_tokens accepted
-// beside either, and the docs' echo mandate — full content back every
-// turn, thinking and signature included — is enforced leniently today;
-// the adapter echoes anyway, the documented contract being the safe side.
+// breakpoints — plus the dialect's own policy words). Probed live:
+// `thinking: adaptive` and `enabled` both accepted, `disabled` honored
+// on M3, budget_tokens accepted beside either. The wire mandates full
+// content back every turn (thinking and signature included); we echo
+// anyway, the documented contract being the safe side.
 
 use super::{empty_usage, merge_usage, request, response_from_value, show_turn, sse_channel, strip_thinking,
             CacheMode, Thinking};
@@ -20,37 +19,25 @@ use serde_json::{json, Value};
 /// The minimax adapter's one entry into the provider port. Strip is a
 /// wire rule wearing a policy flag: this wire carries thinking blocks in
 /// its history verbatim, so stripping them is this adapter's job, never
-/// the core's. The third slot of the tuple is the rendered wire body the
-/// vendor actually sent — the session records it so the file is a
-/// faithful log of every byte the model saw, not just the message
-/// pairs the IR happens to keep.
+/// the core's. The third tuple slot is the rendered wire body the vendor
+/// sent — the session records it verbatim.
 pub(super) async fn turn(cfg: &Config, ctx: &Context, history: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
     let messages: Vec<Message> = if cfg.thinking == Thinking::Strip { strip_thinking(history) } else { history.to_vec() };
     let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
     let body = body(cfg, ctx, &messages, cfg.streaming);
     let key = cfg.api_key.clone();
-    if cfg.streaming {
-        streaming(url, body, key, token, sink).await
-    } else {
-        blocking(url, body, key, token, sink).await
-    }
+    if cfg.streaming { streaming(url, body, key, token, sink).await }
+    else { blocking(url, body, key, token, sink).await }
 }
 
 pub(super) fn body(cfg: &Config, ctx: &Context, messages: &[Message], stream: bool) -> Value {
+    use super::chat_system_text;
     let active = cfg.cache == CacheMode::Active;
     // The system side is rendered as multiple blocks: `system_text` first
-    // (just `crate::SYSTEM`, the static identity contract), then one block
-    // per reminder. AGENTS.md content rides in an `AgentsMdClosest`
-    // reminder today; runtime context and compaction anchors will ride
-    // here tomorrow — the v1 scheduler knows nothing about which kind.
-    //
-    // Cache markers: every stable reminder (one whose id reports
-    // `is_session_stable()`) gets a `cache_control: ephemeral` marker, so
-    // AGENTS.md's content sits in the cached prefix alongside `SYSTEM`
-    // without the cache key shifting per turn. Unstable reminders
-    // (runtime injections, future ephemeral nudges) skip the marker and
-    // land as fresh blocks each request — they don't pollute the prefix
-    // or invalidate it.
+    // (just `crate::SYSTEM`), then one block per reminder. Every session-
+    // stable reminder carries a `cache_control: ephemeral` marker so its
+    // body sits in the cached prefix; unstable reminders skip the marker
+    // and land as fresh blocks (no prefix pollution).
     let system = if active {
         let mut blocks = vec![json!({
             "type": "text", "text": ctx.system_text,
@@ -59,35 +46,25 @@ pub(super) fn body(cfg: &Config, ctx: &Context, messages: &[Message], stream: bo
         for r in &ctx.reminders {
             let mut b = json!({"type": "text", "text": r.text});
             if r.id.is_session_stable() {
-                b.as_object_mut().unwrap()
-                    .insert("cache_control".into(), json!({"type": "ephemeral"}));
+                b.as_object_mut().unwrap().insert("cache_control".into(), json!({"type": "ephemeral"}));
             }
             blocks.push(b);
         }
         Value::Array(blocks)
     } else {
         // No active cache: collapse to a single string, identical to the
-        // chat-completions family. Reminders own their own leading
-        // separator so a flat join reproduces the wire shape.
-        let mut s = ctx.system_text.clone();
-        for r in &ctx.reminders {
-            s.push_str(&r.text);
-        }
-        Value::String(s)
+        // chat-completions family.
+        Value::String(chat_system_text(ctx))
     };
     let mut tools = ctx.tools.clone();
-    if active {
-        if let Some(last) = tools.last_mut() { last["cache_control"] = json!({"type": "ephemeral"}); }
-    }
+    if active { if let Some(last) = tools.last_mut() { last["cache_control"] = json!({"type": "ephemeral"}); } }
     let wire: Vec<Value> = messages.iter().map(Message::to_value).collect();
     let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
         "system": system, "tools": tools, "messages": wire});
     body["stream"] = json!(stream);
-    // Thinking is this vendor's dial, spelled its way: `adaptive` turns it
-    // on (M3 ships thinking *off* by default — an agent wants it on),
-    // `disabled` is the honest strip (no reasoning generated at all, so
-    // nothing needs echoing back), and an effort tier rides the Messages
-    // budget beside the toggle — accepted on the live wire, probe-verified.
+    // Thinking: `adaptive` turns it on (M3 ships thinking off by default
+    // — an agent wants it on), `disabled` is the honest strip, and an
+    // effort tier rides the Messages budget beside the toggle.
     body["thinking"] = match (cfg.thinking, cfg.effort) {
         (Thinking::Strip, _) => json!({"type": "disabled"}),
         (Thinking::Preserve, Some(e)) => json!({"type": "adaptive", "budget_tokens": e.budget(cfg.max_tokens)}),
@@ -248,12 +225,12 @@ mod tests {
         assert!(b["tools"][0].get("cache_control").is_some());
     }
 
-    /// AGENTS.md content rides in its own system block — separate from
-    /// `system_text` (which holds only `crate::SYSTEM`) — and lands in
+    /// AGENTS.md content rides in its own system block, separate from
+    /// `system_text` (which holds only `crate::SYSTEM`), and lands in
     /// the cached prefix via the stable reminder's `cache_control`
-    /// marker. Two blocks means two cache segments: `SYSTEM` and the
-    /// AGENTS.md body can change independently without invalidating
-    /// each other's prefix.
+    /// marker. Two blocks = two cache segments: `SYSTEM` and the AGENTS.md
+    /// body can change independently without invalidating each other's
+    /// prefix.
     #[test]
     fn body_splits_agents_md_into_its_own_system_block() {
         use crate::test_util::temp_dir;
@@ -291,7 +268,7 @@ mod tests {
 
     /// With no AGENTS.md loaded, `reminders` is empty and the wire is
     /// byte-equivalent to the old single-block behavior: one block,
-    /// `system_text` (= `crate::SYSTEM`), cache marker.
+    /// `system_text`, cache marker.
     #[test]
     fn body_without_agents_md_is_a_single_system_block() {
         use crate::test_util::temp_dir;

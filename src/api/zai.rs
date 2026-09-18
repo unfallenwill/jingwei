@@ -1,14 +1,12 @@
 // Zhipu's zai speaks the chat-completions dialect with a vocabulary of
-// its own on top, all of it staying here. Probed live before this was
-// written: the flagship (glm-5.3-flash) *always* thinks — `thinking:
-// disabled` and any reasoning_effort outside low/high/max are hard 400s
-// ("该模型始终思考，不支持关闭思考") — reasoning streams as
+// its own on top, all of it staying here. Probed live: the flagship
+// always thinks — `thinking: disabled` and any reasoning_effort
+// outside low/high/max are hard 400s — reasoning streams as
 // reasoning_content beside content, usage carries
 // prompt_tokens_details.cached_tokens from an implicit cache that needs
-// no breakpoints, and `clear_thinking: false` keeps prior assistant
-// turns' reasoning in context: preserved thinking, recommended for
-// coding/agents precisely because the echoed reasoning is part of the
-// cached prefix.
+// no breakpoints, and `clear_thinking: false` keeps prior reasoning
+// in context (preserved thinking, recommended for agents because the
+// echoed reasoning rides the cached prefix).
 
 use super::{chat_blocking, chat_messages, chat_streaming, chat_to_internal, chat_tools,
             Thinking};
@@ -24,57 +22,46 @@ use serde_json::{json, Value};
 /// The zai vendor's one entry into the provider port.
 pub(super) async fn turn(cfg: &Config, ctx: &Context, history: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
     let body = body(cfg, ctx, history, cfg.streaming);
-    if cfg.streaming {
-        chat_streaming(cfg, body, usage, token, sink).await
-    } else {
-        chat_blocking(cfg, body, |v| chat_to_internal(v, usage), token, sink).await
-    }
+    if cfg.streaming { chat_streaming(cfg, body, usage, token, sink).await }
+    else { chat_blocking(cfg, body, |v| chat_to_internal(v, usage), token, sink).await }
 }
 
-/// The effort word this wire understands — its vocabulary, not the knob's:
-/// low/high/max are its own words, and `medium` (a word it rejects with a
-/// 400 on the flagship) folds into `high`, the tier the vendor itself
-/// maps it to on models that do accept it.
+/// The effort word this wire understands — its vocabulary, not the
+/// knob's: low/high/max are its own words; `medium` (a 400 on the
+/// flagship) folds into `high`, the tier the vendor itself maps it
+/// to on models that do accept it.
 fn effort_word(e: super::Effort) -> &'static str {
     use super::Effort;
     match e { Effort::Low => "low", Effort::Medium | Effort::High => "high", Effort::Max => "max" }
 }
 
 /// The zai request body: the dialect's shape plus the thinking object.
-/// Preserve is *preserved thinking* here — `clear_thinking: false`, the
-/// vendor's own recommendation for coding/agents, keeping prior turns'
-/// reasoning in the context (and in the cached prefix). Strip sends no
-/// thinking object at all: the flagship cannot stop thinking (`disabled`
-/// is a hard 400), so strip on this wire means "not kept", never "off" —
-/// the history blocks drop in the dialect's message translation.
+/// Preserve is *preserved thinking* (`clear_thinking: false`): prior
+/// turns' reasoning stays in context, riding the cached prefix. Strip
+/// sends no thinking object — the flagship cannot stop thinking
+/// (`disabled` is a hard 400), so strip means "not kept", never "off".
 ///
-/// The system prompt rides in the same place the deepseek one does: built
-/// by `chat_messages` from `Context.system_text` plus reminders. zai's
-/// cache is implicit (`prompt_tokens_details.cached_tokens`), so the
-/// wire-shape parity with the old `compose_system` output matters more
-/// here than explicit cache markers.
+/// The system prompt is built by `chat_messages` from `Context.system_text`
+/// plus reminders. zai's cache is implicit (`prompt_tokens_details.cached_tokens`),
+/// so the wire-shape parity with the old `compose_system` matters more
+/// than explicit cache markers.
 pub(super) fn body(cfg: &Config, ctx: &Context, messages: &[Message], stream: bool) -> Value {
     let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
-        "messages": chat_messages(ctx, messages, cfg), "tools": chat_tools(&ctx.tools)});
+        "messages": chat_messages(ctx, messages), "tools": chat_tools(&ctx.tools)});
     if cfg.thinking == Thinking::Preserve {
         body["thinking"] = json!({"type": "enabled", "clear_thinking": false});
     }
     if let Some(e) = cfg.effort {
         body["reasoning_effort"] = json!(effort_word(e));
     }
-    if stream {
-        body["stream"] = json!(true);
-        body["stream_options"] = json!({"include_usage": true});
-    }
+    super::chat_stream_opts(stream, &mut body);
     body
 }
 
-/// Zai usage → internal shape + display usage, in one place so both
-/// consumers stay identical. Normalizes a wire asymmetry: this wire's
-/// `prompt_tokens` *includes* the implicit cache's `cached_tokens`, while
-/// the internal ledger's `input_tokens` excludes cache traffic — so
-/// `input` here becomes "non-cached input", and `context_in()` (input +
-/// cache read + write) reads true on the wire.
+/// Zai usage → internal shape + display. Normalizes a wire asymmetry:
+/// this wire's `prompt_tokens` includes the implicit cache's `cached_tokens`,
+/// while the internal ledger's `input_tokens` excludes cache traffic —
+/// so `input` becomes "non-cached input", and `context_in()` reads true.
 pub(super) fn usage(u: &Value) -> (Value, Usage) {
     let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
     let cached = u["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
@@ -86,8 +73,6 @@ pub(super) fn usage(u: &Value) -> (Value, Usage) {
         Usage { input: fresh, output: out, cache_read: cached, cache_write: 0 },
     )
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -113,9 +98,9 @@ mod tests {
     }
 
     /// AGENTS.md content rides through `body()` as the system prompt on
-    /// chat-completions wires. Pin it down: when the loaded AGENTS.md
-    /// produces extras, the system message the wire carries contains
-    /// both the base `SYSTEM` and the extras.
+    /// chat-completions wires. When the loaded AGENTS.md produces extras,
+    /// the system message the wire carries contains both the base
+    /// `SYSTEM` and the extras.
     #[test]
     fn body_includes_agents_md_extras_in_the_system_message() {
         use crate::test_util::temp_dir;

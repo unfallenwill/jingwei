@@ -16,45 +16,34 @@ use serde_json::{json, Value};
 /// The deepseek vendor's one entry into the provider port.
 pub(super) async fn turn(cfg: &Config, ctx: &Context, history: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
     let body = body(cfg, ctx, history, cfg.streaming);
-    if cfg.streaming {
-        chat_streaming(cfg, body, usage, token, sink).await
-    } else {
-        chat_blocking(cfg, body, |v| chat_to_internal(v, usage), token, sink).await
-    }
+    if cfg.streaming { chat_streaming(cfg, body, usage, token, sink).await }
+    else { chat_blocking(cfg, body, |v| chat_to_internal(v, usage), token, sink).await }
 }
 
 /// The deepseek request body: the dialect's shape plus the `thinking`
-/// toggle. On this wire `--thinking strip` is not an erasure but the
-/// toggle off — `disabled` makes the model generate no reasoning at all,
-/// which is the only honest strip on a wire whose echo rule (tools ⇒
-/// reasoning back) a stripped history would break on the second request.
-/// Effort rides `reasoning_effort` verbatim: low/high/max are the wire's
-/// own words, and it maps medium→high itself for compatibility.
+/// toggle. Strip is the toggle off (`disabled` makes the model generate
+/// no reasoning — the only honest strip on a wire whose echo rule
+/// would break on a stripped history). Effort rides `reasoning_effort`
+/// verbatim; the wire maps medium→high itself.
 ///
 /// The system prompt is built by `chat_messages` from `Context.system_text`
-/// (just `crate::SYSTEM`) plus every reminder's text — AGENTS.md content
-/// rides in a `AgentsMdClosest` reminder today; runtime context will ride
-/// here tomorrow. The chat-completions family has a single system-message
-/// slot, so reminders concatenate inline; the wire-shape matches the old
-/// `compose_system` output so cache keys stay stable.
+/// plus every reminder. The chat-completions family has a single
+/// system-message slot, so reminders concatenate inline; the wire-shape
+/// matches the old `compose_system` output so cache keys stay stable.
 pub(super) fn body(cfg: &Config, ctx: &Context, messages: &[Message], stream: bool) -> Value {
     let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
         "thinking": {"type": if cfg.thinking == Thinking::Strip { "disabled" } else { "enabled" }},
-        "messages": chat_messages(ctx, messages, cfg), "tools": chat_tools(&ctx.tools)});
-    if stream {
-        body["stream"] = json!(true);
-        body["stream_options"] = json!({"include_usage": true});
-    }
+        "messages": chat_messages(ctx, messages), "tools": chat_tools(&ctx.tools)});
+    super::chat_stream_opts(stream, &mut body);
     if let Some(e) = cfg.effort {
         body["reasoning_effort"] = json!(e.label());
     }
     body
 }
 
-/// DeepSeek usage → internal shape + display. The IR contract ("input is
-/// non-cached input") is the core's; the spelling is the vendor's: this
-/// ledger splits its disk cache natively, hit + miss = prompt, and both
-/// halves are reported on every request.
+/// DeepSeek usage → internal shape + display. The IR contract ("input
+/// is non-cached input") is the core's; the spelling is the vendor's:
+/// this ledger splits its disk cache natively (hit + miss = prompt).
 pub(super) fn usage(u: &Value) -> (Value, Usage) {
     let cached = u["prompt_cache_hit_tokens"].as_u64().unwrap_or(0);
     let fresh = u["prompt_cache_miss_tokens"].as_u64()
@@ -66,7 +55,6 @@ pub(super) fn usage(u: &Value) -> (Value, Usage) {
         Usage { input: fresh, output: out, cache_read: cached, cache_write: 0 },
     )
 }
-
 
 #[cfg(test)]
 mod tests {
