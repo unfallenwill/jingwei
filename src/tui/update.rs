@@ -274,7 +274,7 @@ fn input_mode(app: &mut App, k: KeyEvent) -> Action {
     // menu is up, these keys belong to it, not to the cursor.
     if app.completion.is_some() {
         match k.code {
-            KeyCode::Tab => return if apply_completion(app) { Action::None } else { Action::None },
+            KeyCode::Tab => { apply_completion(app); return Action::None; }
             KeyCode::BackTab => { completion_up(app); return Action::None; }
             KeyCode::Esc => { dismiss_completion(app); return Action::None; }
             KeyCode::Up => { completion_up(app); return Action::None; }
