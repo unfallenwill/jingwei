@@ -3,6 +3,11 @@
     "context7": {
       "command": "npx",
       "args": ["-y", "@upstash/context7-mcp"]
+    },
+    "firecrawl": {
+      "command": "npx",
+      "args": ["-y", "firecrawl-mcp"],
+      "env": {"FIRECRAWL_API_KEY": "fc-f147e058946e453a91725618a1de4c3e"}
     }
   }
 }

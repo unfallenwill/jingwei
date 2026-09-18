@@ -1,3 +1,7 @@
 /target
 /Cargo.lock.bak
 *.pdb
+# Project-local MCP config: servers with their commands/args, plus any
+# per-developer env keys. Each dev fills in their own; secrets stay out
+# of the repo. Use .mcp.json.example if you want a tracked template.
+.mcp.json
