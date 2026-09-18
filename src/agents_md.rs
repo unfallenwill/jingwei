@@ -278,4 +278,30 @@ mod tests {
         let ctx = AgentsMdContext::load(&dir);
         assert_eq!(ctx.system_prompt_extras(), "");
     }
+
+    /// Pin the loader against this repo's own AGENTS.md: jingwei runs
+    /// from many workspaces, but if the workspace *is* this project, the
+    /// file at the root is the conventions other agents wrote for us.
+    /// Catches accidental edits that would silently break discovery.
+    #[test]
+    fn load_finds_this_repos_own_agents_md() {
+        // CARGO_MANIFEST_DIR is set by cargo to the crate being tested —
+        // resolves to the project root regardless of where cargo runs from.
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ctx = AgentsMdContext::load(manifest);
+        let path = ctx.found_path.clone().expect("jingwei ships an AGENTS.md at the root");
+        assert_eq!(path, manifest.join("AGENTS.md"));
+        let extras = ctx.system_prompt_extras();
+        assert!(extras.contains("# Project conventions"),
+            "extras must be labelled so the model recognizes them");
+        assert!(extras.contains("Build & test"),
+            "the file jingwei ships actually says 'Build & test' — \
+             if this fails, the AGENTS.md at the root was rewritten \
+             without telling the loader");
+        let banner = ctx.banner().expect("a file present ⇒ a banner");
+        // The banner has to land at the start of every session, in front
+        // of the session-id line, so the user sees what got loaded.
+        assert!(banner.starts_with("jingwei · loaded AGENTS.md at "));
+        assert!(banner.contains(&manifest.display().to_string()));
+    }
 }
