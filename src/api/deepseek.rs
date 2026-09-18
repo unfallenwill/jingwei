@@ -15,10 +15,11 @@ use serde_json::{json, Value};
 
 /// The deepseek vendor's one entry into the provider port.
 pub(super) async fn turn(cfg: &Config, ctx: &Context, history: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
+    let body = body(cfg, ctx, history, cfg.streaming);
     if cfg.streaming {
-        streaming(cfg, ctx, history, token, sink).await
+        chat_streaming(cfg, body, usage, token, sink).await
     } else {
-        blocking(cfg, ctx, history, token, sink).await
+        chat_blocking(cfg, body, |v| chat_to_internal(v, usage), token, sink).await
     }
 }
 
@@ -66,19 +67,7 @@ pub(super) fn usage(u: &Value) -> (Value, Usage) {
     )
 }
 
-/// Chat Completions response → internal shape; the dialect's walk, this
-/// vendor's ledger.
-fn to_internal(v: &Value) -> Response {
-    chat_to_internal(v, usage)
-}
 
-async fn blocking(cfg: &Config, ctx: &Context, messages: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
-    chat_blocking(cfg, body(cfg, ctx, messages, false), to_internal, token, sink).await
-}
-
-async fn streaming(cfg: &Config, ctx: &Context, messages: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
-    chat_streaming(cfg, body(cfg, ctx, messages, true), usage, token, sink).await
-}
 #[cfg(test)]
 mod tests {
 

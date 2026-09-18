@@ -26,10 +26,13 @@ use serde_json::{json, Value};
 /// pairs the IR happens to keep.
 pub(super) async fn turn(cfg: &Config, ctx: &Context, history: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
     let messages: Vec<Message> = if cfg.thinking == Thinking::Strip { strip_thinking(history) } else { history.to_vec() };
+    let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
+    let body = body(cfg, ctx, &messages, cfg.streaming);
+    let key = cfg.api_key.clone();
     if cfg.streaming {
-        streaming(cfg, ctx, &messages, token, sink).await
+        streaming(url, body, key, token, sink).await
     } else {
-        blocking(cfg, ctx, &messages, token, sink).await
+        blocking(url, body, key, token, sink).await
     }
 }
 
@@ -93,10 +96,7 @@ pub(super) fn body(cfg: &Config, ctx: &Context, messages: &[Message], stream: bo
     body
 }
 
-async fn blocking(cfg: &Config, ctx: &Context, messages: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
-    let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
-    let body = body(cfg, ctx, messages, false);
-    let key = cfg.api_key.clone();
+async fn blocking(url: String, body: Value, key: String, token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
     let v: Value = request(token, &key, &url, &body, true, |r| {
         let v: Value = r.into_json()?;
         if let Some(err) = v.get("error") { return Err(Error::Msg(err.to_string())); }
@@ -107,10 +107,7 @@ async fn blocking(cfg: &Config, ctx: &Context, messages: &[Message], token: &Can
     Ok((resp, token.is_cancelled(), body))
 }
 
-async fn streaming(cfg: &Config, ctx: &Context, messages: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
-    let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
-    let body = body(cfg, ctx, messages, true);
-    let key = cfg.api_key.clone();
+async fn streaming(url: String, body: Value, key: String, token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
     let resp = request(token, &key, &url, &body, true, Ok).await?;
     // Blocks arrive one at a time, indexed; a tool_use's arguments stream as
     // partial JSON, so they accumulate in `tool_json` beside the typed block
