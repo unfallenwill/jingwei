@@ -167,7 +167,7 @@ fn collect_tree_agents_md(root: &Path, exclude: Option<&PathBuf>) -> Vec<PathBuf
     queue.push_back(root.to_path_buf());
     while let Some(dir) = queue.pop_front() {
         let candidate = dir.join(FILENAME);
-        if candidate.is_file() && exclude.map_or(true, |e| e != &candidate) {
+        if candidate.is_file() && exclude != Some(&candidate) {
             out.push(candidate);
         }
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
