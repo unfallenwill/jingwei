@@ -247,12 +247,7 @@ fn args_from_cli(c: Cli) -> Result<Args> {
             a.all = all;
             return Ok(a);
         }
-        Some(Cmd::Resume { id }) => {
-            match id {
-                Some(s) if !s.is_empty() => a.resume = Some(s),
-                _ => a.cont = true,
-            }
-        }
+        Some(Cmd::Resume { id }) => resume_into(&mut a, id),
         None => {
             // the default invocation — copy flags into Args
             a.api_key = c.api_key;
@@ -269,12 +264,8 @@ fn args_from_cli(c: Cli) -> Result<Args> {
             a.context_size = parse_num_flag("--context-size", c.context_size)?;
             a.max_turns = parse_num_flag("--max-turns", c.max_turns)?;
             if c.no_stream { a.streaming = false; }
-            // --resume value handling: bare (Some(None)) → cont; with value → resume
             if let Some(r) = c.resume {
-                match r {
-                    Some(s) if !s.is_empty() => a.resume = Some(s),
-                    _ => a.cont = true,
-                }
+                resume_into(&mut a, r);
             }
             a.cont |= c.r#continue;
             a.list = c.list;
@@ -284,6 +275,16 @@ fn args_from_cli(c: Cli) -> Result<Args> {
         }
     }
     Ok(a)
+}
+
+/// Both the subcommand arm (`resume <id>`) and the flag arm (`--resume [id]`)
+/// spell the same rule: a non-empty value is the id, anything else is
+/// "the newest session" (`cont`).
+fn resume_into(a: &mut Args, id: Option<String>) {
+    match id {
+        Some(s) if !s.is_empty() => a.resume = Some(s),
+        _ => a.cont = true,
+    }
 }
 
 /// Parse a numeric flag, naming the flag in the error so the user can
