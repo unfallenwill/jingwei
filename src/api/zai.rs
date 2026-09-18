@@ -46,8 +46,9 @@ fn effort_word(e: super::Effort) -> &'static str {
 /// is a hard 400), so strip on this wire means "not kept", never "off" —
 /// the history blocks drop in the dialect's message translation.
 pub(super) fn body(cfg: &Config, messages: &[Message], schemas: &[Value], stream: bool) -> Value {
+    let system_text = crate::agents_md::full_system_prompt(&cfg.agents_md_extra);
     let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
-        "messages": chat_messages(crate::SYSTEM, messages, cfg), "tools": chat_tools(schemas)});
+        "messages": chat_messages(&system_text, messages, cfg), "tools": chat_tools(schemas)});
     if cfg.thinking == Thinking::Preserve {
         body["thinking"] = json!({"type": "enabled", "clear_thinking": false});
     }
@@ -113,6 +114,31 @@ mod tests {
         c.thinking = ApiThinking::Strip;
         let b = super::body(&c, &[], &[], false);
         assert!(b.get("thinking").is_none(), "strip on zai means no thinking object");
+    }
+
+    /// AGENTS.md content rides through `body()` as the system prompt on
+    /// chat-completions wires. Pin it down: when `cfg.agents_md_extra`
+    /// is set, the system message the wire carries contains both the
+    /// base `SYSTEM` and the extras.
+    #[test]
+    fn body_includes_agents_md_extras_in_the_system_message() {
+        use crate::test_util::temp_dir;
+        let dir = temp_dir("agents_md_wire");
+        std::fs::write(dir.join("AGENTS.md"), "always use pnpm").unwrap();
+        let ctx = crate::agents_md::AgentsMdContext::load(&dir);
+        assert!(ctx.found_path.is_some());
+
+        let mut c = cfg("https://x".into(), true);
+        c.protocol = Protocol::ZAI;
+        c.agents_md_extra = ctx.system_prompt_extras();
+        let msgs = vec![crate::ir::Message::User("task".into())];
+        let b = super::body(&c, &msgs, &[], false);
+        let system = b["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains(crate::SYSTEM), "base SYSTEM stays in the wire");
+        assert!(system.contains("always use pnpm"), "AGENTS.md body rides in");
+        assert!(system.contains("# Project conventions"), "extras are labelled");
+        assert!(system.contains(&dir.display().to_string()),
+            "banner path lands too, so the model knows where the content came from");
     }
 
     #[test]

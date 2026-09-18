@@ -29,9 +29,10 @@ pub(super) async fn turn(cfg: &Config, history: &[Message], schemas: &[Value], t
 /// Effort rides `reasoning_effort` verbatim: low/high/max are the wire's
 /// own words, and it maps medium→high itself for compatibility.
 pub(super) fn body(cfg: &Config, messages: &[Message], schemas: &[Value], stream: bool) -> Value {
+    let system_text = crate::agents_md::full_system_prompt(&cfg.agents_md_extra);
     let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
         "thinking": {"type": if cfg.thinking == Thinking::Strip { "disabled" } else { "enabled" }},
-        "messages": chat_messages(crate::SYSTEM, messages, cfg), "tools": chat_tools(schemas)});
+        "messages": chat_messages(&system_text, messages, cfg), "tools": chat_tools(schemas)});
     if stream {
         body["stream"] = json!(true);
         body["stream_options"] = json!({"include_usage": true});

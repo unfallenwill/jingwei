@@ -11,6 +11,7 @@
 //      settings — key, base URL, model, protocol, cache, thinking,
 //      effort, frontend choice — go through CLI flags)
 
+mod agents_md;
 mod api;
 mod cancel;
 mod config;
@@ -40,6 +41,7 @@ use crate::mcp::Hub;
 use crate::settings::Settings;
 use crate::tool_runtime::run_tool;
 use crate::tools::{print_tool_call, tools};
+use crate::agents_md::AgentsMdContext;
 use crate::turn::{Turn, TurnOutcome, TurnState};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -184,6 +186,11 @@ struct Cli {
     /// With `--list`, list every project's sessions.
     #[arg(long)] all: bool,
 
+    /// Skip AGENTS.md discovery entirely. The agent runs with no
+    /// project conventions loaded — for paranoid sessions, or when the
+    /// repo's AGENTS.md is known to be stale or misleading.
+    #[arg(long)] no_agents_md: bool,
+
     // prompt — everything else, captured verbatim. clap's
     // `trailing_var_arg` lets the prompt begin after `--`, so users
     // who want to send `--help` as a literal task can still do so
@@ -270,6 +277,7 @@ fn args_from_cli(c: Cli) -> Result<Args> {
             a.list = c.list;
             a.all = c.all;
             a.prompt = c.prompt;
+            a.no_agents_md = c.no_agents_md;
         }
     }
     Ok(a)
@@ -346,6 +354,19 @@ async fn run() -> Result<()> {
         return session::print_list(args.all);
     }
     let cfg = build_config(&args)?;
+    // AGENTS.md: discover the closest one walking up from the workspace.
+    // `--no-agents-md` short-circuits to an empty context so the rest of
+    // the run is identical to "no AGENTS.md exists at all". The extras
+    // are pre-rendered here and stashed on cfg; vendors read them when
+    // composing the system prompt and don't touch the filesystem.
+    let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let agents_ctx = if args.no_agents_md {
+        AgentsMdContext::empty(&workspace)
+    } else {
+        AgentsMdContext::load(&workspace)
+    };
+    let mut cfg = cfg;
+    cfg.agents_md_extra = agents_ctx.system_prompt_extras();
     // MCP hub: external servers' tools, offered to the model as though
     // they were the agent's own. Spawned once per process and shared
     // across every turn (and every front-end). The user's servers are
@@ -353,9 +374,8 @@ async fn run() -> Result<()> {
     // and are picked up by the hub itself. A missing file is a None — the
     // hub starts empty and the session runs as it always did.
     let user_mcp = read_user_mcp();
-    let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let hub = Hub::spawn(&workspace, user_mcp.as_ref());
-    run_with_hub(args, cfg, hub).await
+    run_with_hub(args, cfg, hub, agents_ctx).await
 }
 
 /// The rest of `run` after the hub is spawned. The TUI and plain REPL take
@@ -363,9 +383,16 @@ async fn run() -> Result<()> {
 /// `mpsc::Sender`); the one-shot path also takes a clone, then calls
 /// `shutdown` on its own copy at the end so the connections close in
 /// every exit path.
-async fn run_with_hub(args: Args, cfg: Config, hub: Hub) -> Result<()> {
+async fn run_with_hub(args: Args, cfg: Config, hub: Hub, agents_ctx: AgentsMdContext) -> Result<()> {
     let interactive = args.prompt.is_empty();
     let (mut convo, banners) = begin_session(&args, &cfg, interactive)?;
+    // AGENTS.md gets a banner slot too, when one was loaded. Prepended
+    // so the user sees it before the session id — the context comes
+    // first in attention order, and the banner says the same thing.
+    let mut banners = banners;
+    if let Some(b) = agents_ctx.banner() {
+        banners.insert(0, b);
+    }
     if interactive {
         // A terminal gets the TUI; pipes, tests, and one-shots get the log.
         return if tui::wanted() {

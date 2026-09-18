@@ -31,10 +31,15 @@ pub(super) async fn turn(cfg: &Config, history: &[Message], schemas: &[Value], t
 
 pub(super) fn body(cfg: &Config, messages: &[Message], schemas: &[Value], stream: bool) -> Value {
     let active = cfg.cache == CacheMode::Active;
+    // Compose the system prompt from the base constant plus any AGENTS.md
+    // extras loaded at session start. The active-cache breakpoint lands
+    // on the resulting block, so both pieces go into the cached prefix
+    // together — AGENTS.md doesn't shift the cache key per turn.
+    let system_text = crate::agents_md::full_system_prompt(&cfg.agents_md_extra);
     let system = if active {
-        json!([{"type": "text", "text": crate::SYSTEM, "cache_control": {"type": "ephemeral"}}])
+        json!([{"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}])
     } else {
-        json!(crate::SYSTEM)
+        json!(system_text)
     };
     let mut tools = schemas.to_vec();
     if active {
@@ -210,6 +215,31 @@ mod tests {
         let b = super::body(&c, &[], &[json!({"name":"t","description":"d","input_schema":{"type":"object"}})], false);
         assert!(b["system"].as_array().unwrap()[0].get("cache_control").is_some());
         assert!(b["tools"][0].get("cache_control").is_some());
+    }
+
+    /// AGENTS.md extras land inside the same system-text block the
+    /// cache_control breakpoint annotates — so the agent's project
+    /// conventions sit in the cached prefix alongside the base `SYSTEM`
+    /// and don't shift the cache key per turn.
+    #[test]
+    fn body_composes_agents_md_into_the_system_block() {
+        use crate::test_util::temp_dir;
+        let dir = temp_dir("agents_md_minimax");
+        std::fs::write(dir.join("AGENTS.md"), "use rustfmt").unwrap();
+        let ctx = crate::agents_md::AgentsMdContext::load(&dir);
+
+        let mut c = cfg("https://x".into(), true);
+        c.cache = crate::api::CacheMode::Active; // exercise the array-with-cache branch
+        c.agents_md_extra = ctx.system_prompt_extras();
+        let b = super::body(&c, &[], &[], false);
+        let arr = b["system"].as_array().expect("active cache ⇒ array of blocks");
+        assert_eq!(arr.len(), 1, "one system block, not split by the extras");
+        let text = arr[0]["text"].as_str().unwrap();
+        assert!(text.contains(crate::SYSTEM));
+        assert!(text.contains("use rustfmt"));
+        // the breakpoint stays on the composed block — the agent's
+        // AGENTS.md participates in the cached prefix as one unit
+        assert!(arr[0].get("cache_control").is_some());
     }
 
     #[test]

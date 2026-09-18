@@ -550,6 +550,7 @@ mod tests {
             protocol: Protocol::ZAI,
             cache: CacheMode::Auto, thinking: Thinking::Preserve, effort: None,
             max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+            agents_md_extra: String::new(),
         };
         assert_eq!(chat_url(&cfg), "https://api.example.com/chat/completions");
         // no trailing slash
@@ -564,6 +565,7 @@ mod tests {
             protocol: Protocol::ZAI,
             cache: CacheMode::Auto, thinking: Thinking::Preserve, effort: None,
             max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+            agents_md_extra: String::new(),
         };
         let msgs = vec![Message::User("hi".into())];
         let out = chat_messages("you are a bot", &msgs, &cfg);

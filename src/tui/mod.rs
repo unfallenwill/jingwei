@@ -1716,6 +1716,7 @@ mod tests {
             thinking: crate::api::Thinking::Preserve,
             effort: None,
             max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+            agents_md_extra: String::new(),
         };
         let mut convo = Convo::ephemeral();
         convo.history.push(crate::ir::Message::User("seed".into()));
@@ -1755,6 +1756,7 @@ mod tests {
             thinking: crate::api::Thinking::Preserve,
             effort: None,
             max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+            agents_md_extra: String::new(),
         };
         let mut convo = Convo::ephemeral();
         convo.history.push(crate::ir::Message::User("seed".into()));
@@ -1792,6 +1794,7 @@ mod tests {
             thinking: crate::api::Thinking::Preserve,
             effort: None,
             max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+            agents_md_extra: String::new(),
         };
         let convo = Arc::new(AsyncMutex::new(Convo::ephemeral()));
         // a pre-existing agent slot, as if the first Submit had already
@@ -1970,7 +1973,8 @@ mod tests {
         let cfg = Config { api_key: "k".into(), base_url: "https://x".into(), model: "m".into(),
             protocol: crate::api::Protocol::MINIMAX, cache: crate::api::CacheMode::Auto,
             thinking: crate::api::Thinking::Preserve, effort: None,
-            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true };
+            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+            agents_md_extra: String::new() };
         let convo = Arc::new(AsyncMutex::new(crate::session::Convo::ephemeral()));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
@@ -1988,7 +1992,8 @@ mod tests {
         let cfg = Config { api_key: "k".into(), base_url: "https://x".into(), model: "m".into(),
             protocol: crate::api::Protocol::MINIMAX, cache: crate::api::CacheMode::Auto,
             thinking: crate::api::Thinking::Preserve, effort: None,
-            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true };
+            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+            agents_md_extra: String::new() };
         let convo = Arc::new(AsyncMutex::new(crate::session::Convo::ephemeral()));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
@@ -2019,7 +2024,8 @@ mod tests {
         let cfg = Config { api_key: "k".into(), base_url: "https://x".into(), model: "m".into(),
             protocol: crate::api::Protocol::MINIMAX, cache: crate::api::CacheMode::Auto,
             thinking: crate::api::Thinking::Preserve, effort: None,
-            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true };
+            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+            agents_md_extra: String::new() };
         let convo = Arc::new(AsyncMutex::new(crate::session::Convo::ephemeral()));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let _sink = ChannelSink::new(tx);

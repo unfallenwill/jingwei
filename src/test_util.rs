@@ -81,6 +81,7 @@ pub(crate) fn cfg(base: String, streaming: bool) -> crate::config::Config {
         effort: None,
         max_tokens: 1024, context_size: crate::config::DEFAULT_CONTEXT_SIZE,
         max_turns: crate::config::DEFAULT_MAX_TURNS, streaming,
+        agents_md_extra: String::new(),
     }
 }
 
