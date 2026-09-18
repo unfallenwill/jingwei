@@ -440,14 +440,7 @@ fn row_lines(row: &Row, w: usize, out: &mut Vec<Line<'static>>, lay: Lay) {
                 crate::display::Sev::Warn => (WARN_BG, false),
                 crate::display::Sev::Err => (ERR_BG, true),
             };
-            let style = note_style(bg, err);
-            if lay == Lay::Pane {
-                out.push(Line::from(Span::styled(truncate_cols(text, w), style)));
-            } else {
-                for chunk in wrap_cols(text, w) {
-                    out.push(Line::from(Span::styled(chunk, style)));
-                }
-            }
+            emit(out, text, w, lay, note_style(bg, err), vec![]);
         }
     }
 }
@@ -462,16 +455,8 @@ fn task_spans(first: bool) -> (Span<'static>, Span<'static>) {
     }
 }
 
-/// A flat (unguttered) row's content: one wrapped row per chunk — the
-/// pane's preview cuts it to one row.
 fn flat(l: &str, w: usize, lay: Lay, out: &mut Vec<Line<'static>>, style: Style) {
-    if lay == Lay::Pane {
-        out.push(Line::from(Span::styled(truncate_cols(l, w), style)));
-        return;
-    }
-    for chunk in wrap_cols(l, w) {
-        out.push(Line::from(Span::styled(chunk, style)));
-    }
+    emit(out, l, w, lay, style, vec![]);
 }
 
 /// A reasoning fold: its marker when closed, marker + full body when open.
@@ -574,19 +559,25 @@ fn think_tail(app: &App, w: usize, lay: Lay, out: &mut Vec<Line<'static>>) {
 /// hanging from the gutter, so the block stays a block; only the pane's
 /// live tail cuts the line to one row.
 fn guttered(l: &str, w: usize, lay: Lay, style: Style, out: &mut Vec<Line<'static>>) {
-    let avail = w.saturating_sub(disp_width(FOLD_GUTTER));
+    let prefix = vec![Span::styled(FOLD_GUTTER, gutter_style())];
+    emit(out, l, w.saturating_sub(disp_width(FOLD_GUTTER)), lay, style, prefix);
+}
+
+/// One text row's content, with optional prefix spans: a fold gutter,
+/// a continuation indent, or nothing. Pane truncates; flush / review
+/// wrap. The Pane vs other branches look the same on every caller —
+/// folding them into one place is the whole point.
+fn emit(out: &mut Vec<Line<'static>>, text: &str, avail: usize, lay: Lay, style: Style, prefix: Vec<Span<'static>>) {
     if lay == Lay::Pane {
-        out.push(Line::from(vec![
-            Span::styled(FOLD_GUTTER, gutter_style()),
-            Span::styled(truncate_cols(l, avail), style),
-        ]));
+        let mut spans = prefix;
+        spans.push(Span::styled(truncate_cols(text, avail), style));
+        out.push(Line::from(spans));
         return;
     }
-    for chunk in wrap_cols(l, avail) {
-        out.push(Line::from(vec![
-            Span::styled(FOLD_GUTTER, gutter_style()),
-            Span::styled(chunk, style),
-        ]));
+    for chunk in wrap_cols(text, avail) {
+        let mut spans = prefix.clone();
+        spans.push(Span::styled(chunk, style));
+        out.push(Line::from(spans));
     }
 }
 
