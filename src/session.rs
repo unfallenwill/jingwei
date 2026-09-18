@@ -451,10 +451,8 @@ pub fn print_list(all: bool) -> crate::Result<()> {
 /// only when projects are mixed (`--all`) — within one project every row
 /// would carry the same value.
 pub fn format_table(metas: &[Meta], scope: &Path, show_dir: bool) -> String {
-    let mut heads = vec!["ID", "STARTED", "PROTOCOL", "MODEL", "MSGS"];
-    if show_dir {
-        heads.push("DIR");
-    }
+    let mut heads: Vec<&str> = vec!["ID", "STARTED", "PROTOCOL", "MODEL", "MSGS"];
+    if show_dir { heads.push("DIR"); }
     heads.push("FIRST TASK");
     let cells = |m: &Meta| {
         let mut v = vec![
@@ -464,9 +462,7 @@ pub fn format_table(metas: &[Meta], scope: &Path, show_dir: bool) -> String {
             crate::format::truncate_cols(&m.model, 18),
             m.msgs.to_string(),
         ];
-        if show_dir {
-            v.push(clip_head(&dir_tail(&m.cwd), 26));
-        }
+        if show_dir { v.push(clip_head(&dir_tail(&m.cwd), 26)); }
         v.push(crate::format::truncate_cols(m.first.trim(), 40));
         v
     };
@@ -477,22 +473,17 @@ pub fn format_table(metas: &[Meta], scope: &Path, show_dir: bool) -> String {
             widths[i] = widths[i].max(crate::format::disp_width(c));
         }
     }
-    let row = |cells: &[String]| {
-        cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let pad = " ".repeat(widths[i].saturating_sub(crate::format::disp_width(c)));
-                format!("{c}{pad}")
-            })
+    let row = |cells: &[&str]| {
+        cells.iter().enumerate()
+            .map(|(i, c)| format!("{c}{}", " ".repeat(widths[i].saturating_sub(crate::format::disp_width(c)))))
             .collect::<Vec<_>>()
             .join("  ")
     };
-    let mut out = String::new();
-    out.push_str(&row(&heads.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
-    out.push('\n');
+    let head_cells: Vec<&str> = heads.clone();
+    let mut out = format!("{}\n", row(&head_cells));
     for r in &rows {
-        out.push_str(&row(r));
+        let s: Vec<&str> = r.iter().map(String::as_str).collect();
+        out.push_str(&row(&s));
         out.push('\n');
     }
     out.push_str(&format!(
