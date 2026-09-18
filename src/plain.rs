@@ -504,11 +504,16 @@ mod tests {
         let hub = crate::mcp::Hub::empty();
         let sink = BagSink(Default::default());
         handle_mcp_command("", &hub, &sink).await;
-        let msgs = sink.0.lock().unwrap();
-        assert_eq!(msgs.len(), 1, "got: {msgs:?}");
-        match &msgs[0] {
-            Msg::Banner(s) => assert!(s.contains("no MCP servers"), "{s}"),
-            other => panic!("expected a banner, got {other:?}"),
+        {
+            // Scope the guard: clippy::await_holding_lock, and the rule is
+            // right — `hub.shutdown()` does not reach into the sink today,
+            // but a future change that does would deadlock behind this lock.
+            let msgs = sink.0.lock().unwrap();
+            assert_eq!(msgs.len(), 1, "got: {msgs:?}");
+            match &msgs[0] {
+                Msg::Banner(s) => assert!(s.contains("no MCP servers"), "{s}"),
+                other => panic!("expected a banner, got {other:?}"),
+            }
         }
         hub.shutdown().await;
     }
@@ -530,11 +535,13 @@ mod tests {
         let hub = crate::mcp::Hub::empty();
         let sink = BagSink(Default::default());
         handle_mcp_command("frobnicate", &hub, &sink).await;
-        let msgs = sink.0.lock().unwrap();
-        assert_eq!(msgs.len(), 1);
-        match &msgs[0] {
-            Msg::Note { text, .. } => assert!(text.contains("unknown subcommand"), "{text}"),
-            other => panic!("expected a note, got {other:?}"),
+        {
+            let msgs = sink.0.lock().unwrap();
+            assert_eq!(msgs.len(), 1);
+            match &msgs[0] {
+                Msg::Note { text, .. } => assert!(text.contains("unknown subcommand"), "{text}"),
+                other => panic!("expected a note, got {other:?}"),
+            }
         }
         hub.shutdown().await;
     }
@@ -545,14 +552,16 @@ mod tests {
         let hub = crate::mcp::Hub::empty();
         let sink = BagSink(Default::default());
         handle_mcp_command("enable", &hub, &sink).await;
-        let msgs = sink.0.lock().unwrap();
-        assert_eq!(msgs.len(), 1);
-        match &msgs[0] {
-            Msg::Note { sev, text } => {
-                assert_eq!(*sev, Sev::Err);
-                assert!(text.contains("missing server name"), "{text}");
+        {
+            let msgs = sink.0.lock().unwrap();
+            assert_eq!(msgs.len(), 1);
+            match &msgs[0] {
+                Msg::Note { sev, text } => {
+                    assert_eq!(*sev, Sev::Err);
+                    assert!(text.contains("missing server name"), "{text}");
+                }
+                other => panic!("expected a note, got {other:?}"),
             }
-            other => panic!("expected a note, got {other:?}"),
         }
         hub.shutdown().await;
     }
