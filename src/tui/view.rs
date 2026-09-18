@@ -26,7 +26,7 @@ use ratatui::text::{Line, Span};
 
 /// How many body lines a *collapsed* tool tail shows before the "+N" marker.
 /// Small on purpose: the folded REPL shows a preview, Ctrl-O (or the plain
-/// log's [`crate::plain`] 20-line echo) exists to see the rest.
+/// log's 20-line echo) exists to see the rest.
 pub const TOOL_TAIL_SHOWN: usize = 3;
 
 // ---- the status bar's text (moved out of main.rs: view vocabulary, all of it)
@@ -38,11 +38,10 @@ fn humanize(n: u64) -> String {
     else { format!("{:.1}M", n as f64 / 1_000_000.0) }
 }
 
-/// Session cache hit rate, to two decimals: of everything the model has
-/// read, the share that came from cache. `None` until cache traffic exists
-/// — an endpoint that never caches would otherwise carry a permanent
-/// "0.00%", which is noise; the first write (cache being built, nothing hit
-/// yet) does count, because "0.00%" then is the truth and the change.
+/// Session cache hit rate, to two decimals: `None` until cache traffic
+/// exists — a permanent "0.00%" on non-caching endpoints is noise. The
+/// first write (cache being built, nothing hit yet) does count: that
+/// "0.00%" is then the truth and the change.
 fn cache_pct(total: &Usage) -> Option<f64> {
     let read = total.context_in();
     (read > 0 && (total.cache_read > 0 || total.cache_write > 0))
@@ -52,13 +51,11 @@ fn cache_pct(total: &Usage) -> Option<f64> {
 /// The status bar's text within `max_w` display columns: the session's
 /// ledger, flush right, pure — so tests pin it directly.
 ///
-/// The ledger answers "who am I talking to, how much room is left" —
-/// checked occasionally, so it sheds as the pane narrows: model first
-/// (the banner already said it), then effort, then the cache rate, then
-/// the ctx gauge — with the browse hint pinned (in review, the user is
-/// reading history, not checking accounts — the hint is the one thing
-/// the bar must still say). When nothing unpinned is left to shed, the
-/// bar truncates, keeping its one-physical-row law.
+/// The ledger answers "who am I talking to, how much room is left":
+/// model first (the banner already said it), then effort, then cache
+/// rate, then the ctx gauge — with the browse hint pinned. When
+/// nothing unpinned is left to shed, the bar truncates, keeping its
+/// one-physical-row law.
 pub fn bar_text(app: &App, max_w: usize) -> String {
     let mut segs = bar_segs(app);
     loop {
@@ -77,17 +74,15 @@ pub fn bar_text(app: &App, max_w: usize) -> String {
 }
 
 /// One ledger segment: its text, and whether it may be shed when the pane
-/// narrows. Pinned: the browse hint (in review, the user is reading
-/// history, not checking accounts — the hint is the one thing the bar must
-/// still say).
+/// narrows. Pinned: the browse hint.
 struct Seg {
     content: String,
     pinned: bool,
 }
 
 /// The bar's segments (see [`bar_text`]). They appear as their data
-/// arrives: no cache traffic — no cache rate; no request read yet — no
-/// ctx gauge; unknown limits (the default `Info`) — no ctx gauge either.
+/// arrives: no cache traffic — no cache rate; no read yet — no ctx
+/// gauge; unknown limits — no ctx gauge either.
 fn bar_segs(app: &App) -> Vec<Seg> {
     let st = &app.status;
     let i = &app.info;
@@ -150,13 +145,12 @@ fn rule(w: usize) -> Line<'static> {
 
 /// Render the pane `w` columns wide inside a screen `h` rows tall (the
 /// input block is capped to what fits). Row count varies with the state:
-/// the tail row appears while text streams, the input block grows one row
-/// per line being composed — and within a task the count only ever grows:
-/// blank padding holds the pane at its high-water mark
+/// the tail row appears while text streams, the input block grows one
+/// row per line being composed — and within a task the count only ever
+/// grows. Blank padding holds the pane at its high-water mark
 /// ([`Status::pane_floor`](super::model::Status::pane_floor)), so the
-/// status bar keeps its row while folds swap tail rows for reserve. The
-/// reserve is blank: only a live, streaming block is ever drawn above the
-/// input.
+/// bar keeps its row while folds swap tail rows for reserve. The reserve
+/// is blank: only a live, streaming block is ever drawn above the input.
 pub fn pane(app: &App, w: u16, h: u16) -> Pane {
     let w = w.max(8) as usize;
     let mut lines: Vec<Line<'static>> = vec![];
@@ -247,8 +241,7 @@ fn menu_rows(c: &Completion, w: usize) -> Vec<Line<'static>> {
 /// Small on purpose: the menu is a hint, not the transcript.
 const MENU_ROWS: usize = 6;
 
-/// The prompt row: `❯ <label>`, continuation rows indented by the
-/// same gutter width.
+/// The prompt row: `❯ <label>`, continuation rows indented to match.
 fn prompt_line(label: &str, style: Style) -> Line<'static> {
     Line::from(vec![
         Span::styled(PROMPT_HEAD, prompt_style()),
@@ -257,10 +250,9 @@ fn prompt_line(label: &str, style: Style) -> Line<'static> {
     ])
 }
 
-/// The input block: one row per line of the draft (the prompt gutter only
+/// The input block: one row per line of the draft (prompt gutter only
 /// on the first), horizontally scrolled on the caret's row, vertically
-/// windowed to `cap` rows with the caret kept visible. Returns the rows,
-/// the caret's row within the block, and its column.
+/// windowed to `cap` rows. Returns the rows, caret row, and column.
 fn input_rows(app: &App, w: usize, cap: usize) -> (Vec<Line<'static>>, usize, usize) {
     let text = &app.input.text;
     let i = app.input.caret();
@@ -314,15 +306,13 @@ fn line_window(line: &str, off: usize, avail: usize) -> (String, usize) {
     (format!("…{}", truncate_cols(&line[start..], avail.saturating_sub(1))), width + 1)
 }
 
-/// How a row may lay out its text. The same row renders under all three:
-/// the pane's live rows truncate (they are rewritten every frame — previews
-/// keep the pane's geometry predictable), the transcript wraps at the width
-/// of its flush and is then baked (what lands in the scrollback is
-/// immutable, so it must carry the whole line at *that* width — the way a
-/// shell's own output is wrapped forever by the width it was printed at),
-/// and the review overlay wraps at the live width, re-wrapping as the
-/// terminal is resized. One enum, because the three modes are one fact with
-/// three faces.
+/// How a row may lay out its text — three modes, one fact. The pane's
+/// live rows truncate (rewritten every frame; previews keep the pane's
+/// geometry predictable); the transcript wraps at the flush width and
+/// is then baked (the scrollback is immutable, so it carries the whole
+/// line at *that* width, the way a shell's own output is); the review
+/// overlay wraps at the live width, re-wrapping on resize. One enum
+/// because the three modes are one fact with three faces.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lay {
     /// Truncate with an ellipsis: the pane's live preview rows, one
@@ -349,10 +339,10 @@ pub fn flush_lines(app: &App, w: usize, from: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// The last `n` rendered transcript lines at width `w` — the visible tail a
-/// resize redraw reprints. Only committed rows: the live block (streaming
-/// text, the thinking tail) is the pane's, drawn above its rules, and must
-/// not be doubled here.
+/// The last `n` rendered transcript lines at width `w` — the visible
+/// tail a resize redraw reprints. Only committed rows: the live block
+/// (streaming text, the thinking tail) is the pane's, and must not be
+/// doubled here.
 pub fn transcript_tail(app: &App, w: usize, n: usize) -> Vec<Line<'static>> {
     let mut out = vec![];
     for row in &app.rows {
@@ -423,7 +413,7 @@ fn row_lines(row: &Row, w: usize, out: &mut Vec<Line<'static>>, lay: Lay) {
                 }
             }
         }
-        Row::Line(l) => flat(l, w, lay, out, Style::default()),
+        Row::Line(l) => emit(out, l, w, lay, Style::default(), vec![]),
         Row::Sep => out.push(Line::from("")),
         // the fold travels inside the row: its kind is the variant arm the
         // renderer is already in — there is nothing to disagree with
@@ -455,9 +445,7 @@ fn task_spans(first: bool) -> (Span<'static>, Span<'static>) {
     }
 }
 
-fn flat(l: &str, w: usize, lay: Lay, out: &mut Vec<Line<'static>>, style: Style) {
-    emit(out, l, w, lay, style, vec![]);
-}
+
 
 /// A reasoning fold: its marker when closed, marker + full body when open.
 /// The open marker splits in two — the title is a header, its metadata a
@@ -535,9 +523,9 @@ fn fold_head(head: &str, expanded: bool, w: usize, out: &mut Vec<Line<'static>>)
 /// The live reasoning block: reasoning streams for seconds, and a frozen
 /// pane cannot tell "thinking" from "hung". So the pane (and the review
 /// overlay) show the block as it arrives — the number it will fold into,
-/// how long it has been running, and the tail that still moves. It never
-/// lands in the scrollback: ThinkEnd folds it once, with its final state,
-/// into the transcript; the pane then falls back to blank reserve.
+/// how long it has been running, and the tail that still moves. ThinkEnd
+/// folds it once, with its final state, into the transcript; the pane
+/// then falls back to blank reserve.
 fn think_tail(app: &App, w: usize, lay: Lay, out: &mut Vec<Line<'static>>) {
     if app.think_buf.is_empty() {
         return;
@@ -565,8 +553,8 @@ fn guttered(l: &str, w: usize, lay: Lay, style: Style, out: &mut Vec<Line<'stati
 
 /// One text row's content, with optional prefix spans: a fold gutter,
 /// a continuation indent, or nothing. Pane truncates; flush / review
-/// wrap. The Pane vs other branches look the same on every caller —
-/// folding them into one place is the whole point.
+/// wrap. Folding the Pane vs other branches into one place is the
+/// whole point.
 fn emit(out: &mut Vec<Line<'static>>, text: &str, avail: usize, lay: Lay, style: Style, prefix: Vec<Span<'static>>) {
     if lay == Lay::Pane {
         let mut spans = prefix;

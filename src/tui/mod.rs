@@ -74,8 +74,7 @@ use update::{update as step, Action, Ev};
 
 type Backend = CrosstermBackend<io::Stdout>;
 
-/// The running agent: its cancellation token and its coroutine. A struct,
-/// not a tuple — the shell reads it by name.
+/// The running agent: its cancellation token and its coroutine.
 struct Agent {
     token: Arc<crate::cancel::CancelToken>,
     job: tokio::task::JoinHandle<()>,
@@ -92,15 +91,11 @@ impl Agent {
     }
 }
 
-/// The plan for handing `n` finished lines to the scrollback above a pane
+/// Plan for handing `n` finished lines to the scrollback above a pane
 /// at row `top`, `height` rows tall, on a screen of `screen` rows: a list
-/// of (scroll_up, paint_at, count) steps. Pure arithmetic — the one piece
-/// of the stage that can be wrong in interesting ways, and therefore the
-/// one piece that is unit-tested.
-///
-/// Invariants every plan preserves: every row is painted exactly once, in
-/// order; after each step the pane still ends on or above the screen's
-/// last row; the pane's new top row is the row after the last painted one.
+/// of (scroll_up, paint_at, count) steps. Pure arithmetic, the one piece
+/// of the stage that can be wrong in interesting ways — and therefore
+/// the one piece that is unit-tested.
 fn flush_plan(top: u16, height: u16, screen: u16, n: usize) -> Vec<(u16, u16, usize)> {
     let mut plan = vec![];
     let mut drawn = top as i32;
@@ -121,10 +116,10 @@ fn flush_plan(top: u16, height: u16, screen: u16, n: usize) -> Vec<(u16, u16, us
     plan
 }
 
-/// The bytes that scroll the screen one row at a time: CR+LF pairs, printed
-/// with the cursor parked on the last row. Pure, so the choice it pins —
-/// line feeds, never `CSI S` — is a testable fact and not just a comment.
-/// See [`Stage::scroll`] for why that choice matters.
+/// The bytes that scroll the screen one row at a time: CR+LF pairs,
+/// printed with the cursor parked on the last row. Pure, so the choice
+/// it pins — line feeds, never `CSI S` — is a testable fact. See
+/// [`Stage::scroll`] for why.
 fn scroll_bytes(n: u16) -> String {
     "\r\n".repeat(n as usize)
 }
@@ -173,7 +168,7 @@ fn retire_bytes(top: u16, height: u16) -> Vec<u8> {
 }
 
 /// The bottom of the screen: the pane's rows and where they sit. All
-/// geometry is tracked, never queried — see the module docs.
+/// geometry is tracked, never queried.
 struct Stage {
     /// The frame under construction. Everything one repaint wants on the
     /// wire — Hide, scrolls, transcript rows, height-change clears, pane
@@ -268,11 +263,10 @@ impl Stage {
     }
 
     /// Hand the rows rendered since the last flush to the terminal: they
-    /// are painted above the pane (overwriting its old position) and, once
-    /// the screen is full, carried into the native scrollback. Same
-    /// chunked scroll-and-paint arithmetic ratatui's inline viewport uses,
-    /// done here so the heights stay ours — the arithmetic lives in
-    /// [`flush_plan`], where tests can reach it.
+    /// are painted above the pane and, once the screen is full, carried
+    /// into the native scrollback. Same chunked scroll-and-paint
+    /// arithmetic ratatui's inline viewport uses, kept here so the
+    /// heights stay ours — the arithmetic lives in [`flush_plan`].
     fn flush(&mut self, lines: &[Line<'static>]) -> io::Result<()> {
         if lines.is_empty() {
             return Ok(());
@@ -346,12 +340,12 @@ impl Stage {
 /// The cells of a rendered block, offset to start at row `at`: one per
 /// column, except the trailing halves of wide graphemes. A wide glyph
 /// covers its neighbor column, so the buffer parks a blank cell there —
-/// but the terminal's cursor already skips past both halves when the glyph
-/// is printed, and the backend only repositions between *non-adjacent*
-/// cells. Emitting the blank would land one column further right and shove
-/// the rest of the row sideways (every CJK char spaced a column apart, the
-/// caret off by that much). Stepping over the shadow, the way ratatui's
-/// own buffer diff does, keeps runs contiguous and columns exact.
+/// but the terminal's cursor already skips past both halves when printed,
+/// and the backend only repositions between *non-adjacent* cells.
+/// Emitting the blank would shove the rest of the row sideways (every
+/// CJK char spaced a column apart). Stepping over the shadow, the way
+/// ratatui's own buffer diff does, keeps runs contiguous and columns
+/// exact.
 fn row_cells(buf: &Buffer, at: u16) -> Vec<(u16, u16, Cell)> {
     let w = buf.area.width;
     let mut cells = Vec::with_capacity(buf.content.len());
@@ -370,22 +364,22 @@ fn row_cells(buf: &Buffer, at: u16) -> Vec<(u16, u16, Cell)> {
 }
 
 /// Whether this frame must repaint the pane: the transcript has rows to
-/// hand to the scrollback, nothing has been painted yet, the terminal
-/// resized, or the pane's rows or caret differ from what is on screen.
+/// hand to the scrollback, nothing painted yet, the terminal resized,
+/// or the pane's rows or caret differ from what is on screen.
 ///
 /// The comparison renders the candidate pane first and diffs it against
-/// the painted one — dirty-tracking at the render boundary rather than in
-/// every update arm. Its cost is bounded by the pane (≤ screen rows), and
+/// the painted one — dirty-tracking at the render boundary rather than
+/// in every update arm. Cost is bounded by the pane (≤ screen rows);
 /// the alternative (per-field dirty flags) would tax every future rule
-/// added to `update` with remembering to flag itself.
+/// with remembering to flag itself.
 ///
 /// When none hold the frame is skipped wholesale — no cells written, no
-/// `Hide`, no `Show`. That is not merely an optimization: the tick fires
-/// every 120 ms even while the prompt sits idle and the state does not
-/// change, and hiding then re-showing the cursor that often resets the
-/// terminal's own blink phase, so the caret flickers eight times a second
-/// instead of blinking at the terminal's pace. An unchanged frame leaves
-/// the caret — and its blinking — entirely to the terminal.
+/// `Hide`, no `Show`. Not merely an optimization: the tick fires every
+/// 120 ms even while the prompt sits idle, and hiding then re-showing
+/// the cursor that often resets the terminal's own blink phase, so the
+/// caret flickers eight times a second instead of blinking at the
+/// terminal's pace. An unchanged frame leaves the caret — and its
+/// blinking — entirely to the terminal.
 fn needs_paint(
     grew: bool,
     painted: Option<&((u16, u16), view::Pane)>,
@@ -403,10 +397,9 @@ fn needs_paint(
 }
 
 /// Open the TUI: terminal setup, the event loop, guaranteed restore.
-/// `convo` is the conversation to run on (history + its session); the
-/// banners come from the composition root and land beside ours.
-/// `hub` is the MCP hub: a clone the TUI shares with the agent loop, and
-/// uses itself for `/mcp` slash commands while idle.
+/// `convo` is the conversation to run on; `hub` is the MCP hub: a clone
+/// the TUI shares with the agent loop, and uses itself for `/mcp`
+/// slash commands while idle.
 pub async fn run(cfg: Config, mut ctx: crate::context::Context, convo: Convo, banners: Vec<String>, hub: Hub) -> crate::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sink = ChannelSink::new(tx);
@@ -435,18 +428,16 @@ pub async fn run(cfg: Config, mut ctx: crate::context::Context, convo: Convo, ba
     let mut cfg = cfg;
     // convo is replaceable — `/model` swaps in a fresh Convo without
     // disturbing the running event loop. Each replacement wraps a new
-    // AsyncMutex; the previous one is dropped with its lock held at most
-    // until any in-flight agent coroutine finishes.
+    // AsyncMutex; the previous one is dropped with its lock held at
+    // most until any in-flight agent coroutine finishes.
     let mut convo = Arc::new(AsyncMutex::new(convo));
     let mut agent: Option<Agent> = None;
     // The MCP hub is shared with the spawned agent task (so MCP tool
     // calls have a hub to dispatch to) and with the slash dispatcher
     // (so /mcp can read & operate on the same servers). Cloning a Hub
     // is cloning an mpsc::Sender — cheap, and the actor task is the
-    // single owner of the real state. `mut` is in case future code
-    // paths need to replace it; nothing currently does.
-    #[allow(unused_mut)]
-    let mut hub = hub;
+    // single owner of the real state.
+    let hub = hub;
 
     // Raw mode, bracketed paste, and the kitty keyboard protocol (which
     // makes Shift-Enter distinguishable from Enter on terminals that
@@ -644,8 +635,7 @@ pub async fn run(cfg: Config, mut ctx: crate::context::Context, convo: Convo, ba
     // One burst to dissolve: the pane's rows erase, the caret parks on
     // the first of them for the shell's prompt, and the session's modes
     // roll back — a render between the per-row clears used to show the
-    // pane dissolving row by row. Raw mode is termios, not escape
-    // bytes; it goes back after the burst.
+    // pane dissolving row by row. Raw mode is termios, not escape bytes.
     let _ = send_frame(&mut io::stdout().lock(), &retire_bytes(stage.top, stage.height));
     let _ = crossterm::terminal::disable_raw_mode();
     save_history(&app.input.history);
@@ -706,13 +696,7 @@ impl std::fmt::Debug for HandleOutcome {
 /// switch arm is the one that mutates: the loop's `cfg` and `convo`
 /// are replaced, the `info` row of the pane is refreshed, and a
 /// transcript note announces what happened.
-fn apply_outcome(
-    outcome: HandleOutcome,
-    cfg: &mut Config,
-    convo: &mut Arc<AsyncMutex<Convo>>,
-    app: &mut App,
-    sink: &ChannelSink,
-) {
+fn apply_outcome(outcome: HandleOutcome, cfg: &mut Config, convo: &mut Arc<AsyncMutex<Convo>>, app: &mut App, sink: &ChannelSink) {
     match outcome {
         HandleOutcome::None | HandleOutcome::Cancel => {}
         HandleOutcome::Switch { cfg: new_cfg, convo: new_convo, banners, announce } => {
@@ -734,8 +718,8 @@ fn apply_outcome(
 }
 
 /// Parse a `/`-prefixed input line into a slash command + its args.
-/// A line that is not a slash command returns `None`; the caller
-/// falls through to the normal submit path (a regular task).
+/// A line that is not a slash command returns `None`; the caller falls
+/// through to the normal submit path.
 fn parse_slash(line: &str) -> Option<SlashCmd<'_>> {
     let line = line.trim();
     let rest = line.strip_prefix('/')?;
@@ -754,13 +738,7 @@ struct SlashCmd<'a> {
 /// accretion — every new command adds a match arm and nothing else.
 /// Unknown commands surface in the transcript as a `Note` so the user
 /// sees the typo (no silent failure).
-fn dispatch_slash(
-    cmd: SlashCmd<'_>,
-    cfg: &Config,
-    convo: &Arc<AsyncMutex<Convo>>,
-    sink: &ChannelSink,
-    hub: &Hub,
-) -> HandleOutcome {
+fn dispatch_slash(cmd: SlashCmd<'_>, cfg: &Config, convo: &Arc<AsyncMutex<Convo>>, sink: &ChannelSink, hub: &Hub) -> HandleOutcome {
     match cmd.name {
         "exit" | "quit" => {
             // the loop owns the quit flag; we just stop the current
@@ -805,11 +783,7 @@ fn dispatch_slash(
 /// ride back through `HandleOutcome::Switch`; the loop swaps them in.
 /// With no args we surface the current selection and the available
 /// profiles; with one arg we look it up under `<provider>/<model>`.
-fn slash_model(
-    args: Vec<&str>,
-    cfg: &Config,
-    convo: &Arc<AsyncMutex<Convo>>,
-) -> Result<HandleOutcome, String> {
+fn slash_model(args: Vec<&str>, cfg: &Config, convo: &Arc<AsyncMutex<Convo>>) -> Result<HandleOutcome, String> {
     let settings = Settings::load().map_err(|e| e.to_string())?;
     let current_key = settings
         .active
@@ -921,16 +895,9 @@ fn protocol_of(name: &str) -> Option<crate::api::Protocol> {
 /// (the agent coroutine is spawned) and yields no outcome — the loop
 /// keeps its current cfg and convo. Slash commands on the input line
 /// resolve here too: dispatching `/model` returns `Switch` with the
-/// newly-built Config and Convo; the loop swaps them in.
-fn handle(
-    action: Action,
-    cfg: &Config,
-    ctx: &mut crate::context::Context,
-    convo: &Arc<AsyncMutex<Convo>>,
-    agent: &mut Option<Agent>,
-    sink: &ChannelSink,
-    hub: &Hub,
-) -> HandleOutcome {
+/// newly-built Config and Convo.
+fn handle(action: Action, cfg: &Config, ctx: &mut crate::context::Context, convo: &Arc<AsyncMutex<Convo>>,
+          agent: &mut Option<Agent>, sink: &ChannelSink, hub: &Hub) -> HandleOutcome {
     match action {
         Action::None => HandleOutcome::None,
         Action::Cancel => {
@@ -1705,8 +1672,7 @@ mod tests {
         assert!(needs_paint(false, Some(&painted), 80, 24, &b), "cursor moved → paint");
     }
 
-    // ---- handle: the action dispatcher ------------------------------------
-
+    // ---- handle: the action dispatcher ----
     /// A handle that lets a test inspect the agent that was spawned.
     fn run_handle(action: Action) -> (ChannelSink, Option<Agent>) {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1861,8 +1827,8 @@ mod tests {
     // ---- history file: save → load round trip -----------------------------
 
     /// Point home_dir() at a temp dir for the lifetime of the test. The
-    /// loader and saver both consult home_dir(), so the override has to
-    /// land before either is called. The guard removes both on drop.
+    /// loader and saver both consult home_dir(); the override has to
+    /// land before either is called. The guard removes the dir on drop.
     struct HomeOverride(std::path::PathBuf);
     impl Drop for HomeOverride {
         fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
