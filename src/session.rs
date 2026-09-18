@@ -246,6 +246,9 @@ impl Session {
             return Ok(());
         }
         if self.persisted == 0 {
+            // Both the first-sync and rewrite paths want the directory
+            // present; lift it once. The OpenOptions::open below shares
+            // the same parent lookup.
             if let Some(p) = self.path.as_deref().and_then(Path::parent) {
                 fs::create_dir_all(p)?;
             }
@@ -258,9 +261,6 @@ impl Session {
             // session under `list_in`. `create_new` refuses an
             // existing target; the error surfaces as an io error the
             // caller already knows to handle.
-            if let Some(p) = self.path.as_deref().and_then(Path::parent) {
-                fs::create_dir_all(p)?;
-            }
             OpenOptions::new().write(true).create_new(true).open(self.path.as_deref().unwrap())?
         } else {
             OpenOptions::new().create(true).append(true).open(self.path.as_deref().unwrap())?
