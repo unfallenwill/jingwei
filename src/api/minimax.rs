@@ -11,6 +11,7 @@ use super::{empty_usage, merge_usage, request, response_from_value, show_turn, s
             CacheMode, Thinking};
 use crate::cancel::CancelToken;
 use crate::config::Config;
+use crate::context::Context;
 use crate::display::{Msg, Show};
 use crate::ir::{Block, Message, Response};
 use crate::{Error, Result};
@@ -19,29 +20,59 @@ use serde_json::{json, Value};
 /// The minimax adapter's one entry into the provider port. Strip is a
 /// wire rule wearing a policy flag: this wire carries thinking blocks in
 /// its history verbatim, so stripping them is this adapter's job, never
-/// the core's.
-pub(super) async fn turn(cfg: &Config, history: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
+/// the core's. The third slot of the tuple is the rendered wire body the
+/// vendor actually sent — the session records it so the file is a
+/// faithful log of every byte the model saw, not just the message
+/// pairs the IR happens to keep.
+pub(super) async fn turn(cfg: &Config, ctx: &Context, history: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
     let messages: Vec<Message> = if cfg.thinking == Thinking::Strip { strip_thinking(history) } else { history.to_vec() };
     if cfg.streaming {
-        streaming(cfg, &messages, schemas, token, sink).await
+        streaming(cfg, ctx, &messages, token, sink).await
     } else {
-        blocking(cfg, &messages, schemas, token, sink).await
+        blocking(cfg, ctx, &messages, token, sink).await
     }
 }
 
-pub(super) fn body(cfg: &Config, messages: &[Message], schemas: &[Value], stream: bool) -> Value {
+pub(super) fn body(cfg: &Config, ctx: &Context, messages: &[Message], stream: bool) -> Value {
     let active = cfg.cache == CacheMode::Active;
-    // Compose the system prompt from the base constant plus any AGENTS.md
-    // extras loaded at session start. The active-cache breakpoint lands
-    // on the resulting block, so both pieces go into the cached prefix
-    // together — AGENTS.md doesn't shift the cache key per turn.
-    let system_text = crate::agents_md::full_system_prompt(&cfg.agents_md_extra);
+    // The system side is rendered as multiple blocks: `system_text` first
+    // (just `crate::SYSTEM`, the static identity contract), then one block
+    // per reminder. AGENTS.md content rides in an `AgentsMdClosest`
+    // reminder today; runtime context and compaction anchors will ride
+    // here tomorrow — the v1 scheduler knows nothing about which kind.
+    //
+    // Cache markers: every stable reminder (one whose id reports
+    // `is_session_stable()`) gets a `cache_control: ephemeral` marker, so
+    // AGENTS.md's content sits in the cached prefix alongside `SYSTEM`
+    // without the cache key shifting per turn. Unstable reminders
+    // (runtime injections, future ephemeral nudges) skip the marker and
+    // land as fresh blocks each request — they don't pollute the prefix
+    // or invalidate it.
     let system = if active {
-        json!([{"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}])
+        let mut blocks = vec![json!({
+            "type": "text", "text": ctx.system_text,
+            "cache_control": {"type": "ephemeral"},
+        })];
+        for r in &ctx.reminders {
+            let mut b = json!({"type": "text", "text": r.text});
+            if r.id.is_session_stable() {
+                b.as_object_mut().unwrap()
+                    .insert("cache_control".into(), json!({"type": "ephemeral"}));
+            }
+            blocks.push(b);
+        }
+        Value::Array(blocks)
     } else {
-        json!(system_text)
+        // No active cache: collapse to a single string, identical to the
+        // chat-completions family. Reminders own their own leading
+        // separator so a flat join reproduces the wire shape.
+        let mut s = ctx.system_text.clone();
+        for r in &ctx.reminders {
+            s.push_str(&r.text);
+        }
+        Value::String(s)
     };
-    let mut tools = schemas.to_vec();
+    let mut tools = ctx.tools.clone();
     if active {
         if let Some(last) = tools.last_mut() { last["cache_control"] = json!({"type": "ephemeral"}); }
     }
@@ -62,9 +93,9 @@ pub(super) fn body(cfg: &Config, messages: &[Message], schemas: &[Value], stream
     body
 }
 
-async fn blocking(cfg: &Config, messages: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
+async fn blocking(cfg: &Config, ctx: &Context, messages: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
     let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
-    let body = body(cfg, messages, schemas, false);
+    let body = body(cfg, ctx, messages, false);
     let key = cfg.api_key.clone();
     let v: Value = request(token, &key, &url, &body, true, |r| {
         let v: Value = r.into_json()?;
@@ -73,12 +104,12 @@ async fn blocking(cfg: &Config, messages: &[Message], schemas: &[Value], token: 
     }).await?;
     let resp = response_from_value(&v);
     show_turn(&resp, sink);
-    Ok((resp, token.is_cancelled()))
+    Ok((resp, token.is_cancelled(), body))
 }
 
-async fn streaming(cfg: &Config, messages: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
+async fn streaming(cfg: &Config, ctx: &Context, messages: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
     let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
-    let body = body(cfg, messages, schemas, true);
+    let body = body(cfg, ctx, messages, true);
     let key = cfg.api_key.clone();
     let resp = request(token, &key, &url, &body, true, Ok).await?;
     // Blocks arrive one at a time, indexed; a tool_use's arguments stream as
@@ -177,29 +208,30 @@ async fn streaming(cfg: &Config, messages: &[Message], schemas: &[Value], token:
         }
     }
     sink.show(Msg::Done);
-    Ok((Response { blocks: blocks.into_iter().flatten().collect(), usage }, interrupted))
+    Ok((Response { blocks: blocks.into_iter().flatten().collect(), usage }, interrupted, body))
 }
 #[cfg(test)]
 mod tests {
 
     use crate::api::{call_api, Protocol};
     use crate::api::{Effort, Thinking as CThinking};
-    use crate::test_util::{block_on, cfg, mock, mock_seq, sink, BlockExt};
+    use crate::test_util::{block_on, cfg, ctx as make_ctx, mock, mock_seq, sink, BlockExt};
     use serde_json::json;
 
     #[test]
     fn body_thinking_toggle_and_verbatim_echo() {
         let mut c = cfg("https://x".into(), true);
         c.max_tokens = 65_536;  // enough headroom for Effort::Max to be visibly different from High
-        assert_eq!(super::body(&c, &[], &[], false)["thinking"], json!({"type": "adaptive"}));
+        let cx = make_ctx();
+        assert_eq!(super::body(&c, &cx, &[], false)["thinking"], json!({"type": "adaptive"}));
         c.thinking = CThinking::Strip;
-        assert_eq!(super::body(&c, &[], &[], true)["thinking"], json!({"type": "disabled"}));
+        assert_eq!(super::body(&c, &cx, &[], true)["thinking"], json!({"type": "disabled"}));
         c.thinking = CThinking::Preserve;
         c.effort = Some(Effort::High);
-        assert_eq!(super::body(&c, &[], &[], false)["thinking"],
+        assert_eq!(super::body(&c, &cx, &[], false)["thinking"],
             json!({"type": "adaptive", "budget_tokens": 32768}));
         c.effort = Some(Effort::Max);
-        let budget = super::body(&c, &[], &[], false)["thinking"]["budget_tokens"].as_u64().unwrap();
+        let budget = super::body(&c, &cx, &[], false)["thinking"]["budget_tokens"].as_u64().unwrap();
         assert!(budget > 0 && (budget as u32) < c.max_tokens,
             "max clamps below max_tokens: {budget}");
     }
@@ -208,37 +240,76 @@ mod tests {
     fn body_marks_cache_breakpoints_only_when_active() {
         let mut c = cfg("https://x".into(), false);
         c.cache = crate::api::CacheMode::Auto;
-        let b = super::body(&c, &[], &[json!({"name":"t","description":"d","input_schema":{"type":"object"}})], false);
+        let mut cx = make_ctx();
+        cx.tools = vec![json!({"name":"t","description":"d","input_schema":{"type":"object"}})];
+        let b = super::body(&c, &cx, &[], false);
         assert!(b["system"].is_string(), "no breakpoints on auto");
         assert!(b["tools"][0].get("cache_control").is_none());
         c.cache = crate::api::CacheMode::Active;
-        let b = super::body(&c, &[], &[json!({"name":"t","description":"d","input_schema":{"type":"object"}})], false);
+        let b = super::body(&c, &cx, &[], false);
         assert!(b["system"].as_array().unwrap()[0].get("cache_control").is_some());
         assert!(b["tools"][0].get("cache_control").is_some());
     }
 
-    /// AGENTS.md extras land inside the same system-text block the
-    /// cache_control breakpoint annotates — so the agent's project
-    /// conventions sit in the cached prefix alongside the base `SYSTEM`
-    /// and don't shift the cache key per turn.
+    /// AGENTS.md content rides in its own system block — separate from
+    /// `system_text` (which holds only `crate::SYSTEM`) — and lands in
+    /// the cached prefix via the stable reminder's `cache_control`
+    /// marker. Two blocks means two cache segments: `SYSTEM` and the
+    /// AGENTS.md body can change independently without invalidating
+    /// each other's prefix.
     #[test]
-    fn body_composes_agents_md_into_the_system_block() {
+    fn body_splits_agents_md_into_its_own_system_block() {
         use crate::test_util::temp_dir;
         let dir = temp_dir("agents_md_minimax");
         std::fs::write(dir.join("AGENTS.md"), "use rustfmt").unwrap();
-        let ctx = crate::agents_md::AgentsMdContext::load(&dir);
+        let md = crate::agents_md::AgentsMdContext::load(&dir);
 
         let mut c = cfg("https://x".into(), true);
         c.cache = crate::api::CacheMode::Active; // exercise the array-with-cache branch
-        c.agents_md_extra = ctx.system_prompt_extras();
-        let b = super::body(&c, &[], &[], false);
+        let cx = crate::context::Context::new(&md);
+        let b = super::body(&c, &cx, &[], false);
         let arr = b["system"].as_array().expect("active cache ⇒ array of blocks");
-        assert_eq!(arr.len(), 1, "one system block, not split by the extras");
-        let text = arr[0]["text"].as_str().unwrap();
-        assert!(text.contains(crate::SYSTEM));
-        assert!(text.contains("use rustfmt"));
-        // the breakpoint stays on the composed block — the agent's
-        // AGENTS.md participates in the cached prefix as one unit
+        assert_eq!(arr.len(), 2,
+            "two blocks: SYSTEM + AgentsMdClosest reminder — not the old single composed block");
+
+        // block 0: just SYSTEM, with cache marker
+        let sys_block = &arr[0];
+        assert_eq!(sys_block["text"], crate::SYSTEM,
+            "system_text holds the SYSTEM constant alone; AGENTS.md does not leak in here");
+        assert!(sys_block.get("cache_control").is_some(),
+            "SYSTEM rides in the cached prefix");
+
+        // block 1: AgentsMdClosest reminder — labelled, content-bearing,
+        // and also marked (it's session-stable)
+        let agents_block = &arr[1];
+        let agents_text = agents_block["text"].as_str().unwrap();
+        assert!(agents_text.contains("use rustfmt"), "AGENTS.md body in the reminder");
+        assert!(agents_text.contains("# Project conventions"),
+            "reminder is labelled so the model recognizes where the content came from");
+        assert!(agents_text.contains(&dir.display().to_string()),
+            "the path lands in the reminder too — the model knows which AGENTS.md this is");
+        assert!(agents_block.get("cache_control").is_some(),
+            "AgentsMdClosest is session-stable → cache marker");
+    }
+
+    /// With no AGENTS.md loaded, `reminders` is empty and the wire is
+    /// byte-equivalent to the old single-block behavior: one block,
+    /// `system_text` (= `crate::SYSTEM`), cache marker.
+    #[test]
+    fn body_without_agents_md_is_a_single_system_block() {
+        use crate::test_util::temp_dir;
+        let dir = temp_dir("agents_md_minimax_none");
+        // no AGENTS.md written — `load` returns the empty context
+        let md = crate::agents_md::AgentsMdContext::load(&dir);
+
+        let mut c = cfg("https://x".into(), true);
+        c.cache = crate::api::CacheMode::Active;
+        let cx = crate::context::Context::new(&md);
+        let b = super::body(&c, &cx, &[], false);
+        let arr = b["system"].as_array().expect("active cache ⇒ array of blocks");
+        assert_eq!(arr.len(), 1,
+            "no AGENTS.md ⇒ no reminder ⇒ one SYSTEM block — same as the old wire shape");
+        assert_eq!(arr[0]["text"], crate::SYSTEM);
         assert!(arr[0].get("cache_control").is_some());
     }
 
@@ -249,12 +320,13 @@ mod tests {
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
         c.protocol = Protocol::MINIMAX;
         let token = crate::cancel::CancelToken::new();
-        let (resp, _) = block_on(call_api(&c, &[], &[], &token, &sink())).unwrap();
+        let cx = make_ctx();
+        let (resp, _, _) = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
         assert_eq!(resp.blocks.len(), 1);
         let bad = mock(&json!({"error": {"message": "boom"}}).to_string(), 400, false);
         let mut c = cfg(format!("http://127.0.0.1:{bad}"), false);
         c.protocol = Protocol::MINIMAX;
-        let err = block_on(call_api(&c, &[], &[], &token, &sink())).unwrap_err();
+        let err = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap_err();
         assert!(err.to_string().contains("boom"), "got: {err}");
     }
 
@@ -294,7 +366,8 @@ mod tests {
         let port = mock(stream, 200, true);
         let c = cfg(format!("http://127.0.0.1:{port}"), true);
         let token = crate::cancel::CancelToken::new();
-        let (resp, _) = block_on(call_api(&c, &[], &[], &token, &sink())).unwrap();
+        let cx = make_ctx();
+        let (resp, _, _) = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
         eprintln!("got blocks: {:?}
 usage: {:?}", resp.blocks, resp.usage);
         assert_eq!(resp.blocks.len(), 2);
@@ -319,7 +392,8 @@ usage: {:?}", resp.blocks, resp.usage);
         let port = mock(stream, 200, true);
         let c = cfg(format!("http://127.0.0.1:{port}"), true);
         let token = crate::cancel::CancelToken::new();
-        let (resp, _) = block_on(call_api(&c, &[], &[], &token, &sink())).unwrap();
+        let cx = make_ctx();
+        let (resp, _, _) = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
         // message_start's usage must reach the response — both input and
         // cache_read survive even though message_delta carries neither.
         assert_eq!(resp.usage["input_tokens"], 1234, "message_start input must persist");
@@ -342,7 +416,8 @@ usage: {:?}", resp.blocks, resp.usage);
         let port = mock(stream, 200, true);
         let c = cfg(format!("http://127.0.0.1:{port}"), true);
         let token = crate::cancel::CancelToken::new();
-        let err = block_on(call_api(&c, &[], &[], &token, &sink())).unwrap_err();
+        let cx = make_ctx();
+        let err = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap_err();
         assert!(err.to_string().contains("rate limit"), "got: {err}");
     }
 
@@ -352,7 +427,8 @@ usage: {:?}", resp.blocks, resp.usage);
         let body = json!({"content": [], "usage": {}}).to_string();
         let (port, seen) = mock_seq(vec![(200, body)]);
         let c = cfg(format!("http://127.0.0.1:{port}"), false);
-        let _ = block_on(call_api(&c, &[], &[], &token, &sink())).unwrap();
+        let cx = make_ctx();
+        let _ = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
         let raw = seen.lock().unwrap()[0].clone();
         assert!(raw.contains("POST /v1/messages"), "minimax hits /v1/messages: {raw}");
         assert!(raw.contains("x-api-key: test-key") && raw.contains("anthropic-version: 2023-06-01"),

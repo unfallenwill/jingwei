@@ -6,6 +6,7 @@
 use super::{chat_blocking, chat_messages, chat_streaming, chat_to_internal, chat_tools, Thinking};
 use crate::cancel::CancelToken;
 use crate::config::Config;
+use crate::context::Context;
 use crate::display::Show;
 use crate::display::Usage;
 use crate::ir::{Message, Response};
@@ -13,11 +14,11 @@ use crate::Result;
 use serde_json::{json, Value};
 
 /// The deepseek vendor's one entry into the provider port.
-pub(super) async fn turn(cfg: &Config, history: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
+pub(super) async fn turn(cfg: &Config, ctx: &Context, history: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
     if cfg.streaming {
-        streaming(cfg, history, schemas, token, sink).await
+        streaming(cfg, ctx, history, token, sink).await
     } else {
-        blocking(cfg, history, schemas, token, sink).await
+        blocking(cfg, ctx, history, token, sink).await
     }
 }
 
@@ -28,11 +29,17 @@ pub(super) async fn turn(cfg: &Config, history: &[Message], schemas: &[Value], t
 /// reasoning back) a stripped history would break on the second request.
 /// Effort rides `reasoning_effort` verbatim: low/high/max are the wire's
 /// own words, and it maps medium→high itself for compatibility.
-pub(super) fn body(cfg: &Config, messages: &[Message], schemas: &[Value], stream: bool) -> Value {
-    let system_text = crate::agents_md::full_system_prompt(&cfg.agents_md_extra);
+///
+/// The system prompt is built by `chat_messages` from `Context.system_text`
+/// (just `crate::SYSTEM`) plus every reminder's text — AGENTS.md content
+/// rides in a `AgentsMdClosest` reminder today; runtime context will ride
+/// here tomorrow. The chat-completions family has a single system-message
+/// slot, so reminders concatenate inline; the wire-shape matches the old
+/// `compose_system` output so cache keys stay stable.
+pub(super) fn body(cfg: &Config, ctx: &Context, messages: &[Message], stream: bool) -> Value {
     let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
         "thinking": {"type": if cfg.thinking == Thinking::Strip { "disabled" } else { "enabled" }},
-        "messages": chat_messages(&system_text, messages, cfg), "tools": chat_tools(schemas)});
+        "messages": chat_messages(ctx, messages, cfg), "tools": chat_tools(&ctx.tools)});
     if stream {
         body["stream"] = json!(true);
         body["stream_options"] = json!({"include_usage": true});
@@ -65,33 +72,34 @@ fn to_internal(v: &Value) -> Response {
     chat_to_internal(v, usage)
 }
 
-async fn blocking(cfg: &Config, messages: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
-    chat_blocking(cfg, body(cfg, messages, schemas, false), to_internal, token, sink).await
+async fn blocking(cfg: &Config, ctx: &Context, messages: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
+    chat_blocking(cfg, body(cfg, ctx, messages, false), to_internal, token, sink).await
 }
 
-async fn streaming(cfg: &Config, messages: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
-    chat_streaming(cfg, body(cfg, messages, schemas, true), usage, token, sink).await
+async fn streaming(cfg: &Config, ctx: &Context, messages: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
+    chat_streaming(cfg, body(cfg, ctx, messages, true), usage, token, sink).await
 }
 #[cfg(test)]
 mod tests {
 
     use crate::api::{call_api, Protocol};
     use crate::api::{Effort, Thinking as CThinking};
-    use crate::test_util::{block_on, cfg, mock, sink, BlockExt};
+    use crate::test_util::{block_on, cfg, ctx as make_ctx, mock, sink, BlockExt};
     use serde_json::json;
 
     #[test]
     fn body_carries_the_toggle_and_the_effort_word() {
         let mut c = cfg("https://x".into(), true);
         c.protocol = Protocol::DEEPSEEK;
-        let b = super::body(&c, &[], &[], false);
+        let cx = make_ctx();
+        let b = super::body(&c, &cx, &[], false);
         assert_eq!(b["thinking"], json!({"type": "enabled"}));
         c.effort = Some(Effort::Max);
-        let b = super::body(&c, &[], &[], false);
+        let b = super::body(&c, &cx, &[], false);
         assert_eq!(b["reasoning_effort"], "max");
         c.thinking = CThinking::Strip;
         c.effort = None;
-        let b = super::body(&c, &[], &[], false);
+        let b = super::body(&c, &cx, &[], false);
         assert_eq!(b["thinking"], json!({"type": "disabled"}));
         assert!(b.get("reasoning_effort").is_none());
     }
@@ -118,7 +126,8 @@ mod tests {
         let mut c = cfg(format!("http://127.0.0.1:{port}"), true);
         c.protocol = Protocol::DEEPSEEK;
         let token = crate::cancel::CancelToken::new();
-        let (resp, _) = block_on(call_api(&c, &[], &[], &token, &sink())).unwrap();
+        let cx = make_ctx();
+        let (resp, _, _) = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
         assert_eq!(resp.blocks.len(), 2);
         assert_eq!(resp.blocks[0].text().unwrap(), "hello world");
         assert_eq!(resp.blocks[1].name(), "bash");
@@ -135,12 +144,13 @@ mod tests {
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
         c.protocol = Protocol::DEEPSEEK;
         let token = crate::cancel::CancelToken::new();
-        let (resp, _) = block_on(call_api(&c, &[], &[], &token, &sink())).unwrap();
+        let cx = make_ctx();
+        let (resp, _, _) = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
         assert_eq!(resp.blocks[0].text().unwrap(), "ok");
         let bad = mock(&json!({"error":{"message":"boom"}}).to_string(), 400, false);
         let mut c = cfg(format!("http://127.0.0.1:{bad}"), false);
         c.protocol = Protocol::DEEPSEEK;
-        let err = block_on(call_api(&c, &[], &[], &token, &sink())).unwrap_err();
+        let err = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap_err();
         assert!(err.to_string().contains("boom"), "got: {err}");
     }
 

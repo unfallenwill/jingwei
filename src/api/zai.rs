@@ -14,6 +14,7 @@ use super::{chat_blocking, chat_messages, chat_streaming, chat_to_internal, chat
             Thinking};
 use crate::cancel::CancelToken;
 use crate::config::Config;
+use crate::context::Context;
 use crate::display::Show;
 use crate::ir::{Message, Response};
 use crate::display::Usage;
@@ -21,11 +22,11 @@ use crate::Result;
 use serde_json::{json, Value};
 
 /// The zai vendor's one entry into the provider port.
-pub(super) async fn turn(cfg: &Config, history: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
+pub(super) async fn turn(cfg: &Config, ctx: &Context, history: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
     if cfg.streaming {
-        streaming(cfg, history, schemas, token, sink).await
+        streaming(cfg, ctx, history, token, sink).await
     } else {
-        blocking(cfg, history, schemas, token, sink).await
+        blocking(cfg, ctx, history, token, sink).await
     }
 }
 
@@ -45,10 +46,15 @@ fn effort_word(e: super::Effort) -> &'static str {
 /// thinking object at all: the flagship cannot stop thinking (`disabled`
 /// is a hard 400), so strip on this wire means "not kept", never "off" —
 /// the history blocks drop in the dialect's message translation.
-pub(super) fn body(cfg: &Config, messages: &[Message], schemas: &[Value], stream: bool) -> Value {
-    let system_text = crate::agents_md::full_system_prompt(&cfg.agents_md_extra);
+///
+/// The system prompt rides in the same place the deepseek one does: built
+/// by `chat_messages` from `Context.system_text` plus reminders. zai's
+/// cache is implicit (`prompt_tokens_details.cached_tokens`), so the
+/// wire-shape parity with the old `compose_system` output matters more
+/// here than explicit cache markers.
+pub(super) fn body(cfg: &Config, ctx: &Context, messages: &[Message], stream: bool) -> Value {
     let mut body = json!({"model": cfg.model, "max_tokens": cfg.max_tokens,
-        "messages": chat_messages(&system_text, messages, cfg), "tools": chat_tools(schemas)});
+        "messages": chat_messages(ctx, messages, cfg), "tools": chat_tools(&ctx.tools)});
     if cfg.thinking == Thinking::Preserve {
         body["thinking"] = json!({"type": "enabled", "clear_thinking": false});
     }
@@ -86,53 +92,54 @@ fn to_internal(v: &Value) -> Response {
     chat_to_internal(v, usage)
 }
 
-async fn blocking(cfg: &Config, messages: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
-    chat_blocking(cfg, body(cfg, messages, schemas, false), to_internal, token, sink).await
+async fn blocking(cfg: &Config, ctx: &Context, messages: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
+    chat_blocking(cfg, body(cfg, ctx, messages, false), to_internal, token, sink).await
 }
 
-async fn streaming(cfg: &Config, messages: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
-    chat_streaming(cfg, body(cfg, messages, schemas, true), usage, token, sink).await
+async fn streaming(cfg: &Config, ctx: &Context, messages: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
+    chat_streaming(cfg, body(cfg, ctx, messages, true), usage, token, sink).await
 }
 
 #[cfg(test)]
 mod tests {
     use crate::api::{call_api, Protocol, Thinking as ApiThinking};
     use crate::api::{Effort, Thinking as CThinking};
-    use crate::test_util::{block_on, cfg, mock, sink, BlockExt};
+    use crate::test_util::{block_on, cfg, ctx as make_ctx, mock, sink, BlockExt};
     use serde_json::json;
 
     #[test]
     fn body_carries_clear_thinking_and_folds_medium_into_high() {
         let mut c = cfg("https://x".into(), true);
         c.protocol = Protocol::ZAI;
-        let b = super::body(&c, &[], &[], false);
+        let cx = make_ctx();
+        let b = super::body(&c, &cx, &[], false);
         assert_eq!(b["thinking"], json!({"type": "enabled", "clear_thinking": false}));
         assert!(b.get("reasoning_effort").is_none());
         c.effort = Some(Effort::Medium);
-        let b = super::body(&c, &[], &[], false);
+        let b = super::body(&c, &cx, &[], false);
         assert_eq!(b["reasoning_effort"], json!("high"), "medium folds into high");
         c.thinking = ApiThinking::Strip;
-        let b = super::body(&c, &[], &[], false);
+        let b = super::body(&c, &cx, &[], false);
         assert!(b.get("thinking").is_none(), "strip on zai means no thinking object");
     }
 
     /// AGENTS.md content rides through `body()` as the system prompt on
-    /// chat-completions wires. Pin it down: when `cfg.agents_md_extra`
-    /// is set, the system message the wire carries contains both the
-    /// base `SYSTEM` and the extras.
+    /// chat-completions wires. Pin it down: when the loaded AGENTS.md
+    /// produces extras, the system message the wire carries contains
+    /// both the base `SYSTEM` and the extras.
     #[test]
     fn body_includes_agents_md_extras_in_the_system_message() {
         use crate::test_util::temp_dir;
         let dir = temp_dir("agents_md_wire");
         std::fs::write(dir.join("AGENTS.md"), "always use pnpm").unwrap();
-        let ctx = crate::agents_md::AgentsMdContext::load(&dir);
-        assert!(ctx.found_path.is_some());
+        let md = crate::agents_md::AgentsMdContext::load(&dir);
+        assert!(md.found_path.is_some());
 
         let mut c = cfg("https://x".into(), true);
         c.protocol = Protocol::ZAI;
-        c.agents_md_extra = ctx.system_prompt_extras();
+        let cx = crate::context::Context::new(&md);
         let msgs = vec![crate::ir::Message::User("task".into())];
-        let b = super::body(&c, &msgs, &[], false);
+        let b = super::body(&c, &cx, &msgs, false);
         let system = b["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains(crate::SYSTEM), "base SYSTEM stays in the wire");
         assert!(system.contains("always use pnpm"), "AGENTS.md body rides in");
@@ -155,7 +162,8 @@ mod tests {
         let mut c = cfg(format!("http://127.0.0.1:{port}"), true);
         c.protocol = Protocol::ZAI;
         let token = crate::cancel::CancelToken::new();
-        let (resp, _) = block_on(call_api(&c, &[], &[], &token, &sink())).unwrap();
+        let cx = make_ctx();
+        let (resp, _, _) = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
         assert_eq!(resp.blocks.len(), 3, "thinking + text + tool_use");
         let thinking_text = match &resp.blocks[0] {
             crate::ir::Block::Thinking { text, .. } => text.clone(),
@@ -177,7 +185,8 @@ mod tests {
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
         c.protocol = Protocol::ZAI;
         let token = crate::cancel::CancelToken::new();
-        let (resp, _) = block_on(call_api(&c, &[], &[], &token, &sink())).unwrap();
+        let cx = make_ctx();
+        let (resp, _, _) = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
         assert_eq!(resp.blocks[0].text().unwrap(), "ok");
     }
 

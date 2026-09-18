@@ -33,11 +33,6 @@ pub(crate) struct Config {
     pub(crate) context_size: u64,
     pub(crate) max_turns: u32,
     pub(crate) streaming: bool,
-    /// Pre-rendered AGENTS.md extras for the system prompt, set once at
-    /// session start. Empty string when nothing was loaded (or when the
-    /// user passed `--no-agents-md`). Vendors compose this with the
-    /// base `SYSTEM` constant via `agents_md::full_system_prompt`.
-    pub(crate) agents_md_extra: String,
 }
 
 /// What the user typed on the command line. Each field is `Option<String>`
@@ -143,7 +138,6 @@ pub(crate) fn build_config(args: &Args) -> Result<Config> {
         context_size: args.context_size.unwrap_or(DEFAULT_CONTEXT_SIZE),
         max_turns,
         streaming: args.streaming,
-        agents_md_extra: String::new(),
     })
 }
 
@@ -255,7 +249,6 @@ mod tests {
             api_key: "k".into(), base_url: "https://x".into(), model: "m".into(),
             protocol: Protocol::MINIMAX, cache: CacheMode::Auto, thinking: Thinking::Preserve,
             effort, max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
-            agents_md_extra: String::new(),
         }
     }
 

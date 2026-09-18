@@ -4,12 +4,12 @@
 //
 // Layering (lower → higher, deps go downward only):
 //
-//   L0  display, ir, session                       — pure data types
-//   L1  cancel, file_io, ledger                    — infra primitives
-//   L3  edit, tools, tool_runtime, config         — tool + config layer (config moved to L3: it needs the Vendor port)
-//   L3  edit, tools, tool_runtime                  — tool layer
+//   L0  display, ir, session, turn                  — pure data types + state machines (turn is per-run, no IO)
+//   L1  cancel, file_io, format, ledger, agents_md — infra primitives (agents_md walks the FS — IO, no other crate deps)
+//   L3  config, settings, context, edit, tools, tool_runtime, login, mcp + submodules
+//                                                  — tool/config tier; reaches into api (L4) for the Vendor port + policy enums
 //   L4  api (+ api::minimax/zai/deepseek)          — vendor + transport
-//   L5  main, plain, tui                           — composition + frontends
+//   L5  main, plain, tui (+ tui::model/update/view)— composition + frontends
 //   T   test_util                                  — test-only helpers
 //
 // Rules:
@@ -42,9 +42,9 @@ impl Layer {
 
 fn layer_of(mod_name: &str) -> Option<Layer> {
     let l = match mod_name {
-        "display" | "ir" | "session" => Layer::L0,
-        "cancel" | "file_io" | "format" | "ledger" => Layer::L1,
-        "config" | "settings" => Layer::L3, // tool/config tier; may reach into api for the Vendor port + policy enums
+        "display" | "ir" | "session" | "turn" => Layer::L0, // turn is the pure per-run state machine; data + transfer rules, no IO
+        "cancel" | "file_io" | "format" | "ledger" | "agents_md" | "reminder" => Layer::L1, // agents_md walks the FS — IO primitive, no other crate deps; reminder is pure data the agent core threads through Context
+        "config" | "settings" | "context" => Layer::L3, // tool/config tier; may reach into api for the Vendor port + policy enums; context builds the per-turn model state
         "edit" | "tools" | "tool_runtime" | "login" | "mcp" | "mcp::wire" | "mcp::health"
             | "mcp::config" | "mcp::client" | "mcp::stdio" | "mcp::http" | "mcp::inner"
             | "mcp::stub" => Layer::L3, // tool/config tier; MCP is a tool-provider sibling to `tools`

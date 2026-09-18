@@ -15,6 +15,7 @@ mod agents_md;
 mod api;
 mod cancel;
 mod config;
+mod context;
 mod display;
 mod edit;
 mod file_io;
@@ -24,6 +25,7 @@ mod ledger;
 mod login;
 mod mcp;
 mod plain;
+mod reminder;
 mod session;
 mod settings;
 mod tool_runtime;
@@ -40,11 +42,12 @@ use crate::ir::{Block, Message, ToolResult};
 use crate::mcp::Hub;
 use crate::settings::Settings;
 use crate::tool_runtime::run_tool;
-use crate::tools::{print_tool_call, tools};
+use crate::tools::print_tool_call;
 use crate::agents_md::AgentsMdContext;
+use crate::context::Context;
 use crate::turn::{Turn, TurnOutcome, TurnState};
 use clap::{Parser, Subcommand};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::env;
 use std::io;
 use std::path::PathBuf;
@@ -356,17 +359,18 @@ async fn run() -> Result<()> {
     let cfg = build_config(&args)?;
     // AGENTS.md: discover the closest one walking up from the workspace.
     // `--no-agents-md` short-circuits to an empty context so the rest of
-    // the run is identical to "no AGENTS.md exists at all". The extras
-    // are pre-rendered here and stashed on cfg; vendors read them when
-    // composing the system prompt and don't touch the filesystem.
+    // the run is identical to "no AGENTS.md exists at all". The result
+    // hands off to `Context::new`, which holds `system_text = SYSTEM`
+    // and enqueues an `AgentsMdClosest` reminder when an AGENTS.md was
+    // loaded; vendors consume both fields and never reach into
+    // AGENTS.md or the tool registry themselves.
     let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let agents_ctx = if args.no_agents_md {
         AgentsMdContext::empty(&workspace)
     } else {
         AgentsMdContext::load(&workspace)
     };
-    let mut cfg = cfg;
-    cfg.agents_md_extra = agents_ctx.system_prompt_extras();
+    let ctx = Context::new(&agents_ctx);
     // MCP hub: external servers' tools, offered to the model as though
     // they were the agent's own. Spawned once per process and shared
     // across every turn (and every front-end). The user's servers are
@@ -375,7 +379,7 @@ async fn run() -> Result<()> {
     // hub starts empty and the session runs as it always did.
     let user_mcp = read_user_mcp();
     let hub = Hub::spawn(&workspace, user_mcp.as_ref());
-    run_with_hub(args, cfg, hub, agents_ctx).await
+    run_with_hub(args, cfg, ctx, hub, agents_ctx).await
 }
 
 /// The rest of `run` after the hub is spawned. The TUI and plain REPL take
@@ -383,7 +387,7 @@ async fn run() -> Result<()> {
 /// `mpsc::Sender`); the one-shot path also takes a clone, then calls
 /// `shutdown` on its own copy at the end so the connections close in
 /// every exit path.
-async fn run_with_hub(args: Args, cfg: Config, hub: Hub, agents_ctx: AgentsMdContext) -> Result<()> {
+async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agents_ctx: AgentsMdContext) -> Result<()> {
     let interactive = args.prompt.is_empty();
     let (mut convo, banners) = begin_session(&args, &cfg, interactive)?;
     // AGENTS.md gets a banner slot too, when one was loaded. Prepended
@@ -396,9 +400,9 @@ async fn run_with_hub(args: Args, cfg: Config, hub: Hub, agents_ctx: AgentsMdCon
     if interactive {
         // A terminal gets the TUI; pipes, tests, and one-shots get the log.
         return if tui::wanted() {
-            tui::run(cfg, convo, banners, hub).await
+            tui::run(cfg, ctx, convo, banners, hub).await
         } else {
-            plain::plain_repl(&cfg, convo, banners, hub).await
+            plain::plain_repl(&cfg, ctx, convo, banners, hub).await
         };
     }
     // One-shot: always the plain frontend — its output must stay in the
@@ -415,7 +419,7 @@ async fn run_with_hub(args: Args, cfg: Config, hub: Hub, agents_ctx: AgentsMdCon
     }
     let token = CancelToken::new();
     let mut turn = Turn::new(0);
-    let res = agent_turn(&cfg, &mut convo.history, &mut turn, &token, &hub, &sink).await;
+    let res = agent_turn(&cfg, &mut ctx, &mut convo.history, &mut turn, &token, &hub, &sink).await;
     if let Err(e) = convo.persist() {
         sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
     }
@@ -513,8 +517,8 @@ fn user_message(text: &str) -> Message {
 /// returns to read the terminal state — the wrapper exists to own the
 /// cancel select (`tokio::select!` against Ctrl-C) and the double-signal
 /// semantics, not to hide the turn from anyone.
-async fn agent_turn(cfg: &crate::config::Config, history: &mut Vec<Message>, turn: &mut Turn, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
-    let agent = agent_loop(cfg, history, turn, token, hub, sink);
+async fn agent_turn(cfg: &crate::config::Config, ctx: &mut Context, history: &mut Vec<Message>, turn: &mut Turn, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
+    let agent = agent_loop(cfg, ctx, history, turn, token, hub, sink);
     tokio::pin!(agent);
     tokio::select! {
         res = &mut agent => return res,
@@ -558,7 +562,12 @@ async fn agent_turn(cfg: &crate::config::Config, history: &mut Vec<Message>, tur
 /// tool whose name starts with `mcp__`. Re-fetching the definitions every
 /// turn is what lets `/mcp enable|disable|reconnect` take effect mid-session
 /// without restarting.
-async fn agent_loop(cfg: &crate::config::Config, history: &mut Vec<Message>, turn: &mut Turn, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
+///
+/// `ctx` is the model-side context — system text + tool list, owned by
+/// `crate::context`. The agent loop asks `ctx.refresh(hub)` each turn so
+/// the next request sees whatever MCP servers reported; it does not touch
+/// AGENTS.md or the tool registry directly.
+async fn agent_loop(cfg: &crate::config::Config, ctx: &mut Context, history: &mut Vec<Message>, turn: &mut Turn, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
     // The only legal first move. An Illegal here would mean the caller
     // handed us a non-fresh turn — a programming bug — and we surface it
     // as a regular error rather than a panic so a misconfigured caller
@@ -566,7 +575,7 @@ async fn agent_loop(cfg: &crate::config::Config, history: &mut Vec<Message>, tur
     turn.transition(TurnState::InProgress, None)
         .map_err(|e| Error::Msg(e.to_string()))?;
 
-    let result = run_turn(cfg, history, token, hub, sink).await;
+    let result = run_turn(cfg, ctx, history, token, hub, sink).await;
     // The Result → TurnOutcome translation lives here because `Error` is
     // a main-rs type and turn.rs deliberately does not depend on it.
     // From TurnOutcome onward the mapping is the turn's own concern
@@ -583,17 +592,14 @@ async fn agent_loop(cfg: &crate::config::Config, history: &mut Vec<Message>, tur
 /// Drive one turn's worth of API calls and tool runs. Pure mechanics — the
 /// [`Turn`] state machine is owned by the caller. Returns whatever
 /// happened; the caller maps it onto a terminal state via [`Turn::finish`].
-async fn run_turn(cfg: &crate::config::Config, history: &mut Vec<Message>, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
-    let mut schemas: Vec<Value> = tools().iter()
-        .map(|t| json!({"name": t.name, "description": t.desc, "input_schema": t.schema}))
-        .collect();
-    schemas.extend(hub.definitions().await);
+async fn run_turn(cfg: &crate::config::Config, ctx: &mut Context, history: &mut Vec<Message>, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
     for step in 0..cfg.max_turns {
         if token.is_cancelled() { return Err(Error::Interrupted); }
-        if fit_context(history, cfg.context_size) {
+        ctx.refresh(hub).await;
+        if context::fit_context(history, cfg.context_size) {
             sink.show(Msg::Note { sev: Sev::Warn, text: " trimmed history to fit --context-size ".into() });
         }
-        let (resp, interrupted) = api_call_api(cfg, history, &schemas, token, sink).await?;
+        let (resp, interrupted, _body) = api_call_api(cfg, ctx, history, token, sink).await?;
         let content = resp.blocks;
         if interrupted {
             // Cut off mid-response: keep finished text/thinking, drop tool
@@ -649,65 +655,6 @@ fn truncate(s: &str) -> String {
     format!("{}…[truncated, {} bytes total]", &s[..end], s.len())
 }
 
-/// Rough token estimate (bytes/3 — conservative for CJK-heavy content).
-fn est_tokens(history: &[Message]) -> u64 {
-    serde_json::to_string(&ir::history_value(history)).map_or(0, |s| (s.len() / 3) as u64)
-}
-
-/// Shrink history until the estimate fits `limit`, trimming the oldest
-/// tool_result first. Both shrinks keep tool_use/result pairing valid: an
-/// in-place cut touches only the result's text, and a minimal result leaves
-/// together with its paired tool_use (an orphaned tool_use is a 400 on the
-/// next request), along with any message left holding no blocks.
-fn fit_context(history: &mut Vec<Message>, limit: u64) -> bool {
-    let mut changed = false;
-    while est_tokens(history) > limit {
-        let Some((mi, bi)) = oldest_tool_result(history) else { break };
-        let Message::ToolResults(rs) = &mut history[mi] else { break };
-        if rs[bi].content.chars().count() > 200 {
-            let cut: String = rs[bi].content.chars().take(200).collect();
-            rs[bi].content = format!("{cut}…[trimmed to fit context]");
-            changed = true;
-            continue;
-        }
-        drop_result_and_pair(history, mi, bi);
-        changed = true;
-    }
-    changed
-}
-
-/// The first (oldest) tool_result in the history, as (message, block) indices.
-fn oldest_tool_result(history: &[Message]) -> Option<(usize, usize)> {
-    history.iter().position(|m| matches!(m, Message::ToolResults(rs) if !rs.is_empty())).map(|mi| (mi, 0))
-}
-
-/// Delete the tool_result at (mi, bi) and its tool_use — which sits in the
-/// assistant message just before — so neither survives unpaired. A thinking
-/// block that only led up to that call goes too; messages emptied of blocks
-/// are removed outright (an empty content array is its own API error).
-fn drop_result_and_pair(history: &mut Vec<Message>, mi: usize, bi: usize) {
-    let id = match &history[mi] {
-        Message::ToolResults(rs) => rs[bi].id.clone(),
-        _ => return,
-    };
-    if let Message::ToolResults(rs) = &mut history[mi] { rs.remove(bi); }
-    if mi > 0 {
-        if let Message::Assistant(blocks) = &mut history[mi - 1] {
-            blocks.retain(|b| match b.tool_use() { Some((bid, _, _)) => bid != id, None => true });
-            // thinking whose tool_use is gone: nothing left to reason towards
-            if !blocks.is_empty() && blocks.iter().all(Block::is_thinking) { blocks.clear(); }
-        }
-    }
-    let empty = |m: &Message| matches!(m, Message::Assistant(b) if b.is_empty())
-        || matches!(m, Message::ToolResults(r) if r.is_empty());
-    if empty(&history[mi]) {
-        history.remove(mi);
-        if mi > 0 && empty(&history[mi - 1]) {
-            history.remove(mi - 1);
-        }
-    }
-}
-
 // ---- tests -----------------------------------------------------------------
 
 /// Cargo runs a crate's tests in parallel threads of one process, and
@@ -716,15 +663,15 @@ fn drop_result_and_pair(history: &mut Vec<Message>, mi: usize, bi: usize) {
 /// this lock, so the env-touching set runs one at a time. Test-only: the
 /// binary never touches it.
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     #![allow(unused_imports)]
     use super::*;
     use crate::api::{backoff, call_api as api_call_api, CacheMode, Protocol, RETRY_MAX, Thinking};
     use crate::config::{Args, DEFAULT_CONTEXT_SIZE, DEFAULT_MAX_TURNS};
-    use crate::tools::dispatch;
+    use crate::tools::{dispatch, tools};
     use crate::tool_runtime::run_bash;
     use crate::test_util::{temp_dir, block_on, cfg, mock, mock_stall};
+    use serde_json::json;
     use crate::cancel::CancelToken;
     use std::fs;
     use std::io::{Read, Write};
@@ -947,89 +894,6 @@ mod tests {
         assert!(err.contains("auto, active"), "got: {err}");
     }
 
-    // ---- thinking policy & context trim ----
-
-    #[test]
-    fn fit_context_trims_oldest_tool_result_and_keeps_pairing() {
-        let big = "x".repeat(10_000);
-        let mut history = hv(vec![
-            json!({"role": "user", "content": "go"}),
-            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]}),
-            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": big}]}),
-        ]);
-        assert!(fit_context(&mut history, 500));
-        let j = hist(&history);
-        assert!(j[2]["content"][0]["content"].as_str().unwrap().contains("trimmed"));
-        assert_eq!(j[1]["content"][0]["id"], j[2]["content"][0]["tool_use_id"]);
-        let mut tiny = hv(vec![json!({"role": "user", "content": "t"})]);
-        assert!(!fit_context(&mut tiny, 10_000));
-    }
-
-    #[test]
-    fn fit_context_drops_short_tool_result_messages_when_still_over() {
-        let mut history = hv(vec![
-            json!({"role": "user", "content": "go"}),
-            json!({"role": "assistant", "content": [
-                {"type": "thinking", "thinking": "one call, one thought"},
-                {"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]}),
-            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}), // too short to trim in place
-            json!({"role": "assistant", "content": [{"type": "text", "text": "padding to keep the estimate high"}]}),
-        ]);
-        let limit = est_tokens(&history) - 1; // guarantee the first pass is over
-        assert!(fit_context(&mut history, limit));
-        // the whole exchange is gone — the assistant message held only the call
-        assert_eq!(history.len(), 2);
-        assert!(!hist(&history).to_string().contains("tool_result"));
-        assert_pairing(&history);
-    }
-
-    #[test]
-    fn fit_context_keeps_unpaired_blocks_of_partially_dropped_batches() {
-        // a batch of two calls where only the first result is minimal: the
-        // second call/result pair must survive the first one's removal
-        let mut history = hv(vec![
-            json!({"role": "user", "content": "go"}),
-            json!({"role": "assistant", "content": [
-                {"type": "thinking", "thinking": "plan: run two"},
-                {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "true"}},
-                {"type": "tool_use", "id": "t2", "name": "read_file", "input": {"path": "x"}}]}),
-            json!({"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},        // minimal → dropped with t1
-                {"type": "tool_result", "tool_use_id": "t2", "content": "y".repeat(500)}]}), // trimmed in place
-            json!({"role": "assistant", "content": [{"type": "text", "text": "padding to keep the estimate high"}]}),
-        ]);
-        let limit = est_tokens(&history) - 1;
-        assert!(fit_context(&mut history, limit));
-        assert_pairing(&history);
-        let body = hist(&history).to_string();
-        assert!(!body.contains("\"id\": \"t1\""), "t1's tool_use must not survive its result: {body}");
-        assert!(body.contains("t2"), "t2's pair must both survive: {body}");
-        assert!(body.contains("thinking"), "thinking led up to t2 as well — it stays: {body}");
-    }
-
-    /// Every tool_use keeps exactly one tool_result and vice versa, and no
-    /// message is left with an empty content array.
-    fn assert_pairing(history: &[Message]) {
-        let uses: Vec<String> = history.iter().flat_map(|m| match m {
-            Message::Assistant(blocks) => blocks.iter()
-                .filter_map(|b| b.tool_use().map(|(id, _, _)| id.to_string())).collect::<Vec<_>>(),
-            _ => vec![],
-        }).collect();
-        let results: Vec<String> = history.iter().flat_map(|m| match m {
-            Message::ToolResults(rs) => rs.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
-            _ => vec![],
-        }).collect();
-        for u in &uses { assert!(results.contains(u), "tool_use {u} lost its tool_result"); }
-        for r in &results { assert!(uses.contains(r), "tool_result {r} lost its tool_use"); }
-        for m in history {
-            match m {
-                Message::Assistant(b) => assert!(!b.is_empty(), "empty message left behind"),
-                Message::ToolResults(r) => assert!(!r.is_empty(), "empty message left behind"),
-                Message::User(_) => {}
-            }
-        }
-    }
-
     // ---- zai vendor: dialect conversion ----
 
     // ---- api over local mocks ----
@@ -1050,7 +914,8 @@ mod tests {
             // for the spawn to land, even though the hub itself has no work
             // to do in this test.
             let hub = crate::mcp::Hub::empty();
-            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await.unwrap();
+            let mut cx = crate::test_util::ctx();
+            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await.unwrap();
             hub.shutdown().await;
         });
         assert_eq!(history.len(), 4); // user + assistant(tool_use) + user(tool_result) + assistant(text)
@@ -1079,7 +944,8 @@ mod tests {
         let mut turn = Turn::new(0);
         block_on(async {
             let hub = crate::mcp::Hub::empty();
-            agent_loop(&c, &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await.unwrap(); // must return instead of spinning
+            let mut cx = crate::test_util::ctx();
+            agent_loop(&c, &mut cx, &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await.unwrap(); // must return instead of spinning
             hub.shutdown().await;
         });
         assert_eq!(history.len(), 3); // user + assistant(tool_use) + user(tool_result)
@@ -1112,13 +978,14 @@ mod tests {
         let mut turn = Turn::new(0);
         let err = block_on(async {
             let hub = crate::mcp::Hub::empty();
+            let mut cx = crate::test_util::ctx();
             let token = Arc::new(CancelToken::new());
             let t = token.clone();
             tokio::task::spawn_blocking(move || {
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 t.cancel();
             });
-            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), true), &mut history, &mut turn, &token, &hub, &sink()).await;
+            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), true), &mut cx, &mut history, &mut turn, &token, &hub, &sink()).await;
             hub.shutdown().await;
             res
         }).unwrap_err();
@@ -1153,13 +1020,14 @@ mod tests {
         let mut turn = Turn::new(0);
         let err = block_on(async {
             let hub = crate::mcp::Hub::empty();
+            let mut cx = crate::test_util::ctx();
             let token = Arc::new(CancelToken::new());
             let t = token.clone();
             tokio::task::spawn_blocking(move || {
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 t.cancel();
             });
-            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &mut turn, &token, &hub, &sink()).await;
+            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut history, &mut turn, &token, &hub, &sink()).await;
             hub.shutdown().await;
             res
         }).unwrap_err();
@@ -1192,7 +1060,8 @@ mod tests {
         let mut turn = Turn::new(0);
         let err = block_on(async {
             let hub = crate::mcp::Hub::empty();
-            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await
+            let mut cx = crate::test_util::ctx();
+            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await
         }).unwrap_err();
         // the error reaches the caller — the same one we record on the turn
         assert!(matches!(err, Error::Api(500, _)), "got: {err}");
@@ -1220,7 +1089,8 @@ mod tests {
         let mut history = hv(vec![json!({"role": "user", "content": "say hi"})]);
         block_on(async {
             let hub = crate::mcp::Hub::empty();
-            agent_turn(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await.unwrap();
+            let mut cx = crate::test_util::ctx();
+            agent_turn(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await.unwrap();
             hub.shutdown().await;
         });
         // the wrapper drove Queued → InProgress → Completed on the turn
@@ -1273,8 +1143,9 @@ mod tests {
             (429, r#"{"error":{"message":"rate limited"}}"#.into()),
             (200, r#"{"content":[{"type":"text","text":"after retry"}],"usage":{}}"#.into()),
         ]);
-        let (resp, _) = block_on(crate::api::call_api(
-            &cfg(format!("http://127.0.0.1:{port}"), false), &[], &[], &CancelToken::new(), &sink(),
+        let cx = crate::test_util::ctx();
+        let (resp, _, _) = block_on(crate::api::call_api(
+            &cfg(format!("http://127.0.0.1:{port}"), false), &cx, &[], &CancelToken::new(), &sink(),
         )).unwrap();
         assert_eq!(blocks(&resp.blocks)[0]["text"], "after retry");
         assert_eq!(reqs.lock().unwrap().len(), 2, "the request went out twice");
@@ -1286,8 +1157,9 @@ mod tests {
         let (port, reqs) = mock_seq(vec![
             (400, r#"{"error":{"message":"bad model"}}"#.into()),
         ]);
+        let cx = crate::test_util::ctx();
         let err = block_on(crate::api::call_api(
-            &cfg(format!("http://127.0.0.1:{port}"), false), &[], &[], &CancelToken::new(), &sink(),
+            &cfg(format!("http://127.0.0.1:{port}"), false), &cx, &[], &CancelToken::new(), &sink(),
         )).unwrap_err();
         assert!(err.to_string().contains("bad model"), "got: {err}");
         assert_eq!(reqs.lock().unwrap().len(), 1, "no second request");
@@ -1368,104 +1240,4 @@ mod tests {
         assert!(t.len() <= MAX_TOOL_OUTPUT + 64, "the marker is bounded: {t}");
     }
 
-    // ---- est_tokens / fit_context: the trim machinery --------------------
-
-    #[test]
-    fn est_tokens_is_zero_when_history_cannot_be_serialized() {
-        // the or-default path: history that fails to serialize still
-        // returns 0, not a panic
-        let h: Vec<Message> = vec![];
-        assert_eq!(est_tokens(&h), 0);
     }
-
-    #[test]
-    fn est_tokens_grows_with_content_size() {
-        // a longer user message bulks a larger estimate
-        let s = "x".repeat(3_000);
-        let h = vec![Message::User(s)];
-        let small = est_tokens(&[Message::User("hi".into())]);
-        let big = est_tokens(&h);
-        assert!(big > small, "more bytes → more tokens: small={small}, big={big}");
-    }
-
-    #[test]
-    fn oldest_tool_result_returns_none_when_history_has_no_results() {
-        let h = vec![Message::User("t".into())];
-        assert!(oldest_tool_result(&h).is_none());
-    }
-
-    #[test]
-    fn oldest_tool_result_skips_empty_tool_results() {
-        // a ToolResults with no entries does not count
-        let h = vec![
-            Message::User("go".into()),
-            Message::Assistant(vec![Block::Text("ok".into())]),
-            Message::ToolResults(vec![]),
-            Message::ToolResults(vec![crate::ir::ToolResult { id: "t".into(), content: "ok".into() }]),
-        ];
-        let (mi, _) = oldest_tool_result(&h).expect("the second ToolResults has entries");
-        assert_eq!(mi, 3);
-    }
-
-    #[test]
-    fn drop_result_and_pair_drops_both_use_and_result() {
-        let mut h = hv(vec![
-            json!({"role": "user", "content": "go"}),
-            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]}),
-            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}),
-        ]);
-        drop_result_and_pair(&mut h, 2, 0);
-        // the tool_use and its tool_result both gone; the user message survives
-        assert_eq!(h.len(), 1, "the empty assistant + result messages collapse: {h:?}");
-        assert!(matches!(&h[0], Message::User(_)));
-    }
-
-    #[test]
-    fn drop_result_and_pair_keeps_thinking_blocks_for_other_calls() {
-        // a batch where thinking was reasoning towards *two* calls:
-        // dropping the first result must not lose the thinking block —
-        // it's still the reasoning for the second call
-        let mut h = hv(vec![
-            json!({"role": "user", "content": "go"}),
-            json!({"role": "assistant", "content": [
-                {"type": "thinking", "thinking": "two calls"},
-                {"type": "tool_use", "id": "t1", "name": "bash", "input": {}},
-                {"type": "tool_use", "id": "t2", "name": "read_file", "input": {"path": "x"}}]}),
-            json!({"role": "user", "content": [
-                {"type": "tool_result", "id": "t1", "content": "ok"},
-                {"type": "tool_result", "id": "t2", "content": "y"}]}),
-        ]);
-        // find t1's position in the result message
-        let (mi, _) = oldest_tool_result(&h).unwrap();
-        // bi to be 0 (first result), t1 at bi=0
-        drop_result_and_pair(&mut h, mi, 0);
-        let j = hist(&h).to_string();
-        assert!(!j.contains("\"id\": \"t1\""), "t1's tool_use is gone");
-        assert!(j.contains("t2"), "t2's pair survives");
-        assert!(j.contains("two calls"), "the thinking block survives t2's sake");
-    }
-
-    #[test]
-    fn drop_result_and_pair_returns_silently_on_wrong_index() {
-        // mi points at a non-ToolResults: the function must not panic
-        let mut h = hv(vec![json!({"role": "user", "content": "go"})]);
-        let before = h.clone();
-        drop_result_and_pair(&mut h, 0, 0);
-        assert_eq!(hist(&h), hist(&before));
-    }
-
-    #[test]
-    fn fit_context_returns_false_when_history_already_fits() {
-        let h = hv(vec![json!({"role": "user", "content": "hi"})]);
-        assert!(!fit_context(&mut h.clone(), u64::MAX));
-        let mut h2 = h.clone();
-        assert!(!fit_context(&mut h2, est_tokens(&h) + 1000));
-    }
-
-    #[test]
-    fn fit_context_returns_false_when_there_is_nothing_to_trim() {
-        // an over-limit history with no tool_results: nothing changes
-        let mut h = hv(vec![json!({"role": "user", "content": "go"})]);
-        assert!(!fit_context(&mut h, 0));
-    }
-}

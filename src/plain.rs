@@ -150,6 +150,7 @@ impl Show for PlainSink {
 /// path keeps the shell's own history (up-arrow) and line editing.
 pub async fn plain_repl(
     cfg: &crate::config::Config,
+    mut ctx: crate::context::Context,
     mut convo: crate::session::Convo,
     banners: Vec<String>,
     hub: Hub,
@@ -217,7 +218,7 @@ pub async fn plain_repl(
         sink.show(Msg::TaskBegin(line));
         let token = crate::cancel::CancelToken::new();
         let mut turn = crate::turn::Turn::new(0);
-        match agent_turn(cfg, &mut convo.history, &mut turn, &token, &hub, &sink).await {
+        match agent_turn(cfg, &mut ctx, &mut convo.history, &mut turn, &token, &hub, &sink).await {
             Err(crate::Error::Interrupted) => {}
             Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
             Ok(()) => {}

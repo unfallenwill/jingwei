@@ -49,10 +49,6 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
-/// A typed history from JSON literals — the tests still speak the wire
-/// shape, and `ir` owns the only translation of it.
-/// History back as JSON, for the assertions the tests have always made.
-/// A response's blocks as JSON, read like a `content` array.
 /// A sink that drops everything — the tests assert on state and on the
 /// mock wire, never on what a frontend shows. The real frontends
 /// (`plain::PlainSink`, the TUI's `ChannelSink`) are exercised through
@@ -81,8 +77,18 @@ pub(crate) fn cfg(base: String, streaming: bool) -> crate::config::Config {
         effort: None,
         max_tokens: 1024, context_size: crate::config::DEFAULT_CONTEXT_SIZE,
         max_turns: crate::config::DEFAULT_MAX_TURNS, streaming,
-        agents_md_extra: String::new(),
     }
+}
+
+/// A bare `Context` for tests that don't care about AGENTS.md or the
+/// tool list. Vendors take `&Context`; tests that exercise `body()` or
+/// `call_api()` need a handle, and wiring one by hand is noise. The empty
+/// AGENTS.md context gives us a system_text equal to `crate::SYSTEM`,
+/// which is what nearly every test wants anyway.
+#[cfg(test)]
+pub(crate) fn ctx() -> crate::context::Context {
+    let md = crate::agents_md::AgentsMdContext::empty(&std::path::PathBuf::from("."));
+    crate::context::Context::new(&md)
 }
 
 /// Serve one HTTP response on a fresh port: `response` as JSON (status 200)

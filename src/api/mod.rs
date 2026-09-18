@@ -11,6 +11,7 @@
 
 use crate::config::Config;
 use crate::cancel::CancelToken;
+use crate::context::Context;
 use crate::display::{Msg, Show};
 use crate::ir::{Block, Message, Response};
 use crate::display::Usage;
@@ -24,8 +25,12 @@ use tokio::sync::mpsc;
 
 /// The boxed future a vendor's `turn` returns. Boxed because the wire is
 /// chosen at runtime — one allocation per request, and the vendor's own
-/// streaming/blocking machinery stays its own.
-pub(crate) type Turn<'a> = Pin<Box<dyn Future<Output = Result<(Response, bool)>> + Send + 'a>>;
+/// streaming/blocking machinery stays its own. The third slot is the
+/// rendered wire body that was actually sent: the session records it
+/// verbatim so a reader can see what the model saw on every request,
+/// not just the message stream. Vendors that build a different wire
+/// shape return whatever shape they built.
+pub(crate) type Turn<'a> = Pin<Box<dyn Future<Output = Result<(Response, bool, Value)>> + Send + 'a>>;
 
 /// The provider port. One impl per wire; the composition root holds a
 /// [`Protocol`] handle and calls through it — no `match` anywhere. Adding a
@@ -39,8 +44,8 @@ pub(crate) trait Vendor: Sync {
     fn turn<'a>(
         &'a self,
         cfg: &'a Config,
+        ctx: &'a Context,
         history: &'a [Message],
-        schemas: &'a [Value],
         token: &'a CancelToken,
         sink: &'a dyn Show,
     ) -> Turn<'a>;
@@ -67,10 +72,10 @@ impl Vendor for MiniMax {
     fn accepts(&self, cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
         minimax_accepts(cache, thinking, effort)
     }
-    fn turn<'a>(&'a self, cfg: &'a Config, history: &'a [Message], schemas: &'a [Value], token: &'a CancelToken, sink: &'a dyn Show)
+    fn turn<'a>(&'a self, cfg: &'a Config, ctx: &'a Context, history: &'a [Message], token: &'a CancelToken, sink: &'a dyn Show)
         -> Turn<'a>
     {
-        Box::pin(minimax::turn(cfg, history, schemas, token, sink))
+        Box::pin(minimax::turn(cfg, ctx, history, token, sink))
     }
 }
 
@@ -81,10 +86,10 @@ impl Vendor for Zai {
     fn accepts(&self, cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
         zai_accepts(cache, thinking, effort)
     }
-    fn turn<'a>(&'a self, cfg: &'a Config, history: &'a [Message], schemas: &'a [Value], token: &'a CancelToken, sink: &'a dyn Show)
+    fn turn<'a>(&'a self, cfg: &'a Config, ctx: &'a Context, history: &'a [Message], token: &'a CancelToken, sink: &'a dyn Show)
         -> Turn<'a>
     {
-        Box::pin(zai::turn(cfg, history, schemas, token, sink))
+        Box::pin(zai::turn(cfg, ctx, history, token, sink))
     }
 }
 
@@ -95,10 +100,10 @@ impl Vendor for DeepSeek {
     fn accepts(&self, cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
         deepseek_accepts(cache, thinking, effort)
     }
-    fn turn<'a>(&'a self, cfg: &'a Config, history: &'a [Message], schemas: &'a [Value], token: &'a CancelToken, sink: &'a dyn Show)
+    fn turn<'a>(&'a self, cfg: &'a Config, ctx: &'a Context, history: &'a [Message], token: &'a CancelToken, sink: &'a dyn Show)
         -> Turn<'a>
     {
-        Box::pin(deepseek::turn(cfg, history, schemas, token, sink))
+        Box::pin(deepseek::turn(cfg, ctx, history, token, sink))
     }
 }
 
@@ -167,8 +172,8 @@ impl Effort {
 
 // ---- transport: shared by every wire --------------------------------------
 
-pub(crate) async fn call_api(cfg: &Config, history: &[Message], schemas: &[Value], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
-    cfg.protocol.0.turn(cfg, history, schemas, token, sink).await
+pub(crate) async fn call_api(cfg: &Config, ctx: &Context, history: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
+    cfg.protocol.0.turn(cfg, ctx, history, token, sink).await
 }
 
 fn show_turn(resp: &Response, sink: &dyn Show) {
@@ -311,7 +316,27 @@ fn chat_url(cfg: &Config) -> String {
     format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'))
 }
 
-fn chat_messages(system: &str, history: &[Message], _cfg: &Config) -> Vec<Value> {
+/// Compose the full system-side text for the chat-completions family:
+/// `system_text` joined to each reminder by `"\n\n"`. Reminders own their
+/// own separators (each starts with `"\n\n"`), so a single join produces
+/// `SYSTEM \n\n\n\n# Project conventions... \n\n<body>` for the closest
+/// AGENTS.md — the same wire shape the old `compose_system` produced,
+/// keeping cross-session cache keys stable across the migration.
+///
+/// Used by every chat-completions vendor (`zai`, `deepseek`); the
+/// Messages wire (MiniMax) reads `system_text` and `reminders` itself
+/// because it can render them as separate blocks with per-block
+/// `cache_control`.
+fn chat_system_text(ctx: &Context) -> String {
+    let mut out = ctx.system_text.clone();
+    for r in &ctx.reminders {
+        out.push_str(&r.text);
+    }
+    out
+}
+
+fn chat_messages(ctx: &Context, history: &[Message], _cfg: &Config) -> Vec<Value> {
+    let system = chat_system_text(ctx);
     let mut out = Vec::with_capacity(history.len() + 1);
     out.push(json!({"role": "system", "content": system}));
     for m in history {
@@ -324,7 +349,7 @@ fn chat_tools(schemas: &[Value]) -> Value {
     Value::Array(schemas.to_vec())
 }
 
-async fn chat_blocking(cfg: &Config, body: Value, to_internal: fn(&Value) -> Response, token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
+async fn chat_blocking(cfg: &Config, body: Value, to_internal: fn(&Value) -> Response, token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
     let url = chat_url(cfg);
     let key = cfg.api_key.clone();
     let resp = request(token, &key, &url, &body, false, |r| {
@@ -334,7 +359,7 @@ async fn chat_blocking(cfg: &Config, body: Value, to_internal: fn(&Value) -> Res
     }).await?;
     let resp = to_internal(&resp);
     show_turn(&resp, sink);
-    Ok((resp, token.is_cancelled()))
+    Ok((resp, token.is_cancelled(), body))
 }
 
 fn chat_to_internal(v: &Value, usage_of: fn(&Value) -> (Value, Usage)) -> Response {
@@ -357,7 +382,7 @@ fn chat_to_internal(v: &Value, usage_of: fn(&Value) -> (Value, Usage)) -> Respon
     Response { blocks, usage }
 }
 
-async fn chat_streaming(cfg: &Config, body: Value, usage_of: fn(&Value) -> (Value, Usage), token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool)> {
+async fn chat_streaming(cfg: &Config, body: Value, usage_of: fn(&Value) -> (Value, Usage), token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
     let url = chat_url(cfg);
     let key = cfg.api_key.clone();
     let resp = request(token, &key, &url, &body, false, Ok).await?;
@@ -422,7 +447,7 @@ async fn chat_streaming(cfg: &Config, body: Value, usage_of: fn(&Value) -> (Valu
             input: serde_json::from_str::<Value>(tc["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({})),
         });
     }
-    Ok((Response { blocks, usage }, interrupted))
+    Ok((Response { blocks, usage }, interrupted, body))
 }
 
 // ---- vendor rules ---------------------------------------------------------
@@ -550,7 +575,6 @@ mod tests {
             protocol: Protocol::ZAI,
             cache: CacheMode::Auto, thinking: Thinking::Preserve, effort: None,
             max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
-            agents_md_extra: String::new(),
         };
         assert_eq!(chat_url(&cfg), "https://api.example.com/chat/completions");
         // no trailing slash
@@ -565,14 +589,37 @@ mod tests {
             protocol: Protocol::ZAI,
             cache: CacheMode::Auto, thinking: Thinking::Preserve, effort: None,
             max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
-            agents_md_extra: String::new(),
         };
         let msgs = vec![Message::User("hi".into())];
-        let out = chat_messages("you are a bot", &msgs, &cfg);
+        // an empty reminders list ⇒ the system message is just `system_text`
+        let cx = crate::test_util::ctx();
+        let out = chat_messages(&cx, &msgs, &cfg);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["role"], "system");
-        assert_eq!(out[0]["content"], "you are a bot");
+        assert_eq!(out[0]["content"], cx.system_text);
         assert_eq!(out[1]["role"], "user");
+    }
+
+    #[test]
+    fn chat_system_text_concatenates_reminders() {
+        // reminders own their own leading separator; the composer
+        // concatenates verbatim with no extra insertion
+        let dir = crate::test_util::temp_dir("chat_sys_compose");
+        std::fs::write(dir.join("AGENTS.md"), "x").unwrap();
+        let md = crate::agents_md::AgentsMdContext::load(&dir);
+        let cx = crate::context::Context::new(&md);
+        let s = chat_system_text(&cx);
+        assert!(s.starts_with(crate::SYSTEM),
+            "system_text comes first");
+        assert!(s.contains("# Project conventions"),
+            "AGENTS.md section rides in");
+        // wire-shape parity with the old `compose_system`: between SYSTEM
+        // and `# Project conventions` there should be exactly the
+        // reminder's leading "\n\n" — two newlines, the same as today.
+        let sep_idx = s.find("# Project conventions").unwrap();
+        let between = &s[..sep_idx];
+        assert!(between.ends_with("\n\n"),
+            "exactly one blank line between SYSTEM and the AGENTS.md section");
     }
 
     #[test]
