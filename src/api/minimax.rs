@@ -86,9 +86,8 @@ async fn blocking(url: String, body: Value, key: String, token: &CancelToken, si
 
 async fn streaming(url: String, body: Value, key: String, token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
     let resp = request(token, &key, &url, &body, true, Ok).await?;
-    // Blocks arrive one at a time, indexed; a tool_use's arguments stream as
-    // partial JSON, so they accumulate in `tool_json` beside the typed block
-    // until the block closes and the assembled JSON parses into `input`.
+    // Blocks arrive indexed; a tool_use's arguments stream as partial
+    // JSON that accumulates until the block closes.
     let mut blocks: Vec<Option<Block>> = vec![];
     let mut tool_json: Vec<String> = vec![];
     let mut usage = empty_usage();
@@ -102,79 +101,51 @@ async fn streaming(url: String, body: Value, key: String, token: &CancelToken, s
         let Some(data) = line.strip_prefix("data: ") else { continue };
         if data == "[DONE]" { break }
         let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
+        let i = v["index"].as_u64().unwrap_or(0) as usize;
         match v["type"].as_str() {
             Some("message_start") => {
-                // The size of v["message"]["content"] here is unreliable —
-                // the wire reports blocks progressively via content_block_start,
-                // and message_start's `content` may be empty until the first
-                // block arrives. Let content_block_start grow `blocks`.
-                // What is reliable here: the *usage* ledger — minimax opens
-                // the turn with the real input/cache counts already filled in,
-                // and a later `message_delta` only carries output_tokens. If
-                // we don't merge this now, status.turn.context_in() stays at
-                // zero for the whole turn, and the bar's ctx gauge disappears.
-                // The display port is wired so any later merge (turn-end
-                // `message_delta`) replaces — so merging twice with the same
-                // fields is a no-op rather than a double-count.
+                // message_start carries the real input/cache counts;
+                // message_delta later only carries output_tokens. Without
+                // this merge, status.turn.context_in() is zero for the turn
+                // and the bar's ctx gauge disappears.
                 merge_usage(&mut usage, v["message"]["usage"].as_object());
             }
             Some("content_block_start") => {
-                let i = v["index"].as_u64().unwrap_or(0) as usize;
                 if i >= blocks.len() { blocks.resize_with(i + 1, || None); tool_json.resize_with(i + 1, String::new); }
-                match v["content_block"]["type"].as_str() {
-                    Some("text") => blocks[i] = Some(Block::Text(String::new())),
-                    Some("thinking") => blocks[i] = Some(Block::Thinking { text: String::new(), signature: None }),
-                    Some("tool_use") => blocks[i] = Some(Block::ToolUse {
-                        id: v["content_block"]["id"].as_str().unwrap_or("").to_string(),
-                        name: v["content_block"]["name"].as_str().unwrap_or("").to_string(),
+                let cb = &v["content_block"];
+                let kind = cb["type"].as_str();
+                blocks[i] = match kind {
+                    Some("text") => Some(Block::Text(String::new())),
+                    Some("thinking") => Some(Block::Thinking { text: String::new(), signature: None }),
+                    Some("tool_use") => Some(Block::ToolUse {
+                        id: cb["id"].as_str().unwrap_or("").to_string(),
+                        name: cb["name"].as_str().unwrap_or("").to_string(),
                         input: Value::Null,
                     }),
-                    _ => {}
-                }
-                if matches!(v["content_block"]["type"].as_str(), Some("thinking")) {
-                    sink.show(Msg::Think(String::new()));
-                }
+                    _ => None,
+                };
+                if kind == Some("thinking") { sink.show(Msg::Think(String::new())); }
             }
             Some("content_block_delta") => {
-                let i = v["index"].as_u64().unwrap_or(0) as usize;
                 let delta = &v["delta"];
                 match blocks.get_mut(i).and_then(|b| b.as_mut()) {
-                    Some(Block::Text(t)) => {
-                        if let Some(s) = delta["text"].as_str() {
-                            t.push_str(s);
-                            sink.show(Msg::Text(s.into()));
-                        }
-                    }
-                    Some(Block::Thinking { text, .. }) => {
-                        if let Some(s) = delta["thinking"].as_str() {
-                            text.push_str(s);
-                            sink.show(Msg::Think(s.into()));
-                        }
-                    }
-                    Some(Block::ToolUse { .. }) => {
-                        if let Some(s) = delta["partial_json"].as_str() {
-                            tool_json[i].push_str(s);
-                        }
-                    }
+                    Some(Block::Text(t)) => if let Some(s) = delta["text"].as_str() { t.push_str(s); sink.show(Msg::Text(s.into())); }
+                    Some(Block::Thinking { text, .. }) => if let Some(s) = delta["thinking"].as_str() { text.push_str(s); sink.show(Msg::Think(s.into())); }
+                    Some(Block::ToolUse { .. }) => if let Some(s) = delta["partial_json"].as_str() { tool_json[i].push_str(s); }
                     _ => {}
                 }
             }
             Some("content_block_stop") => {
-                let i = v["index"].as_u64().unwrap_or(0) as usize;
-                match blocks.get_mut(i).and_then(|b| b.as_mut()) {
-                    Some(Block::Thinking { .. }) => sink.show(Msg::ThinkEnd),
-                    Some(Block::ToolUse { input, .. }) => {
-                        *input = serde_json::from_str(&tool_json[i]).unwrap_or(Value::Null);
-                    }
-                    _ => {}
+                if let Some(Block::ToolUse { input, .. }) = blocks.get_mut(i).and_then(|b| b.as_mut()) {
+                    *input = serde_json::from_str(&tool_json[i]).unwrap_or(Value::Null);
+                } else if matches!(blocks.get(i).and_then(|b| b.as_ref()), Some(Block::Thinking { .. })) {
+                    sink.show(Msg::ThinkEnd);
                 }
             }
             Some("message_delta") => {
                 merge_usage(&mut usage, v["usage"].as_object());
                 sink.show(Msg::Usage(crate::display::Usage::from_value(&usage)));
-                if let Some(n) = v["usage"]["output_tokens"].as_u64() {
-                    sink.show(Msg::OutTokens(n));
-                }
+                if let Some(n) = v["usage"]["output_tokens"].as_u64() { sink.show(Msg::OutTokens(n)); }
             }
             Some("message_stop") => break,
             Some("error") => return Err(Error::Msg(v["error"].to_string())),
@@ -350,10 +321,10 @@ mod tests {
 
     #[test]
     fn streaming_merges_message_start_usage_so_ctx_is_not_zero() {
-        // minimax opens the turn with input_tokens/cache counts already in
-        // message_start.usage, and message_delta only carries output_tokens.
-        // If the adapter drops message_start's usage, status.turn.context_in()
-        // is zero for the whole turn and the bar's ctx gauge disappears.
+        // minimax opens the turn with input_tokens/cache counts in
+        // message_start.usage; message_delta only carries output_tokens.
+        // Drop message_start's usage and status.turn.context_in() stays
+        // zero for the whole turn, the bar's ctx gauge disappears.
         let stream = concat!(
             r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1234,"cache_read_input_tokens":800}}}"#, "\n\n",
             r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
