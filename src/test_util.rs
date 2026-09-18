@@ -130,10 +130,17 @@ pub(crate) fn mock_seq(responses: Vec<(u16, String)>) -> (u16, Arc<Mutex<Vec<Str
     std::thread::spawn(move || {
         for (status, body) in responses {
             let Ok((mut s, _)) = listener.accept() else { break };
-            let mut buf = vec![0u8; 16 * 1024];
-            let _ = s.read(&mut buf);
-            let raw = String::from_utf8_lossy(&buf[..]).to_string();
-            log.lock().unwrap().push(raw);
+            // A request split across TCP packets (common under parallel
+            // test load) still comes through whole when we drain until
+            // EOF instead of trusting a single read.
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+            let mut req = Vec::new();
+            let mut buf = [0u8; 16_384];
+            while let Ok(n) = s.read(&mut buf) {
+                if n == 0 { break }
+                req.extend_from_slice(&buf[..n]);
+            }
+            log.lock().unwrap().push(String::from_utf8_lossy(&req).into_owned());
             let resp = format!("HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             let _ = s.write_all(resp.as_bytes());
             let _ = s.flush();

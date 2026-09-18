@@ -670,7 +670,7 @@ mod tests {
     use crate::config::{Args, DEFAULT_CONTEXT_SIZE, DEFAULT_MAX_TURNS};
     use crate::tools::{dispatch, tools};
     use crate::tool_runtime::run_bash;
-    use crate::test_util::{temp_dir, block_on, cfg, mock, mock_stall};
+    use crate::test_util::{temp_dir, block_on, cfg, mock, mock_seq, mock_stall};
     use serde_json::json;
     use crate::cancel::CancelToken;
     use std::fs;
@@ -702,34 +702,6 @@ mod tests {
     }
     fn sink() -> NullSink {
         NullSink
-    }
-
-    /// Sequential mock: serves one response per connection, in order, and
-    /// records the raw bytes of every request it received.
-    fn mock_seq(responses: Vec<(u16, String)>) -> (u16, Arc<Mutex<Vec<String>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let log = seen.clone();
-        std::thread::spawn(move || {
-            for (status, body) in responses {
-                let Ok((mut s, _)) = listener.accept() else { break };
-                let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(200)));
-                let mut req = Vec::new();
-                let mut buf = [0u8; 16_384];
-                while let Ok(n) = s.read(&mut buf) {
-                    if n == 0 { break }
-                    req.extend_from_slice(&buf[..n]);
-                }
-                log.lock().unwrap().push(String::from_utf8_lossy(&req).into_owned());
-                let ctype = if body.starts_with("data:") { "text/event-stream" } else { "application/json" };
-                let resp = format!("HTTP/1.1 {status} OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}\n\n", body.len() + 2);
-                let _ = s.write_all(resp.as_bytes());
-                let _ = s.flush();
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-        });
-        (port, seen)
     }
 
     /// SSE server with two connections: `first` is served complete (with a
