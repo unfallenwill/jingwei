@@ -377,8 +377,6 @@ mod tests {
             });
             let path_before = Settings::path().expect("HOME must be set");
             s.save().unwrap();
-            eprintln!("saved to: {}", path_before.display());
-            eprintln!("exists after save: {}", path_before.exists());
             let mode = std::fs::metadata(&path_before).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "api_key file must be owner-only: {mode:o}");
         }
