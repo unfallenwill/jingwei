@@ -240,7 +240,13 @@ mod tests {
         let mut output: Vec<u8> = Vec::new();
         let mut settings = Settings::empty();
         let r = wizard(&mut input, &mut output, &mut settings);
-        eprintln!("--- wizard output ---\n{}\n---", String::from_utf8_lossy(&output));
+        // The wizard's prompts are the most informative debug surface when
+        // a wizard test fails ("which question did it stop at?"), so keep
+        // the capture around. Print on failure only — running seven
+        // wizard tests prints seven dialogs otherwise.
+        if r.is_err() {
+            eprintln!("--- wizard output ---\n{}\n---", String::from_utf8_lossy(&output));
+        }
         (r, settings)
     }
 
