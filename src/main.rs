@@ -28,6 +28,7 @@ mod settings;
 mod tool_runtime;
 mod tools;
 mod tui;
+mod turn;
 
 #[cfg(test)] mod test_util;
 use crate::api::call_api as api_call_api;
@@ -39,6 +40,7 @@ use crate::mcp::Hub;
 use crate::settings::Settings;
 use crate::tool_runtime::run_tool;
 use crate::tools::{print_tool_call, tools};
+use crate::turn::{Turn, TurnState};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::env;
@@ -476,8 +478,14 @@ fn user_message(text: &str) -> Message {
 /// REPL prompt comes back with everything the agent already carried still in
 /// place. A second Ctrl-C while it is unwinding exits immediately, for when
 /// even graceful is too slow.
+///
+/// `turn` is the per-run state machine: a fresh `Turn` enters here in
+/// `Queued` and walks the table as [`run_turn`] drives it. The wrapper
+/// owns the construction so callers see one entry point and never have to
+/// reach for `Turn::new` themselves.
 async fn agent_turn(cfg: &crate::config::Config, history: &mut Vec<Message>, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
-    let agent = agent_loop(cfg, history, token, hub, sink);
+    let mut turn = Turn::new(0);
+    let agent = agent_loop(cfg, history, &mut turn, token, hub, sink);
     tokio::pin!(agent);
     tokio::select! {
         res = &mut agent => return res,
@@ -508,17 +516,39 @@ async fn agent_turn(cfg: &crate::config::Config, history: &mut Vec<Message>, tok
 /// history valid — interrupted tools get results, unfinished tool calls are
 /// dropped from the turn, and the REPL prompt simply returns.
 ///
+/// `turn` is the per-run state machine the wrapper owns; this function
+/// drives it through the table — `Queued → InProgress` at the entry, and
+/// the terminal transition on the way out. The mechanics of "do API calls
+/// and run tools" live in [`run_turn`], kept separate so the mapping
+/// between [`Result`] and [`TurnState`] has exactly one home ([`finish_turn`]).
+///
 /// `hub` is the MCP hub — its `definitions()` is the source of the schemas
 /// the model sees, and its `call()` is what runs when the model asks for a
 /// tool whose name starts with `mcp__`. Re-fetching the definitions every
 /// turn is what lets `/mcp enable|disable|reconnect` take effect mid-session
 /// without restarting.
-async fn agent_loop(cfg: &crate::config::Config, history: &mut Vec<Message>, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
+async fn agent_loop(cfg: &crate::config::Config, history: &mut Vec<Message>, turn: &mut Turn, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
+    // The only legal first move. An Illegal here would mean the caller
+    // handed us a non-fresh turn — a programming bug — and we surface it
+    // as a regular error rather than a panic so a misconfigured caller
+    // doesn't kill the agent mid-sentence.
+    turn.transition(TurnState::InProgress, None)
+        .map_err(|e| Error::Msg(e.to_string()))?;
+
+    let result = run_turn(cfg, history, token, hub, sink).await;
+    finish_turn(turn, &result);
+    result
+}
+
+/// Drive one turn's worth of API calls and tool runs. Pure mechanics — the
+/// [`Turn`] state machine is owned by the caller. Returns whatever
+/// happened; the caller maps it onto a terminal state via [`finish_turn`].
+async fn run_turn(cfg: &crate::config::Config, history: &mut Vec<Message>, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
     let mut schemas: Vec<Value> = tools().iter()
         .map(|t| json!({"name": t.name, "description": t.desc, "input_schema": t.schema}))
         .collect();
     schemas.extend(hub.definitions().await);
-    for turn in 0..cfg.max_turns {
+    for step in 0..cfg.max_turns {
         if token.is_cancelled() { return Err(Error::Interrupted); }
         if fit_context(history, cfg.context_size) {
             sink.show(Msg::Note { sev: Sev::Warn, text: " trimmed history to fit --context-size ".into() });
@@ -563,11 +593,26 @@ async fn agent_loop(cfg: &crate::config::Config, history: &mut Vec<Message>, tok
         history.push(Message::ToolResults(results));
         if stopped { return Err(Error::Interrupted); }
 
-        if turn + 1 == cfg.max_turns {
+        if step + 1 == cfg.max_turns {
             sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: hit --max-turns={}, stopping ", cfg.max_turns) });
         }
     }
     Ok(())
+}
+
+/// Move the turn to the terminal state that matches the result. Centralized
+/// so the [`Result`] → [`TurnState`] mapping rule lives in one place; the
+/// table in [`crate::turn`] is the single source of truth for what is
+/// legal. A `TurnError` here means a future change broke the mapping —
+/// silently ignored, because the smoke tests in `turn.rs` pin the table
+/// down before any new return variant can land here.
+fn finish_turn(turn: &mut Turn, result: &Result<()>) {
+    let (next, payload) = match result {
+        Ok(()) => (TurnState::Completed, None),
+        Err(Error::Interrupted) => (TurnState::Interrupted, None),
+        Err(e) => (TurnState::Failed, Some(e.to_string())),
+    };
+    let _ = turn.transition(next, payload);
 }
 
 fn truncate(s: &str) -> String {
@@ -972,12 +1017,13 @@ mod tests {
         let done = r#"{"content":[{"type":"text","text":"done"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
         let (port, reqs) = mock_seq(vec![(200, tool.into()), (200, done.into())]);
         let mut history = hv(vec![json!({"role": "user", "content": "run echo"})]);
+        let mut turn = Turn::new(0);
         block_on(async {
             // Hub::empty() spawns an actor task — the test needs a runtime
             // for the spawn to land, even though the hub itself has no work
             // to do in this test.
             let hub = crate::mcp::Hub::empty();
-            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &CancelToken::new(), &hub, &sink()).await.unwrap();
+            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await.unwrap();
             hub.shutdown().await;
         });
         assert_eq!(history.len(), 4); // user + assistant(tool_use) + user(tool_result) + assistant(text)
@@ -991,6 +1037,9 @@ mod tests {
         let reqs = reqs.lock().unwrap();
         assert!(reqs[0].contains("input_schema"), "tool schemas must be sent");
         assert!(reqs[1].contains("\"type\":\"tool_result\""), "results must feed the next request");
+        // the turn reached Completed — the natural exit on a final-text response
+        assert_eq!(turn.state, TurnState::Completed);
+        assert!(turn.started_at.is_some() && turn.ended_at.is_some());
     }
 
     #[test]
@@ -1000,12 +1049,15 @@ mod tests {
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
         c.max_turns = 1;
         let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
+        let mut turn = Turn::new(0);
         block_on(async {
             let hub = crate::mcp::Hub::empty();
-            agent_loop(&c, &mut history, &CancelToken::new(), &hub, &sink()).await.unwrap(); // must return instead of spinning
+            agent_loop(&c, &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await.unwrap(); // must return instead of spinning
             hub.shutdown().await;
         });
         assert_eq!(history.len(), 3); // user + assistant(tool_use) + user(tool_result)
+        // hitting max_turns is a normal exit, not a failure — Completed, not Failed
+        assert_eq!(turn.state, TurnState::Completed);
     }
 
     // ---- coroutine cancellation ----
@@ -1030,6 +1082,7 @@ mod tests {
             r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answ"}}"#, "\n\n");
         let port = mock_stall(tool, stalled);
         let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
+        let mut turn = Turn::new(0);
         let err = block_on(async {
             let hub = crate::mcp::Hub::empty();
             let token = Arc::new(CancelToken::new());
@@ -1038,7 +1091,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 t.cancel();
             });
-            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), true), &mut history, &token, &hub, &sink()).await;
+            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), true), &mut history, &mut turn, &token, &hub, &sink()).await;
             hub.shutdown().await;
             res
         }).unwrap_err();
@@ -1056,6 +1109,11 @@ mod tests {
         let results: Vec<&str> = j[2]["content"].as_array().unwrap().iter()
             .map(|b| b["tool_use_id"].as_str().unwrap()).collect();
         assert!(ids.iter().all(|i| results.contains(i)));
+        // Ctrl-C mid-stream lands the turn on `Interrupted`, not `Failed` —
+        // interruption is a stop, not an error, and the table keeps the two
+        // separate so the banner can read "interrupted" without "error".
+        assert_eq!(turn.state, TurnState::Interrupted);
+        assert!(turn.error.is_none(), "interrupted is not a failure");
     }
 
     #[test]
@@ -1065,6 +1123,7 @@ mod tests {
             r#"{{"content":[{{"type":"tool_use","id":"t1","name":"bash","input":{{"command":"{cmd}"}}}}],"usage":{{"input_tokens":1,"output_tokens":1}}}}"#);
         let (port, _) = mock_seq(vec![(200, tool)]);
         let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
+        let mut turn = Turn::new(0);
         let err = block_on(async {
             let hub = crate::mcp::Hub::empty();
             let token = Arc::new(CancelToken::new());
@@ -1073,7 +1132,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 t.cancel();
             });
-            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &token, &hub, &sink()).await;
+            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &mut turn, &token, &hub, &sink()).await;
             hub.shutdown().await;
             res
         }).unwrap_err();
@@ -1082,6 +1141,37 @@ mod tests {
         let result = hist(&history)[2]["content"][0]["content"].as_str().unwrap().to_string();
         assert!(result.contains("[interrupted by user]"), "got: {result}");
         assert_eq!(hist(&history)[2]["content"][0]["tool_use_id"], json!("t1"));
+        // mid-tool cancel also lands on `Interrupted` — same state, same reason.
+        assert_eq!(turn.state, TurnState::Interrupted);
+    }
+
+    /// A 500 from the wire is *not* `Failed`: the transport retries it
+    /// (`is_transient`), so the user only sees the eventual result. We
+    /// exhaust `RETRY_MAX` and serve another 500 on every attempt — once
+    /// retries are gone, the turn ends in `Failed` with the API status
+    /// text in `error`.
+    #[test]
+    fn agent_loop_records_failed_when_api_rejects() {
+        // 5xx is transient; serve enough 500s to exhaust retries, and the
+        // final error surfaces as `Failed`. Each retry is a fresh
+        // connection on the mock listener, so N retries need N responses.
+        let five_hundred = r#"{"type":"error","error":{"type":"api_error","message":"overloaded"}}"#;
+        let mut responses = Vec::new();
+        for _ in 0..=crate::api::RETRY_ATTEMPTS {
+            responses.push((500, five_hundred.into()));
+        }
+        let (port, _) = mock_seq(responses);
+        let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
+        let mut turn = Turn::new(0);
+        let err = block_on(async {
+            let hub = crate::mcp::Hub::empty();
+            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await
+        }).unwrap_err();
+        // the error reaches the caller — the same one we record on the turn
+        assert!(matches!(err, Error::Api(500, _)), "got: {err}");
+        assert_eq!(turn.state, TurnState::Failed, "5xx after retries is Failed, not Interrupted");
+        assert!(turn.error.as_deref().unwrap_or("").contains("500"), "error carries the api status: got {:?}", turn.error);
+        assert!(turn.started_at.is_some() && turn.ended_at.is_some(), "timestamps stamp both ends");
     }
 
     // bash+grandchild test lives in tool_runtime::tests; see cmd/conn
