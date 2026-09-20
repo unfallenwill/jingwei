@@ -36,7 +36,7 @@
 // the tool registry moves to its own module this file will import it from
 // there.
 
-use crate::ledger::{ledger_note, stale};
+use crate::tools::ledger::{ledger_note, stale};
 use serde_json::Value;
 
 /// The most diff lines one replacement may print before the report falls back

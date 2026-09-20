@@ -17,7 +17,7 @@ use crate::core::ir::{Block, Message, ToolResult};
 use crate::core::turn::{Turn, TurnOutcome, TurnState};
 use crate::display::{Msg, Sev, Show};
 use crate::mcp::Hub;
-use crate::tool_runtime::run_tool;
+use crate::tools::runtime::run_tool;
 use crate::tools::print_tool_call;
 use crate::Error;
 

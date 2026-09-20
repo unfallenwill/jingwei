@@ -46,9 +46,9 @@ impl Layer {
 fn layer_of(mod_name: &str) -> Option<Layer> {
     let l = match mod_name {
         "display" | "core" | "core::ir" | "core::session" | "core::turn" => Layer::L0, // pure data types + state machines (turn is per-run, no IO)
-        "cancel" | "file_io" | "format" | "ledger" | "core::agents_md" | "core::reminder" => Layer::L1, // infra primitives (agents_md walks the FS — IO, no other crate deps; reminder is pure data the agent core threads through Context)
+        "cancel" | "file_io" | "format" | "core::agents_md" | "core::reminder" => Layer::L1, // infra primitives (agents_md walks the FS — IO, no other crate deps; reminder is pure data the agent core threads through Context)
         "config" | "settings" | "core::context" => Layer::L3, // tool/config tier; may reach into api (L4) for the Vendor port + policy enums; context builds the per-turn model state
-        "edit" | "tools" | "tool_runtime" | "login" | "mcp" | "mcp::wire" | "mcp::health"
+        "tools" | "tools::edit" | "tools::ledger" | "tools::runtime" | "login" | "mcp" | "mcp::wire" | "mcp::health"
             | "mcp::config" | "mcp::client" | "mcp::stdio" | "mcp::http" | "mcp::inner"
             | "mcp::stub" => Layer::L3, // tool/config tier; MCP is a tool-provider sibling to `tools`
         "api" | "api::minimax" | "api::zai" | "api::deepseek" => Layer::L4,
@@ -145,6 +145,7 @@ fn collect_edges() -> HashMap<String, Vec<String>> {
                 "api" => &["minimax", "zai", "deepseek"],
                 "core" => &["agent", "agents_md", "context", "ir", "reminder", "session", "turn"],
                 "mcp" => &["wire", "health", "config", "client", "stdio", "http", "inner", "stub"],
+                "tools" => &["edit", "ledger", "runtime"],
                 "tui" => &["model", "update", "view"],
                 _ => &[],
             };

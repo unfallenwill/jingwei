@@ -10,10 +10,14 @@
 // one-line summary the frontends can echo verbatim, and the full output the
 // frontends decide how much of to show.
 
+mod edit;
+mod ledger;
+pub(crate) mod runtime;
+
 use crate::display::{Msg, Show};
-use crate::edit::edit_tool;
 use crate::file_io::write_atomic;
-use crate::ledger::{ledger_note, stale};
+use crate::tools::edit::edit_tool;
+use crate::tools::ledger::{ledger_note, stale};
 use serde_json::{json, Value};
 use std::fs;
 use std::process::{Command, ExitStatus};
@@ -178,6 +182,7 @@ mod tests {
     use super::*;
     use crate::test_util::temp_dir;
     use serde_json::json;
+    use std::fs;
 
     #[test]
     fn tools_registry_is_wellformed() {
@@ -188,6 +193,39 @@ mod tests {
             assert_eq!(x.schema["type"], "object");
             assert!(x.schema["properties"].is_object() && x.schema["required"].is_array());
         }
+    }
+
+    #[test]
+    fn bash_tool_returns_exit_code_and_output() {
+        let ok = dispatch("bash", &json!({"command": "echo hi"}));
+        assert!(ok.starts_with("exit=0") && ok.contains("hi"), "got: {ok}");
+        let bad = dispatch("bash", &json!({"command": if cfg!(windows) { "exit 1" } else { "false" }}));
+        assert!(!bad.starts_with("exit=0") && bad.contains("exit="), "got: {bad}");
+    }
+
+    #[test]
+    fn write_read_edit_file_contract() {
+        let dir = temp_dir("files");
+        let p = dir.join("f.txt");
+        // write (with missing parent dirs) + read roundtrip
+        assert!(dispatch("write_file", &json!({"path": dir.join("a/b.txt").to_str().unwrap(), "content": "v1"})).starts_with("ok:"));
+        assert_eq!(dispatch("read_file", &json!({"path": dir.join("a/b.txt").to_str().unwrap()})), "v1");
+        // edit unique
+        fs::write(&p, "hello world").unwrap();
+        assert!(dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "hello", "new": "hi"})).starts_with("ok:"));
+        assert_eq!(fs::read_to_string(&p).unwrap(), "hi world");
+        // edit missing
+        assert!(dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "zzz", "new": "x"})).contains("not found"));
+        // edit ambiguous — re-read so the ledger knows the current bytes,
+        // and the ambiguity message is the one we test (the ledger check
+        // fires first and would otherwise steal the message).
+        fs::write(&p, "ab ab").unwrap();
+        dispatch("read_file", &json!({"path": p.to_str().unwrap()}));
+        assert!(dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "ab", "new": "cd"})).contains("appears 2 times"));
+        // read missing
+        assert!(dispatch("read_file", &json!({"path": dir.join("nope").to_str().unwrap()})).starts_with("error:"));
+        // unknown tool
+        assert!(dispatch("nope", &json!({})).starts_with("error: unknown tool"));
     }
 
     // ---- tool_summary: the one-line echo the frontends show ---------------

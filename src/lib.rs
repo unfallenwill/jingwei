@@ -18,15 +18,12 @@ mod core;
 /// The display port. `pub` because the thin binary renders its final
 /// error banner through the same vocabulary the frontends share.
 pub mod display;
-mod edit;
 mod file_io;
 mod format;
-mod ledger;
 mod login;
 mod mcp;
 mod plain;
 mod settings;
-mod tool_runtime;
 mod tools;
 mod tui;
 
@@ -462,55 +459,6 @@ mod tests {
     use super::*;
     use crate::api::{Protocol, CacheMode, Thinking};
     use crate::config::{Args, DEFAULT_CONTEXT_SIZE, DEFAULT_MAX_TURNS};
-    use crate::tools::{dispatch, tools};
-    use crate::tool_runtime::run_bash;
-    use crate::test_util::{temp_dir};
-    use serde_json::json;
-    use std::fs;
-
-    #[test]
-    fn bash_tool_returns_exit_code_and_output() {
-        let ok = dispatch("bash", &json!({"command": "echo hi"}));
-        assert!(ok.starts_with("exit=0") && ok.contains("hi"), "got: {ok}");
-        let bad = dispatch("bash", &json!({"command": if cfg!(windows) { "exit 1" } else { "false" }}));
-        assert!(!bad.starts_with("exit=0") && bad.contains("exit="), "got: {bad}");
-    }
-
-    #[test]
-    fn write_read_edit_file_contract() {
-        let dir = temp_dir("files");
-        let p = dir.join("f.txt");
-        // write (with missing parent dirs) + read roundtrip
-        assert!(dispatch("write_file", &json!({"path": dir.join("a/b.txt").to_str().unwrap(), "content": "v1"})).starts_with("ok:"));
-        assert_eq!(dispatch("read_file", &json!({"path": dir.join("a/b.txt").to_str().unwrap()})), "v1");
-        // edit unique
-        fs::write(&p, "hello world").unwrap();
-        assert!(dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "hello", "new": "hi"})).starts_with("ok:"));
-        assert_eq!(fs::read_to_string(&p).unwrap(), "hi world");
-        // edit missing
-        assert!(dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "zzz", "new": "x"})).contains("not found"));
-        // edit ambiguous — re-read so the ledger knows the current bytes,
-        // and the ambiguity message is the one we test (the ledger check
-        // fires first and would otherwise steal the message).
-        fs::write(&p, "ab ab").unwrap();
-        dispatch("read_file", &json!({"path": p.to_str().unwrap()}));
-        assert!(dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "ab", "new": "cd"})).contains("appears 2 times"));
-        // read missing
-        assert!(dispatch("read_file", &json!({"path": dir.join("nope").to_str().unwrap()})).starts_with("error:"));
-        // unknown tool
-        assert!(dispatch("nope", &json!({})).starts_with("error: unknown tool"));
-    }
-
-    #[test]
-    fn tools_registry_is_wellformed() {
-        let t = tools();
-        assert_eq!(t.len(), 4);
-        assert_eq!(t.iter().map(|x| x.name).collect::<std::collections::BTreeSet<_>>().len(), 4);
-        for x in t {
-            assert_eq!(x.schema["type"], "object");
-            assert!(x.schema["properties"].is_object() && x.schema["required"].is_array());
-        }
-    }
 
     // ---- flags & config ----
 
