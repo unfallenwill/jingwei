@@ -1673,18 +1673,23 @@ mod tests {
     }
 
     // ---- handle: the action dispatcher ----
+    /// The handle/dispatch tests' config: the same fields every time,
+    /// aimed at an unreachable host — only tests that care spell a
+    /// different `base_url`.
+    fn tcfg(base: &str) -> Config {
+        Config {
+            api_key: "k".into(), base_url: base.into(), model: "m".into(),
+            protocol: crate::api::Protocol::MINIMAX, cache: crate::api::CacheMode::Auto,
+            thinking: crate::api::Thinking::Preserve, effort: None,
+            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+        }
+    }
+
     /// A handle that lets a test inspect the agent that was spawned.
     fn run_handle(action: Action) -> (ChannelSink, Option<Agent>) {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
-        let cfg = crate::config::Config {
-            api_key: "k".into(), base_url: "http://127.0.0.1:1".into(), model: "m".into(),
-            protocol: crate::api::Protocol::MINIMAX,
-            cache: crate::api::CacheMode::Auto,
-            thinking: crate::api::Thinking::Preserve,
-            effort: None,
-            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
-        };
+        let cfg = tcfg("http://127.0.0.1:1");
         let mut convo = Convo::ephemeral();
         convo.history.push(crate::ir::Message::User("seed".into()));
         let convo = Arc::new(AsyncMutex::new(convo));
@@ -1717,14 +1722,7 @@ mod tests {
         // not its end
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
-        let cfg = crate::config::Config {
-            api_key: "k".into(), base_url: "http://127.0.0.1:1".into(), model: "m".into(),
-            protocol: crate::api::Protocol::MINIMAX,
-            cache: crate::api::CacheMode::Auto,
-            thinking: crate::api::Thinking::Preserve,
-            effort: None,
-            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
-        };
+        let cfg = tcfg("http://127.0.0.1:1");
         let mut convo = Convo::ephemeral();
         convo.history.push(crate::ir::Message::User("seed".into()));
         let convo = Arc::new(AsyncMutex::new(convo));
@@ -1755,14 +1753,7 @@ mod tests {
         // and returns None.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
-        let cfg = crate::config::Config {
-            api_key: "k".into(), base_url: "http://127.0.0.1:1".into(), model: "m".into(),
-            protocol: crate::api::Protocol::MINIMAX,
-            cache: crate::api::CacheMode::Auto,
-            thinking: crate::api::Thinking::Preserve,
-            effort: None,
-            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
-        };
+        let cfg = tcfg("http://127.0.0.1:1");
         let convo = Arc::new(AsyncMutex::new(Convo::ephemeral()));
         // a pre-existing agent slot, as if the first Submit had already
         // run and the spawned coroutine were still in flight
@@ -1938,11 +1929,7 @@ mod tests {
     async fn slash_dispatch_unknown_command_yields_no_switch() {
         // `/garbage` does not exist; the dispatcher surfaces a warning
         // and returns None so the loop keeps its current cfg / convo.
-        let cfg = Config { api_key: "k".into(), base_url: "https://x".into(), model: "m".into(),
-            protocol: crate::api::Protocol::MINIMAX, cache: crate::api::CacheMode::Auto,
-            thinking: crate::api::Thinking::Preserve, effort: None,
-            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
-        };
+        let cfg = tcfg("https://x");
         let convo = Arc::new(AsyncMutex::new(crate::session::Convo::ephemeral()));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
@@ -1957,11 +1944,7 @@ mod tests {
 
     #[tokio::test]
     async fn slash_help_announces_available_commands() {
-        let cfg = Config { api_key: "k".into(), base_url: "https://x".into(), model: "m".into(),
-            protocol: crate::api::Protocol::MINIMAX, cache: crate::api::CacheMode::Auto,
-            thinking: crate::api::Thinking::Preserve, effort: None,
-            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
-        };
+        let cfg = tcfg("https://x");
         let convo = Arc::new(AsyncMutex::new(crate::session::Convo::ephemeral()));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
@@ -1989,11 +1972,7 @@ mod tests {
         let dir = crate::test_util::temp_dir("slash_unknown_profile");
         std::env::set_var("HOME", dir);
         // No settings file written — slash_model loads an empty Settings.
-        let cfg = Config { api_key: "k".into(), base_url: "https://x".into(), model: "m".into(),
-            protocol: crate::api::Protocol::MINIMAX, cache: crate::api::CacheMode::Auto,
-            thinking: crate::api::Thinking::Preserve, effort: None,
-            max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
-        };
+        let cfg = tcfg("https://x");
         let convo = Arc::new(AsyncMutex::new(crate::session::Convo::ephemeral()));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let _sink = ChannelSink::new(tx);
