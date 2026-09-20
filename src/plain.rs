@@ -253,50 +253,33 @@ pub(crate) async fn handle_mcp_command(rest: &str, hub: &Hub, sink: &dyn Show) {
                 sink.show(Msg::Banner(format_mcp_status(&status)));
             }
         }
-        "enable" => {
-            let Some(name) = name else {
-                sink.show(Msg::Note { sev: Sev::Err, text: " mcp: missing server name — try /mcp list ".into() });
-                return;
-            };
-            match hub.enable(name).await {
-                Ok(()) => sink.show(Msg::Banner(format!("mcp: enable {name}: done"))),
-                Err(why) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" mcp: enable {name}: {why} ") }),
-            }
-        }
-        "disable" => {
-            let Some(name) = name else {
-                sink.show(Msg::Note { sev: Sev::Err, text: " mcp: missing server name — try /mcp list ".into() });
-                return;
-            };
-            match hub.disable(name).await {
-                Ok(()) => sink.show(Msg::Banner(format!("mcp: disable {name}: done"))),
-                Err(why) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" mcp: disable {name}: {why} ") }),
-            }
-        }
-        "reconnect" => {
-            let Some(name) = name else {
-                sink.show(Msg::Note { sev: Sev::Err, text: " mcp: missing server name — try /mcp list ".into() });
-                return;
-            };
-            match hub.reconnect(name).await {
-                Ok(()) => sink.show(Msg::Banner(format!("mcp: reconnect {name}: done"))),
-                Err(why) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" mcp: reconnect {name}: {why} ") }),
-            }
-        }
-        "disconnect" => {
-            let Some(name) = name else {
-                sink.show(Msg::Note { sev: Sev::Err, text: " mcp: missing server name — try /mcp list ".into() });
-                return;
-            };
-            match hub.disconnect(name).await {
-                Ok(()) => sink.show(Msg::Banner(format!("mcp: disconnect {name}: done"))),
-                Err(why) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" mcp: disconnect {name}: {why} ") }),
-            }
+        "enable" | "disable" | "reconnect" | "disconnect" => {
+            named_server_op(sub, name, hub, sink).await;
         }
         other => sink.show(Msg::Note {
             sev: Sev::Warn,
             text: format!(" mcp: unknown subcommand: {other:?} · try /mcp list "),
         }),
+    }
+}
+
+/// The four verbs that name a server: one missing-name note, one
+/// done/error shape — the verb picks the hub call, everything else is
+/// shared. The TUI rides this same path through its own `/mcp` spawn.
+async fn named_server_op(verb: &str, name: Option<&str>, hub: &Hub, sink: &dyn Show) {
+    let Some(name) = name else {
+        sink.show(Msg::Note { sev: Sev::Err, text: " mcp: missing server name — try /mcp list ".into() });
+        return;
+    };
+    let out = match verb {
+        "enable" => hub.enable(name).await,
+        "disable" => hub.disable(name).await,
+        "reconnect" => hub.reconnect(name).await,
+        _ => hub.disconnect(name).await,
+    };
+    match out {
+        Ok(()) => sink.show(Msg::Banner(format!("mcp: {verb} {name}: done"))),
+        Err(why) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" mcp: {verb} {name}: {why} ") }),
     }
 }
 
