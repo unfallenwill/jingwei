@@ -9,7 +9,9 @@
 //   L3  config, settings, context, edit, tools, tool_runtime, login, mcp + submodules
 //                                                  — tool/config tier; reaches into api (L4) for the Vendor port + policy enums
 //   L4  api (+ api::minimax/zai/deepseek)          — vendor + transport
-//   L5  main, plain, tui (+ tui::model/update/view)— composition + frontends
+//   L5  lib, main, plain, tui (+ tui::model/update/view)
+//                                                  — composition root + frontends (lib/main are the
+//                                                  same composition root split across the lib/bin edge)
 //   T   test_util                                  — test-only helpers
 //
 // Rules:
@@ -49,7 +51,7 @@ fn layer_of(mod_name: &str) -> Option<Layer> {
             | "mcp::config" | "mcp::client" | "mcp::stdio" | "mcp::http" | "mcp::inner"
             | "mcp::stub" => Layer::L3, // tool/config tier; MCP is a tool-provider sibling to `tools`
         "api" | "api::minimax" | "api::zai" | "api::deepseek" => Layer::L4,
-        "main" | "plain" | "tui" | "tui::model" | "tui::update" | "tui::view" => Layer::L5,
+        "main" | "lib" | "plain" | "tui" | "tui::model" | "tui::update" | "tui::view" => Layer::L5,
         "test_util" => Layer::T,
         _ => return None,
     };

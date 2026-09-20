@@ -15,7 +15,7 @@ definitely does not.
 
 ```sh
 cargo check --tests          # pre-commit: cheap, catches signature drift
-cargo test --bin jingwei     # pre-push: full suite, must be green
+cargo test                   # pre-push: full suite (lib + bin + integration), must be green
 ```
 
 ## Commits

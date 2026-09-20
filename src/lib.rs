@@ -1,0 +1,1167 @@
+// jingwei — 精卫填海. A minimal coding agent: speak a task, and a small agent
+// carries stones — one tool call at a time — until the sea is land.
+//
+// Wire protocols: the Messages wire (minimax — whose compatible endpoint is
+// the recommended one, thinking blocks, interleaved reasoning, cache_control),
+// the Chat Completions dialect (zai, deepseek — each with a thinking story of
+// its own). Vendors that live at one address name it themselves; everything
+// else you bring the endpoint for.
+//
+// Env: NO_COLOR (the only environment variable consulted; all other
+//      settings — key, base URL, model, protocol, cache, thinking,
+//      effort, frontend choice — go through CLI flags)
+
+mod agents_md;
+mod api;
+mod cancel;
+mod config;
+mod context;
+/// The display port. `pub` because the thin binary renders its final
+/// error banner through the same vocabulary the frontends share.
+pub mod display;
+mod edit;
+mod file_io;
+mod format;
+mod ir;
+mod ledger;
+mod login;
+mod mcp;
+mod plain;
+mod reminder;
+mod session;
+mod settings;
+mod tool_runtime;
+mod tools;
+mod tui;
+mod turn;
+
+#[cfg(test)] mod test_util;
+use crate::api::call_api as api_call_api;
+use crate::cancel::CancelToken;
+use crate::config::{Args, Config, build_config};
+use crate::display::{Msg, Sev, Show};
+use crate::ir::{Block, Message, ToolResult};
+use crate::mcp::Hub;
+use crate::settings::Settings;
+use crate::tool_runtime::run_tool;
+use crate::tools::print_tool_call;
+use crate::agents_md::AgentsMdContext;
+use crate::context::Context;
+use crate::turn::{Turn, TurnOutcome, TurnState};
+use clap::{Parser, Subcommand};
+use serde_json::Value;
+use std::env;
+use std::io;
+use std::path::PathBuf;
+use std::time::Duration;
+const MAX_TOOL_OUTPUT: usize = 50_000;
+pub type Result<T> = std::result::Result<T, Error>;
+
+// ---- error -----------------------------------------------------------------
+
+#[derive(Debug)]
+pub enum Error {
+    Api(u16, String),
+    Msg(String),
+    Http(Box<ureq::Error>),
+    Json(serde_json::Error),
+    Io(io::Error),
+    /// The coroutine was cancelled (Ctrl-C). Not a failure — a stop.
+    Interrupted,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Api(c, b) => write!(f, "api {c}: {b}"),
+            Self::Msg(m) => write!(f, "{m}"),
+            Self::Http(e) => write!(f, "{e}"),
+            Self::Json(e) => write!(f, "{e}"),
+            Self::Io(e) => write!(f, "{e}"),
+            Self::Interrupted => write!(f, "interrupted"),
+        }
+    }
+}
+impl std::error::Error for Error {}
+
+impl From<ureq::Error> for Error {
+    fn from(e: ureq::Error) -> Self {
+        match e {
+            ureq::Error::Status(c, r) => Self::Api(c, r.into_string().unwrap_or_default()),
+            other => Self::Http(Box::new(other)),
+        }
+    }
+}
+impl From<serde_json::Error> for Error { fn from(e: serde_json::Error) -> Self { Self::Json(e) } }
+impl From<io::Error> for Error { fn from(e: io::Error) -> Self { Self::Io(e) } }
+
+impl Error {
+    /// Is this worth sending again? A 429 or a 5xx, or a socket that
+    /// never answered, is not the request's fault — and the answer is
+    /// the same on every wire, so it lives on the error type. Pure, so
+    /// a test reaches it.
+    fn is_transient(&self) -> bool {
+        match self {
+            Error::Http(_) => true,
+            Error::Api(s, _) => *s == 408 || *s == 429 || *s >= 500,
+            _ => false,
+        }
+    }
+}
+
+// ---- entry -----------------------------------------------------------------
+
+/// The library's single entrypoint. Everything process-shaped — the tokio
+/// runtime, exit codes, the red error banner — lives in the thin `main.rs`
+/// binary that calls this; everything agent-shaped lives here, where
+/// tests and future frontends can reach it without spawning a process.
+pub async fn run() -> Result<()> {
+    // parse() exits the process on error; we want our own error path so
+    // the binary's stderr formatting (the red " jingwei: ... " banner)
+    // matches what every other code path uses.
+    let cli = Cli::try_parse_from(env::args()).map_err(|e| Error::Msg(short_clap_err(&e)))?;
+    if cli.help {
+        crate::config::print_help();
+        return Ok(());
+    }
+    let mut args = args_from_cli(cli)?;
+    // Settings is the layer between persisted preferences and vendor defaults.
+    // We fold its active profile into `args` here so `build_config` (which
+    // only reads args) sees a fully-resolved request. The chain is
+    // CLI flag > settings.json active profile > vendor default.
+    if let Some(active) = Settings::load().ok().and_then(|s| s.active_args()) {
+        if args.api_key.is_none() { args.api_key = Some(active.api_key); }
+        if args.base_url.is_none() { args.base_url = active.base_url; }
+        if args.protocol.is_none() { args.protocol = Some(active.protocol); }
+    }
+    // --list answers from the disk alone — no credentials needed
+    if args.list {
+        return session::print_list(args.all);
+    }
+    let cfg = build_config(&args)?;
+    // AGENTS.md: discover the closest one walking up from the workspace.
+    // `--no-agents-md` short-circuits to an empty context so the rest of
+    // the run is identical to "no AGENTS.md exists at all". The result
+    // hands off to `Context::new`, which holds `system_text = SYSTEM`
+    // and enqueues an `AgentsMdClosest` reminder when an AGENTS.md was
+    // loaded; vendors consume both fields and never reach into
+    // AGENTS.md or the tool registry themselves.
+    let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let agents_ctx = if args.no_agents_md {
+        AgentsMdContext::empty(&workspace)
+    } else {
+        AgentsMdContext::load(&workspace)
+    };
+    let ctx = Context::new(&agents_ctx);
+    // MCP hub: external servers' tools, offered to the model as though
+    // they were the agent's own. Spawned once per process and shared
+    // across every turn (and every front-end). The user's servers are
+    // read from `~/.jingwei/mcp.json`; the project's live in `<cwd>/.mcp.json`
+    // and are picked up by the hub itself. A missing file is a None — the
+    // hub starts empty and the session runs as it always did.
+    let user_mcp = read_user_mcp();
+    let hub = Hub::spawn(&workspace, user_mcp.as_ref());
+    run_with_hub(args, cfg, ctx, hub, agents_ctx).await
+}
+
+const SYSTEM: &str = "You are jingwei (精卫), a coding agent with these tools: \
+    bash (run a shell command), read_file, write_file, edit_file (search/replace; exact match with line-aligned indentation fallback). \
+    Pick the smallest tool that fits: read_file to inspect (not cat via bash); edit_file for a few lines; write_file only to create or wholesale-replace; bash for the rest — running tests, git, grep, ls. \
+    Read a file before you edit it — never guess its contents. \
+    Prefer small, targeted commands. \
+    Never start a command that waits for input or never returns (editors, pagers, watch or server modes) — everything you run must terminate. \
+    Never run destructive commands unless the user explicitly asks. \
+    Never run git commit, push, reset, checkout, clean, or rebase unless the user explicitly asks. \
+    Write for a terminal, not a Markdown renderer: plain text, no headings/tables/bold markers, short lines, with exact copy-pasteable paths and commands. And since your reasoning is folded away and unseen, put every conclusion in the visible answer. \
+    Don't stop until the task is actually delivered: make the change, then verify it by running the build, the tests, or the exact command, fix what fails, and repeat until it passes — only then summarize. If you cannot finish, say exactly what is done, what is left, and what blocked you. \
+    When asked your name, say you are jingwei (精卫). \
+    When finished, reply with a concise 1-3 sentence summary of what you did.";
+
+// ---- cli -------------------------------------------------------------------
+
+/// The argv grammar: top-level subcommands for `login` / `list` / `resume`,
+/// and a flat flag set for the default invocation (one-shot or REPL).
+/// clap does the parsing; `args_from_cli` flattens it back into the
+/// internal [`Args`] shape so the rest of the binary never learns
+/// what clap looks like.
+#[derive(Parser, Debug)]
+#[command(name = "jingwei", disable_help_flag = true, disable_version_flag = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Cmd>,
+
+    // connection
+    #[arg(long)] api_key: Option<String>,
+    #[arg(long)] base_url: Option<String>,
+    #[arg(short = 'm', long)] model: Option<String>,
+    #[arg(long)] protocol: Option<String>,
+
+    // behavior
+    #[arg(long)] cache: Option<String>,
+    #[arg(long)] thinking: Option<String>,
+    #[arg(long)] effort: Option<String>,
+    #[arg(long)] max_tokens: Option<String>,
+    #[arg(long)] context_size: Option<String>,
+    #[arg(long)] max_turns: Option<String>,
+    #[arg(short = 's', long)] stream: bool,
+    #[arg(short = 'S', long)] no_stream: bool,
+
+    // sessions
+    #[arg(short = 'c', long)] r#continue: bool,
+    /// Resume a session by id prefix. Bare `--resume` is like `-c`.
+    /// clap's `Option<Option<String>>` idiom: outer `Some` means "flag
+    /// present", inner `Some` means "value given".
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    resume: Option<Option<String>>,
+    /// List this project's saved sessions.
+    #[arg(long)] list: bool,
+    /// With `--list`, list every project's sessions.
+    #[arg(long)] all: bool,
+
+    /// Skip AGENTS.md discovery entirely. The agent runs with no
+    /// project conventions loaded — for paranoid sessions, or when
+    /// the repo's AGENTS.md is known to be stale or misleading.
+    #[arg(long)] no_agents_md: bool,
+
+    // prompt — everything else, captured verbatim. clap's
+    // `trailing_var_arg` lets the prompt begin after `--`, so users
+    // who want to send `--help` as a literal task can still do so.
+    #[arg(trailing_var_arg = true)]
+    prompt: Vec<String>,
+
+    // -h / --help: clap's auto-generated help is disabled in favour
+    // of the hand-written one in config::HELP (lists every vendor by
+    // name and reads the same to a first-time user as the README).
+    #[arg(short = 'h', long, action = clap::ArgAction::SetTrue)]
+    help: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Set up providers / api keys / active model.
+    Login {
+        #[arg(long)] show: bool,
+        #[arg(long)] reset: bool,
+        #[arg(long)] reveal: bool,
+    },
+    /// List sessions for this project.
+    List {
+        #[arg(long)] all: bool,
+    },
+    /// Resume a session by id prefix; bare `resume` is like `-c`.
+    Resume {
+        id: Option<String>,
+    },
+}
+
+/// Translate [`Cli`] into the internal [`Args`] shape. Subcommands are
+/// mapped onto `Args.resume` / `Args.cont` / `Args.list`; numeric flags
+/// stay as strings here and parse later. Bare `--resume` and
+/// `--resume <id>` both funnel through the same path.
+fn args_from_cli(c: Cli) -> Result<Args> {
+    let mut a = Args {
+        streaming: true,
+        ..Default::default()
+    };
+    if c.command.is_some() { a.list = false; } // subcommands carry their own intent
+    match c.command {
+        Some(Cmd::Login { show, reset, reveal }) => {
+            crate::login::run(show, reset, reveal)?;
+            std::process::exit(0);
+        }
+        Some(Cmd::List { all }) => {
+            a.list = true;
+            a.all = all;
+            return Ok(a);
+        }
+        Some(Cmd::Resume { id }) => resume_into(&mut a, id),
+        None => {
+            // the default invocation — copy flags into Args
+            a.api_key = c.api_key;
+            a.base_url = c.base_url;
+            a.model = c.model;
+            a.protocol = c.protocol;
+            a.cache = c.cache;
+            a.thinking = c.thinking;
+            a.effort = c.effort;
+            // numeric flags stay as strings here so a parse error gets the
+            // same message text build_config would produce later
+            a.max_tokens = parse_num_flag("--max-tokens", c.max_tokens)?;
+            a.context_size = parse_num_flag("--context-size", c.context_size)?;
+            a.max_turns = parse_num_flag("--max-turns", c.max_turns)?;
+            if c.no_stream { a.streaming = false; }
+            if let Some(r) = c.resume {
+                resume_into(&mut a, r);
+            }
+            a.cont |= c.r#continue;
+            a.list = c.list;
+            a.all = c.all;
+            a.prompt = c.prompt;
+            a.no_agents_md = c.no_agents_md;
+        }
+    }
+    Ok(a)
+}
+
+/// Both the subcommand arm (`resume <id>`) and the flag arm (`--resume [id]`)
+/// spell the same rule: a non-empty value is the id, anything else is
+/// "the newest session" (`cont`).
+fn resume_into(a: &mut Args, id: Option<String>) {
+    match id {
+        Some(s) if !s.is_empty() => a.resume = Some(s),
+        _ => a.cont = true,
+    }
+}
+
+/// Parse a numeric flag, naming the flag in the error so the user can
+/// tell which one rejected its value.
+fn parse_num_flag<T: std::str::FromStr>(flag: &str, raw: Option<String>) -> Result<Option<T>>
+where T::Err: std::fmt::Display {
+    match raw {
+        None => Ok(None),
+        Some(s) => s.parse::<T>().map(Some).map_err(|_| Error::Msg(format!("{flag} expects a number"))),
+    }
+}
+
+/// Test-only entrypoint: parse an argv slice (no leading program name)
+/// and yield the internal [`Args`] the same way `run()` does. Used by
+/// `config::tests` to exercise the resolver without spinning up clap
+/// from inside `config.rs`.
+#[cfg(test)]
+pub(crate) fn parse_argv(argv: &[&str]) -> Result<Args> {
+    let mut full = vec!["jingwei".to_string()];
+    full.extend(argv.iter().cloned().map(str::to_string));
+    // `try_parse_from` returns `Err(clap::Error)`. We pull a short
+    // summary from it so the message that ends up in `Error::Msg`
+    // names the bad token when clap can.
+    let cli = Cli::try_parse_from(full)
+        .map_err(|e| Error::Msg(short_clap_err(&e)))?;
+    args_from_cli(cli)
+}
+
+/// Reduce a clap error to a single line that mentions the offending
+/// argument when clap can identify one. Long help blocks the user
+/// cannot easily scroll past.
+fn short_clap_err(e: &clap::Error) -> String {
+    use clap::error::{ContextKind, ContextValue};
+    let mut bad = None;
+    for (kind, val) in e.context() {
+        if matches!(kind, ContextKind::InvalidArg) { if let ContextValue::String(s) = val { bad = Some(s.clone()); } }
+    }
+    match (e.kind(), bad) {
+        (clap::error::ErrorKind::UnknownArgument, Some(a)) => format!("unknown flag: {a}\ntry --help"),
+        (_, Some(a)) => format!("invalid argument {a}: {e}"),
+        (_, None) => e.to_string(),
+    }
+}
+
+
+
+/// The rest of `run` after the hub is spawned. The TUI and plain REPL take
+/// the hub by value (it is `Clone` — handing a clone is a clone of an
+/// `mpsc::Sender`); the one-shot path also takes a clone, then calls
+/// `shutdown` on its own copy at the end so the connections close in
+/// every exit path.
+async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agents_ctx: AgentsMdContext) -> Result<()> {
+    let interactive = args.prompt.is_empty();
+    let (mut convo, banners) = begin_session(&args, &cfg, interactive)?;
+    // AGENTS.md gets a banner slot too, when one was loaded. Prepended
+    // so the user sees it before the session id — the context comes
+    // first in attention order, and the banner says the same thing.
+    let mut banners = banners;
+    if let Some(b) = agents_ctx.banner() {
+        banners.insert(0, b);
+    }
+    if interactive {
+        // A terminal gets the TUI; pipes, tests, and one-shots get the log.
+        return if tui::wanted() {
+            tui::run(cfg, ctx, convo, banners, hub).await
+        } else {
+            plain::plain_repl(&cfg, ctx, convo, banners, hub).await
+        };
+    }
+    // One-shot: always the plain frontend — its output must stay in the
+    // terminal after the process exits, and an alt-screen would take it.
+    let prompt = args.prompt.join(" ");
+    let sink = plain::PlainSink::new();
+    for b in &banners {
+        sink.show(Msg::Banner(b.clone()));
+    }
+    sink.show(Msg::TaskBegin(prompt.clone()));
+    convo.history.push(user_message(&prompt));
+    if let Err(e) = convo.persist() {
+        sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
+    }
+    let token = CancelToken::new();
+    let mut turn = Turn::new(0);
+    let res = agent_turn(&cfg, &mut ctx, &mut convo.history, &mut turn, &token, &hub, &sink).await;
+    if let Err(e) = convo.persist() {
+        sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
+    }
+    sink.show(Msg::TaskEnd);
+    hub.shutdown().await;
+    res
+}
+
+/// Read `~/.jingwei/mcp.json` if it exists. A missing or unreadable
+/// file is a `None`: the hub starts empty, and the rest of the agent
+/// runs as it always did. The hub's loader reaches for the file again
+/// to print warnings; here we just answer "did the user write one?".
+fn read_user_mcp() -> Option<Value> {
+    let path = Settings::home_dir()?.join(".jingwei").join("mcp.json");
+    let text = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!(" jingwei: ~/.jingwei/mcp.json: cannot be parsed ({e}); running without MCP ");
+            None
+        }
+    }
+}
+
+/// The conversation this process runs on, and the banners the frontend
+/// shows beside its own. Policy lives here, at the composition root;
+/// session.rs owns the mechanism. A one-shot stays ephemeral; a resumed
+/// one persists to the file it came from.
+fn begin_session(args: &Args, cfg: &Config, interactive: bool) -> Result<(session::Convo, Vec<String>)> {
+    if !args.resuming() {
+        if !interactive {
+            return Ok((session::Convo::ephemeral(), vec![]));
+        }
+        let prov = session::Provenance {
+            model: cfg.model.clone(),
+            protocol: cfg.protocol_label().into(),
+            base_url: cfg.base_url.clone(),
+        };
+        let s = session::Session::new(&prov, crate::config::HISTORY_FORMAT);
+        let banner = match s.path() {
+            Some(p) => format!("session {} · the conversation persists to {}", s.id(), p.display()),
+            None => format!("session {} · no home directory: this conversation stays in memory", s.id()),
+        };
+        return Ok((session::Convo::persistent(s, vec![]), vec![banner]));
+    }
+    let here = session::current_dir_string();
+    // Scoping comes from the layout: the project subdirectory is the
+    // filter, so `-c` (and a bare --resume) means "this project's newest"
+    // and an explicit id resolves within this project too.
+    let explicit = args.resume.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let (s, history) = session::Session::load(explicit)?;
+    let mut banners = vec![format!(
+        "resumed session {} · {} {} · started {}",
+        s.id(),
+        history.len(),
+        session::msg_word(history.len()),
+        session::utc(s.created())
+    )];
+    if s.model() != cfg.model {
+        // a different model is a different request — and a prefix cache
+        // that starts cold. The header says which model wrote the session.
+        banners.push(format!("session was written by {} — now on {}", s.model(), cfg.model));
+    }
+    if !session::same_dir(s.cwd(), &here) {
+        // the history speaks of files relative to another tree
+        banners.push(format!(
+            "session started in {} — tools now run from {}",
+            session::dir_tail(s.cwd()),
+            session::dir_tail(&here)
+        ));
+    }
+    Ok((session::Convo::persistent(s, history), banners))
+}
+
+/// The one constructor of a user task message. The internal history
+/// shape belongs to the agent core — so its constructor does too, and
+/// no frontend spells the shape by hand.
+fn user_message(text: &str) -> Message {
+    Message::User(text.to_string())
+}
+
+/// Drive one agent run as an interruptible coroutine.
+///
+/// The first Ctrl-C cancels the token: the agent coroutine notices at its
+/// next suspension point (a streamed line, a tool poll, a turn boundary),
+/// tidies the history so every tool call stays paired, and unwinds — the
+/// REPL prompt comes back with everything the agent already carried still in
+/// place. A second Ctrl-C while it is unwinding exits immediately, for when
+/// even graceful is too slow.
+///
+/// `turn` is the per-run state machine: the caller hands in a fresh
+/// `Turn` (in `Queued`) and the wrapper drives it through the table via
+/// [`agent_loop`]. The caller can inspect `turn` after the wrapper
+/// returns to read the terminal state — the wrapper owns the cancel
+/// select (`tokio::select!` against Ctrl-C) and the double-signal
+/// semantics, not to hide the turn from anyone.
+async fn agent_turn(cfg: &crate::config::Config, ctx: &mut Context, history: &mut Vec<Message>, turn: &mut Turn, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
+    let agent = agent_loop(cfg, ctx, history, turn, token, hub, sink);
+    tokio::pin!(agent);
+    tokio::select! {
+        res = &mut agent => return res,
+        // The plain frontend has no key loop of its own, so Ctrl-C arrives
+        // as a signal here; the TUI cancels through its key handler instead.
+        _ = tokio::signal::ctrl_c() => token.cancel(),
+    }
+    let res = tokio::select! {
+        res = &mut agent => res,
+        _ = tokio::signal::ctrl_c() => {
+            sink.show(Msg::Note { sev: Sev::Err, text: " interrupted again — exiting ".into() });
+            std::process::exit(130);
+        }
+    };
+    if let Err(Error::Interrupted) = &res {
+        sink.show(Msg::Note { sev: Sev::Warn, text: " interrupted — stopped at a safe point; history kept ".into() });
+    }
+    res
+}
+
+
+
+// ---- agent loop ------------------------------------------------------------
+
+/// The agent itself, as a coroutine. Every await is a suspension point and a
+/// cancellation point: between turns, on every streamed line, while each tool
+/// runs. On cancellation it returns `Err(Interrupted)` after leaving the
+/// history valid — interrupted tools get results, unfinished tool calls are
+/// dropped from the turn, and the REPL prompt simply returns.
+///
+/// `turn` is the per-run state machine the wrapper owns; this function
+/// drives it through the table — `Queued → InProgress` at the entry,
+/// the terminal transition on the way out. The mechanics of "do API
+/// calls and run tools" live in [`run_turn`], kept separate so the
+/// mapping between [`Result`] and [`TurnState`] has exactly one home
+/// (caller translates to [`TurnOutcome`], [`Turn::finish`] maps that).
+///
+/// `hub` is the MCP hub — its `definitions()` is the source of the schemas
+/// the model sees, and its `call()` is what runs when the model asks for
+/// a tool whose name starts with `mcp__`. Re-fetching definitions every
+/// turn is what lets `/mcp enable|disable|reconnect` take effect mid-session.
+///
+/// `ctx` is the model-side context — system text + tool list, owned by
+/// `crate::context`. The agent loop asks `ctx.refresh(hub)` each turn so
+/// the next request sees whatever MCP servers reported.
+async fn agent_loop(cfg: &crate::config::Config, ctx: &mut Context, history: &mut Vec<Message>, turn: &mut Turn, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
+    // The only legal first move. An Illegal here would mean the caller
+    // handed us a non-fresh turn — a programming bug — and we surface it
+    // as a regular error rather than a panic so a misconfigured caller
+    // doesn't kill the agent mid-sentence.
+    turn.transition(TurnState::InProgress, None)
+        .map_err(|e| Error::Msg(e.to_string()))?;
+
+    let result = run_turn(cfg, ctx, history, token, hub, sink).await;
+    // The Result → TurnOutcome translation lives here because `Error`
+    // is a main-rs type and turn.rs deliberately does not depend on it.
+    // From TurnOutcome onward, the mapping is the turn's own concern.
+    let outcome = match &result {
+        Ok(()) => TurnOutcome::Completed,
+        Err(Error::Interrupted) => TurnOutcome::Interrupted,
+        Err(e) => TurnOutcome::Failed(e.to_string()),
+    };
+    turn.finish(outcome);
+    result
+}
+
+/// Drive one turn's worth of API calls and tool runs. Pure mechanics — the
+/// [`Turn`] state machine is owned by the caller. Returns whatever
+/// happened; the caller maps it onto a terminal state via [`Turn::finish`].
+async fn run_turn(cfg: &crate::config::Config, ctx: &mut Context, history: &mut Vec<Message>, token: &crate::cancel::CancelToken, hub: &Hub, sink: &dyn Show) -> crate::Result<()> {
+    for step in 0..cfg.max_turns {
+        if token.is_cancelled() { return Err(Error::Interrupted); }
+        ctx.refresh(hub).await;
+        if context::fit_context(history, cfg.context_size) {
+            sink.show(Msg::Note { sev: Sev::Warn, text: " trimmed history to fit --context-size ".into() });
+        }
+        let (resp, interrupted, _body) = api_call_api(cfg, ctx, history, token, sink).await?;
+        let content = resp.blocks;
+        if interrupted {
+            // Cut off mid-response: keep finished text/thinking, drop tool
+            // calls — a tool_use whose tool_result never ran would poison
+            // the next request.
+            let kept: Vec<Block> = content.into_iter().filter(|b| b.tool_use().is_none()).collect();
+            if !kept.is_empty() {
+                history.push(Message::Assistant(kept));
+            }
+            return Err(Error::Interrupted);
+        }
+        let calls: Vec<Block> = content.iter().filter(|b| b.tool_use().is_some()).cloned().collect();
+        // Echo the full assistant turn back — including the final
+        // text-only turn, so follow-up questions keep context.
+        if !content.is_empty() {
+            history.push(Message::Assistant(content));
+        }
+        if calls.is_empty() { return Ok(()); }
+
+        // Run the tools. Cancellation stops the batch: the interrupted
+        // call reports as much as it got, the rest are skipped, and
+        // every tool_use still leaves with its tool_result.
+        let mut results = Vec::with_capacity(calls.len());
+        let mut stopped = false;
+        for c in &calls {
+            let (id, name, input) = c.tool_use().expect("filtered to tool calls");
+            let out = if stopped {
+                "skipped: this run was interrupted before the tool ran".into()
+            } else {
+                run_tool(name, input, token, hub).await
+            };
+            let out = truncate(&out);
+            print_tool_call(name, input, &out, sink);
+            results.push(ToolResult { id: id.to_string(), content: out });
+            if token.is_cancelled() { stopped = true; }
+        }
+        history.push(Message::ToolResults(results));
+        if stopped { return Err(Error::Interrupted); }
+
+        if step + 1 == cfg.max_turns {
+            sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: hit --max-turns={}, stopping ", cfg.max_turns) });
+        }
+    }
+    Ok(())
+}
+
+
+
+fn truncate(s: &str) -> String {
+    if s.len() <= MAX_TOOL_OUTPUT { return s.into(); }
+    let mut end = MAX_TOOL_OUTPUT;
+    while !s.is_char_boundary(end) { end -= 1; }
+    format!("{}…[truncated, {} bytes total]", &s[..end], s.len())
+}
+
+// ---- tests -----------------------------------------------------------------
+
+/// Cargo runs a crate's tests in parallel threads of one process, and
+/// `std::env` is process-global — one test's `NO_COLOR` is another test's
+/// surprise. Every test that reads or writes an environment variable holds
+/// this lock, so the env-touching set runs one at a time. Test-only: the
+/// binary never touches it.
+#[cfg(test)]
+mod tests {
+    #![allow(unused_imports)]
+    use super::*;
+    use crate::api::{backoff, call_api as api_call_api, CacheMode, Protocol, RETRY_MAX, Thinking};
+    use crate::config::{Args, DEFAULT_CONTEXT_SIZE, DEFAULT_MAX_TURNS};
+    use crate::tools::{dispatch, tools};
+    use crate::tool_runtime::run_bash;
+    use crate::test_util::{temp_dir, block_on, cfg, mock, mock_seq, mock_stall, sink};
+    use serde_json::json;
+    use crate::cancel::CancelToken;
+    use std::fs;
+    use std::sync::{Arc, Mutex};
+
+    /// A typed history from JSON literals — the tests still speak the wire
+    /// shape, and `ir` owns the only translation of it.
+    fn hv(values: Vec<Value>) -> Vec<Message> {
+        values.iter().map(Message::from_value).collect()
+    }
+    /// History back as JSON, for the assertions the tests have always made.
+    fn hist(history: &[Message]) -> Value {
+        ir::history_value(history)
+    }
+    /// A response's blocks as JSON, read like a `content` array.
+    fn blocks(b: &[Block]) -> Value {
+        Value::Array(b.iter().map(Block::to_value).collect())
+    }
+
+    /// SSE server with two connections: `first` is served complete (with a
+    /// Content-Length, then closed); `stalled` is streamed and then the
+    /// connection is *held open* — an answer cut off mid-stream, the exact
+    /// moment Ctrl-C lands.
+    #[test]
+    fn truncate_caps_long_output() {
+        assert_eq!(truncate("hello"), "hello");
+        let big = "x".repeat(MAX_TOOL_OUTPUT + 5);
+        assert!(truncate(&big).contains("truncated"));
+    }
+
+    #[test]
+    fn truncate_cuts_on_char_boundaries() {
+        // the cut lands inside a multi-byte char — must back off, not slice mid-char
+        let mut big = "x".repeat(MAX_TOOL_OUTPUT - 2);
+        big.push_str("精卫填海");
+        let t = truncate(&big);
+        assert!(t.starts_with('x'));
+        assert!(t.contains(&format!("…[truncated, {} bytes total]", big.len())), "got: {t}");
+        assert!(t.split('…').next().unwrap().len() <= MAX_TOOL_OUTPUT, "kept prefix must fit the cap");
+    }
+
+    #[test]
+    fn bash_tool_returns_exit_code_and_output() {
+        let ok = dispatch("bash", &json!({"command": "echo hi"}));
+        assert!(ok.starts_with("exit=0") && ok.contains("hi"), "got: {ok}");
+        let bad = dispatch("bash", &json!({"command": if cfg!(windows) { "exit 1" } else { "false" }}));
+        assert!(!bad.starts_with("exit=0") && bad.contains("exit="), "got: {bad}");
+    }
+
+    #[test]
+    fn write_read_edit_file_contract() {
+        let dir = temp_dir("files");
+        let p = dir.join("f.txt");
+        // write (with missing parent dirs) + read roundtrip
+        assert!(dispatch("write_file", &json!({"path": dir.join("a/b.txt").to_str().unwrap(), "content": "v1"})).starts_with("ok:"));
+        assert_eq!(dispatch("read_file", &json!({"path": dir.join("a/b.txt").to_str().unwrap()})), "v1");
+        // edit unique
+        fs::write(&p, "hello world").unwrap();
+        assert!(dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "hello", "new": "hi"})).starts_with("ok:"));
+        assert_eq!(fs::read_to_string(&p).unwrap(), "hi world");
+        // edit missing
+        assert!(dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "zzz", "new": "x"})).contains("not found"));
+        // edit ambiguous — re-read so the ledger knows the current bytes,
+        // and the ambiguity message is the one we test (the ledger check
+        // fires first and would otherwise steal the message).
+        fs::write(&p, "ab ab").unwrap();
+        dispatch("read_file", &json!({"path": p.to_str().unwrap()}));
+        assert!(dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "ab", "new": "cd"})).contains("appears 2 times"));
+        // read missing
+        assert!(dispatch("read_file", &json!({"path": dir.join("nope").to_str().unwrap()})).starts_with("error:"));
+        // unknown tool
+        assert!(dispatch("nope", &json!({})).starts_with("error: unknown tool"));
+    }
+
+    #[test]
+    fn tools_registry_is_wellformed() {
+        let t = tools();
+        assert_eq!(t.len(), 4);
+        assert_eq!(t.iter().map(|x| x.name).collect::<std::collections::BTreeSet<_>>().len(), 4);
+        for x in t {
+            assert_eq!(x.schema["type"], "object");
+            assert!(x.schema["properties"].is_object() && x.schema["required"].is_array());
+        }
+    }
+
+    // ---- flags & config ----
+
+    fn flags(list: &[&str]) -> Result<Args> { crate::parse_argv(list) }
+
+    #[test]
+    fn flags_parse_and_validate() {
+        let a = flags(&["--base-url", "https://x/v1", "--api-key", "k", "-m", "m1",
+            "--protocol", "zai", "--cache", "auto", "--thinking", "strip",
+            "--max-tokens", "4096", "--context-size", "100000", "--max-turns", "5",
+            "-S", "do", "stuff"]).unwrap();
+        assert_eq!(a.prompt, vec!["do", "stuff"]);
+        assert!(!a.streaming);
+        let cfg = build_config(&a).unwrap();
+        assert_eq!(cfg.protocol, Protocol::ZAI);
+        assert_eq!(cfg.cache, CacheMode::Auto);
+        assert_eq!(cfg.thinking, Thinking::Strip);
+        assert_eq!(cfg.max_tokens, 4096);
+        assert_eq!(cfg.context_size, 100000);
+        assert_eq!(cfg.max_turns, 5);
+        // --max-turns defaults and rejects 0 / garbage
+        let default = build_config(&flags(&["--api-key", "k", "--base-url", "https://x", "-m", "m"]).unwrap()).unwrap();
+        assert_eq!(default.max_turns, crate::config::DEFAULT_MAX_TURNS);
+        assert_eq!(default.max_tokens, crate::config::DEFAULT_MAX_TOKENS);
+        assert_eq!(default.context_size, crate::config::DEFAULT_CONTEXT_SIZE);
+        assert!(build_config(&flags(&["--api-key", "k", "--base-url", "https://x", "-m", "m",
+            "--max-turns", "0"]).unwrap()).is_err());
+        // active cache belongs to the Messages wire — the chat-completions
+        // vendors reject it in their own words
+        assert!(build_config(&flags(&["--api-key", "k", "--base-url", "https://x", "-m", "m",
+            "--protocol", "zai", "--cache", "active"]).unwrap()).is_err());
+        // required fields — and the one vendor that names its own endpoint
+        // and flagship: a key alone is a whole config
+        assert!(build_config(&flags(&[]).unwrap()).is_err());
+        let bare = build_config(&flags(&["--api-key", "k"]).unwrap()).unwrap();
+        assert_eq!((bare.protocol_label(), bare.base_url.as_str(), bare.model.as_str()),
+            ("minimax", "https://api.minimax.cn/anthropic", "MiniMax-M3"));
+        // every vendor names its endpoint now, but deepseek leaves the
+        // model to the user — flash or pro is a choice, not a default
+        assert!(build_config(&flags(&["--api-key", "k", "--protocol", "deepseek"]).unwrap()).is_err());
+        // bad flags
+        assert!(flags(&["--nope"]).is_err());
+        assert!(flags(&["--max-tokens", "abc"]).is_err());
+        assert!(flags(&["--max-turns", "abc"]).is_err());
+        assert!(flags(&["--base-url"]).is_err());
+        assert!(flags(&["--context-size"]).is_err());
+        assert!(flags(&["-s"]).unwrap().streaming); // -s is the explicit default
+    }
+
+    #[test]
+    fn session_flags_parse_with_optional_resume_value() {
+        // -c and a bare --resume both mean "the newest session"
+        assert!(flags(&["-c"]).unwrap().resuming());
+        assert!(flags(&["--continue"]).unwrap().resuming());
+        assert!(flags(&["--resume"]).unwrap().resuming());
+        assert_eq!(flags(&["--resume"]).unwrap().resume, None);
+        // a value is an id-prefix selector
+        assert_eq!(flags(&["--resume", "20250916"]).unwrap().resume.as_deref(), Some("20250916"));
+        // the optional value never swallows a flag that follows it
+        let a = flags(&["--resume", "--model", "m"]).unwrap();
+        assert_eq!(a.resume, None);
+        assert_eq!(a.model.as_deref(), Some("m"));
+        // --list is a mode of its own
+        assert!(flags(&["--list"]).unwrap().list);
+        assert!(!flags(&["--list"]).unwrap().resuming());
+        assert!(!flags(&["task", "words"]).unwrap().resuming(), "a task alone resumes nothing");
+    }
+
+    #[test]
+    fn user_message_is_the_single_spelling_of_a_task() {
+        assert_eq!(user_message("count files").to_value(), json!({"role": "user", "content": "count files"}));
+    }
+
+    #[test]
+    fn enum_flags_case_insensitive_and_list_available_values() {
+        let parse = |extra: &[&str]| {
+            let mut argv: Vec<&str> = vec!["--api-key", "k", "--base-url", "https://x", "-m", "m"];
+            argv.extend_from_slice(extra);
+            crate::parse_argv(&argv).unwrap()
+        };
+        // spellings are case-insensitive in every position
+        assert_eq!(build_config(&parse(&["--protocol", "ZAI"])).unwrap().protocol, Protocol::ZAI);
+        let cfg = build_config(&parse(&["--cache", "Active", "--thinking", "STRIP"])).unwrap();
+        assert_eq!(cfg.cache, CacheMode::Active);
+        assert_eq!(cfg.thinking, Thinking::Strip);
+        // an unknown value names the flag and lists what is accepted
+        let err = match build_config(&parse(&["--cache", "turbo"])) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("--cache turbo should be rejected"),
+        };
+        assert!(err.contains("invalid cache 'turbo'"), "got: {err}");
+        assert!(err.contains("auto, active"), "got: {err}");
+    }
+
+    // ---- zai vendor: dialect conversion ----
+
+    // ---- api over local mocks ----
+
+    // ---- deepseek vendor ----
+
+    // ---- agent loop ----
+
+    #[test]
+    fn agent_loop_runs_tool_then_stops_on_plain_text() {
+        let tool = r#"{"content":[{"type":"tool_use","id":"t1","name":"bash","input":{"command":"echo hi"}}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let done = r#"{"content":[{"type":"text","text":"done"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let (port, reqs) = mock_seq(vec![(200, tool.into()), (200, done.into())]);
+        let mut history = hv(vec![json!({"role": "user", "content": "run echo"})]);
+        let mut turn = Turn::new(0);
+        block_on(async {
+            // Hub::empty() spawns an actor task — the test needs a runtime
+            // for the spawn to land, even though the hub itself has no work
+            // to do in this test.
+            let hub = crate::mcp::Hub::empty();
+            let mut cx = crate::test_util::ctx();
+            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await.unwrap();
+            hub.shutdown().await;
+        });
+        assert_eq!(history.len(), 4); // user + assistant(tool_use) + user(tool_result) + assistant(text)
+        let j = hist(&history);
+        assert_eq!(j[1]["role"], json!("assistant"));
+        assert_eq!(j[1]["content"][0]["id"], json!("t1")); // full turn echoed back, thinking intact
+        assert_eq!(j[2]["content"][0]["type"], json!("tool_result"));
+        assert_eq!(j[2]["content"][0]["tool_use_id"], json!("t1"));
+        assert!(j[2]["content"][0]["content"].as_str().unwrap().contains("hi"));
+        assert_eq!(j[3]["content"][0]["text"], json!("done")); // final answer stays in history for follow-ups
+        let reqs = reqs.lock().unwrap();
+        assert!(reqs[0].contains("input_schema"), "tool schemas must be sent");
+        assert!(reqs[1].contains("\"type\":\"tool_result\""), "results must feed the next request");
+        // the turn reached Completed — the natural exit on a final-text response
+        assert_eq!(turn.state, TurnState::Completed);
+        assert!(turn.started_at.is_some() && turn.ended_at.is_some());
+    }
+
+    #[test]
+    fn agent_loop_stops_at_max_turns() {
+        let tool = r#"{"content":[{"type":"tool_use","id":"t1","name":"bash","input":{"command":"true"}}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let (port, _) = mock_seq(vec![(200, tool.into())]);
+        let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
+        c.max_turns = 1;
+        let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
+        let mut turn = Turn::new(0);
+        block_on(async {
+            let hub = crate::mcp::Hub::empty();
+            let mut cx = crate::test_util::ctx();
+            agent_loop(&c, &mut cx, &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await.unwrap(); // must return instead of spinning
+            hub.shutdown().await;
+        });
+        assert_eq!(history.len(), 3); // user + assistant(tool_use) + user(tool_result)
+        // hitting max_turns is a normal exit, not a failure — Completed, not Failed
+        assert_eq!(turn.state, TurnState::Completed);
+    }
+
+    // ---- coroutine cancellation ----
+
+    // bash kill/cancel tests live in tool_runtime::tests (the natural
+    // home for them) with tighter timing ceilings.
+
+    #[test]
+    fn agent_loop_interrupted_mid_stream_keeps_history_valid() {
+        let tool = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#, "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"bash","input":{}}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"echo hi\"}"}}"#, "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
+            r#"data: {"type":"message_delta","usage":{"output_tokens":1}}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n");
+        // Second response streams one text delta, then stalls with the
+        // connection open — the exact moment Ctrl-C lands.
+        let stalled = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}"#, "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answ"}}"#, "\n\n");
+        let port = mock_stall(tool, stalled);
+        let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
+        let mut turn = Turn::new(0);
+        let err = block_on(async {
+            let hub = crate::mcp::Hub::empty();
+            let mut cx = crate::test_util::ctx();
+            let token = Arc::new(CancelToken::new());
+            let t = token.clone();
+            tokio::task::spawn_blocking(move || {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                t.cancel();
+            });
+            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), true), &mut cx, &mut history, &mut turn, &token, &hub, &sink()).await;
+            hub.shutdown().await;
+            res
+        }).unwrap_err();
+        assert!(matches!(err, Error::Interrupted), "got: {err}");
+        // user + assistant(tool_use) + user(tool_result) + assistant(partial text; tool_use dropped)
+        assert_eq!(history.len(), 4);
+        let j = hist(&history);
+        assert_eq!(j[3]["role"], json!("assistant"));
+        assert_eq!(j[3]["content"][0]["type"], json!("text"));
+        assert_eq!(j[3]["content"][0]["text"], json!("partial answ"));
+        assert!(j[3]["content"].as_array().unwrap().iter().all(|b| b["type"] != "tool_use"));
+        // every tool_use still has its tool_result — the history stays sendable
+        let ids: Vec<&str> = j[1]["content"].as_array().unwrap().iter()
+            .filter(|b| b["type"] == "tool_use").map(|b| b["id"].as_str().unwrap()).collect();
+        let results: Vec<&str> = j[2]["content"].as_array().unwrap().iter()
+            .map(|b| b["tool_use_id"].as_str().unwrap()).collect();
+        assert!(ids.iter().all(|i| results.contains(i)));
+        // Ctrl-C mid-stream lands the turn on `Interrupted`, not `Failed` —
+        // interruption is a stop, not an error, and the table keeps the two
+        // separate so the banner can read "interrupted" without "error".
+        assert_eq!(turn.state, TurnState::Interrupted);
+        assert!(turn.error.is_none(), "interrupted is not a failure");
+    }
+
+    #[test]
+    fn agent_loop_interrupted_mid_tool_finishes_pairing() {
+        let cmd = if cfg!(windows) { "ping -n 30 127.0.0.1 > nul" } else { "sleep 30" };
+        let tool = format!(
+            r#"{{"content":[{{"type":"tool_use","id":"t1","name":"bash","input":{{"command":"{cmd}"}}}}],"usage":{{"input_tokens":1,"output_tokens":1}}}}"#);
+        let (port, _) = mock_seq(vec![(200, tool)]);
+        let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
+        let mut turn = Turn::new(0);
+        let err = block_on(async {
+            let hub = crate::mcp::Hub::empty();
+            let mut cx = crate::test_util::ctx();
+            let token = Arc::new(CancelToken::new());
+            let t = token.clone();
+            tokio::task::spawn_blocking(move || {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                t.cancel();
+            });
+            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut history, &mut turn, &token, &hub, &sink()).await;
+            hub.shutdown().await;
+            res
+        }).unwrap_err();
+        assert!(matches!(err, Error::Interrupted), "got: {err}");
+        assert_eq!(history.len(), 3); // user + assistant(tool_use) + user(tool_result)
+        let result = hist(&history)[2]["content"][0]["content"].as_str().unwrap().to_string();
+        assert!(result.contains("[interrupted by user]"), "got: {result}");
+        assert_eq!(hist(&history)[2]["content"][0]["tool_use_id"], json!("t1"));
+        // mid-tool cancel also lands on `Interrupted` — same state, same reason.
+        assert_eq!(turn.state, TurnState::Interrupted);
+    }
+
+    /// A 500 from the wire is *not* `Failed`: the transport retries it
+    /// (`is_transient`), so the user only sees the eventual result. We
+    /// exhaust `RETRY_MAX` and serve another 500 on every attempt — once
+    /// retries are gone, the turn ends in `Failed` with the API status
+    /// text in `error`.
+    #[test]
+    fn agent_loop_records_failed_when_api_rejects() {
+        // 5xx is transient; serve enough 500s to exhaust retries, and the
+        // final error surfaces as `Failed`. Each retry is a fresh
+        // connection on the mock listener, so N retries need N responses.
+        let five_hundred = r#"{"type":"error","error":{"type":"api_error","message":"overloaded"}}"#;
+        let mut responses = Vec::new();
+        for _ in 0..=crate::api::RETRY_ATTEMPTS {
+            responses.push((500, five_hundred.into()));
+        }
+        let (port, _) = mock_seq(responses);
+        let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
+        let mut turn = Turn::new(0);
+        let err = block_on(async {
+            let hub = crate::mcp::Hub::empty();
+            let mut cx = crate::test_util::ctx();
+            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await
+        }).unwrap_err();
+        // the error reaches the caller — the same one we record on the turn
+        assert!(matches!(err, Error::Api(500, _)), "got: {err}");
+        assert_eq!(turn.state, TurnState::Failed, "5xx after retries is Failed, not Interrupted");
+        assert!(turn.error.as_deref().unwrap_or("").contains("500"), "error carries the api status: got {:?}", turn.error);
+        assert!(turn.started_at.is_some() && turn.ended_at.is_some(), "timestamps stamp both ends");
+    }
+
+    // bash+grandchild test lives in tool_runtime::tests; see cmd/conn
+    // there for a deeper timeout note.
+
+    /// The wrapper owns the cancel select; the loop-level tests above
+    /// exercise the mechanics without it. This one drives the wrapper
+    /// end-to-end and asserts on the same Turn the caller owns — so a
+    /// future change that forgets to plumb `&mut turn` through agent_turn,
+    /// or hands a non-fresh turn to agent_loop, fails here.
+    #[test]
+    fn agent_turn_drives_a_fresh_turn_through_to_completed() {
+        let done = r#"{"content":[{"type":"text","text":"all done"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let (port, _) = mock_seq(vec![(200, done.into())]);
+        let mut turn = Turn::new(7);
+        // a wrapper-level run starts in Queued — that's the caller's job
+        // to construct, and the wrapper must not silently rewind it.
+        assert_eq!(turn.state, TurnState::Queued);
+        let mut history = hv(vec![json!({"role": "user", "content": "say hi"})]);
+        block_on(async {
+            let hub = crate::mcp::Hub::empty();
+            let mut cx = crate::test_util::ctx();
+            agent_turn(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut history, &mut turn, &CancelToken::new(), &hub, &sink()).await.unwrap();
+            hub.shutdown().await;
+        });
+        // the wrapper drove Queued → InProgress → Completed on the turn
+        // the caller handed in; the id survives, the timestamps stamp
+        // both ends, and the loop's mechanics ran at least once.
+        assert_eq!(turn.id, 7, "wrapper must not rewind turn id");
+        assert_eq!(turn.state, TurnState::Completed);
+        assert!(turn.started_at.is_some() && turn.ended_at.is_some());
+        assert_eq!(hist(&history).as_array().unwrap().last().unwrap()["role"], json!("assistant"));
+    }
+
+    #[test]
+    fn error_display() {
+        assert_eq!(Error::Api(429, "limited".into()).to_string(), "api 429: limited");
+        assert_eq!(Error::Msg("bad".into()).to_string(), "bad");
+        assert_eq!(Error::Interrupted.to_string(), "interrupted");
+    }
+
+    // ---- retry: the transport's own rule ----
+    #[test]
+    fn only_transient_errors_are_resent() {
+        // the retryable kinds: a rate limit, a timeout, a server that is down
+        for code in [408, 429, 500, 502, 503, 504] {
+            assert!(Error::Api(code, "x".into()).is_transient(), "{code} should be resent");
+        }
+        // the request's own fault, or a stop: never resent
+        for code in [400, 401, 403, 404, 422] {
+            assert!(!Error::Api(code, "x".into()).is_transient(), "{code} must not be resent");
+        }
+        assert!(!Error::Msg("x".into()).is_transient());
+        assert!(!Error::Interrupted.is_transient(), "a cancellation is not a failure to retry");
+    }
+
+    #[test]
+    fn backoff_doubles_then_caps() {
+        assert_eq!(backoff(1), Duration::from_millis(500));
+        assert_eq!(backoff(2), Duration::from_millis(1000));
+        assert_eq!(backoff(3), Duration::from_millis(2000));
+        assert_eq!(backoff(4), Duration::from_millis(4000));
+        assert_eq!(backoff(5), RETRY_MAX, "doubling is capped");
+        assert_eq!(backoff(99), RETRY_MAX, "and stays capped");
+    }
+
+    #[test]
+    fn a_transient_failure_is_resent_through_the_one_door() {
+        // 429 first, then the real answer: the door resends and the turn
+        // succeeds where it used to die on the first status
+        let (port, reqs) = mock_seq(vec![
+            (429, r#"{"error":{"message":"rate limited"}}"#.into()),
+            (200, r#"{"content":[{"type":"text","text":"after retry"}],"usage":{}}"#.into()),
+        ]);
+        let cx = crate::test_util::ctx();
+        let (resp, _, _) = block_on(crate::api::call_api(
+            &cfg(format!("http://127.0.0.1:{port}"), false), &cx, &[], &CancelToken::new(), &sink(),
+        )).unwrap();
+        assert_eq!(blocks(&resp.blocks)[0]["text"], "after retry");
+        assert_eq!(reqs.lock().unwrap().len(), 2, "the request went out twice");
+    }
+
+    #[test]
+    fn a_request_fault_is_not_resent() {
+        // a 400 is the request's own; it must fail on the first answer
+        let (port, reqs) = mock_seq(vec![
+            (400, r#"{"error":{"message":"bad model"}}"#.into()),
+        ]);
+        let cx = crate::test_util::ctx();
+        let err = block_on(crate::api::call_api(
+            &cfg(format!("http://127.0.0.1:{port}"), false), &cx, &[], &CancelToken::new(), &sink(),
+        )).unwrap_err();
+        assert!(err.to_string().contains("bad model"), "got: {err}");
+        assert_eq!(reqs.lock().unwrap().len(), 1, "no second request");
+    }
+
+    // ---- Error: the type's display & conversions -------------------------
+
+    #[test]
+    fn error_display_strings_are_actually_distinct() {
+        // each variant has its own Display shape — the test pins them
+        // so a refactor can't silently turn two variants into the same
+        // string (which would defeat the user's ability to tell what
+        // kind of failure they're looking at).
+        assert_eq!(format!("{}", Error::Interrupted), "interrupted");
+        // The passthrough variants delegate to their inner Display; the
+        // outer prefix is the variant's own word — we just check the
+        // inner value shows up verbatim, no "error: " or similar wrapper
+        // added by Error's Display.
+        let io = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert_eq!(format!("{}", Error::Io(io)), "denied");
+        // Error::Json's body is the inner error verbatim
+        let json_err = serde_json::from_str::<u32>("abc").unwrap_err();
+        let json_str = format!("{}", json_err);
+        assert_eq!(format!("{}", Error::Json(json_err)), json_str);
+        // Error::Msg shows the wrapped message verbatim
+        assert_eq!(format!("{}", Error::Msg("hi".into())), "hi");
+        // Error::Api prefix error shape: "api {code}: {body}"
+        assert_eq!(format!("{}", Error::Api(503, "unavailable".into())),
+            "api 503: unavailable");
+    }
+
+    #[test]
+    fn error_from_ureq_wraps_a_status_into_api() {
+        // the Status arm of From<ureq::Error>: the status code and body
+        // ride along as the Error::Api variant
+        let body = r#"{"error":"model gone"}"#;
+        let r = ureq::Response::new(404, "Not Found", body).unwrap();
+        let err: Error = ureq::Error::Status(404, r).into();
+        match err {
+            Error::Api(code, ref b) => {
+                assert_eq!(code, 404);
+                assert!(b.contains("model gone"), "body carries: {b}");
+            }
+            other => panic!("expected Error::Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_from_ureq_wraps_other_kinds_into_http() {
+        // transport / DNS / decode errors: they ride as Error::Http.
+        // Transport cannot be constructed outside ureq, so we trigger a
+        // real one — a request to a closed port.
+        let err: Error = ureq::get("http://127.0.0.1:1/nope").call().unwrap_err().into();
+        assert!(matches!(err, Error::Http(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn error_from_io_preserves_the_io_kind() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "nope");
+        let err: Error = io.into();
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    // ---- truncate: the bounded-output safety net --------------------------
+
+    #[test]
+    fn truncate_passes_through_short_strings() {
+        assert_eq!(truncate("hello"), "hello");
+        assert_eq!(truncate(""), "");
+        assert_eq!(truncate(&"x".repeat(MAX_TOOL_OUTPUT)), "x".repeat(MAX_TOOL_OUTPUT));
+    }
+
+    #[test]
+    fn truncate_strips_after_cap_with_marker() {
+        let big = "a".repeat(MAX_TOOL_OUTPUT + 100);
+        let t = truncate(&big);
+        assert!(t.contains(&format!("…[truncated, {} bytes total]", big.len())));
+        assert!(t.len() <= MAX_TOOL_OUTPUT + 64, "the marker is bounded: {t}");
+    }
+
+    }
