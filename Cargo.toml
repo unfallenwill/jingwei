@@ -36,8 +36,10 @@ clap = { version = "4", features = ["derive", "std", "error-context"], default-f
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "default-tls"] }
 futures-util = "0.3"
 rustls = "0.23.45"
-# `libc` is used by the stdio transport's `kill_on_drop` on Unix; the field
-# exists only on unix, so it lives in a target-specific table.
+# `libc` is used on Unix by the stdio transport's `kill_on_drop` and by
+# login's termios echo toggle (the crate's `termios` binding is the only
+# layout that matches the kernel — see set_echo); both exist only on
+# unix, so it lives in a target-specific table.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

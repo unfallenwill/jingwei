@@ -187,19 +187,17 @@ fn ask_secret_api_key(output: &mut dyn Write, input: &mut dyn BufRead, prompt: &
 
 #[cfg(all(unix, not(test)))]
 unsafe fn set_echo(fd: std::os::unix::io::RawFd, on: bool) -> std::io::Result<()> {
-    // termios magic numbers — ECHO is bit 0o10 on the local-mode word
-    extern "C" { fn tcgetattr(fd: i32, termios: *mut Termios) -> i32; fn tcsetattr(fd: i32, when: i32, termios: *const Termios) -> i32; }
-    static TCSAFLUSH: i32 = 2;
-    #[repr(C)]
-    #[derive(Default, Clone, Copy)]
-    struct Termios {
-        c_iflag: u32, c_oflag: u32, c_cflag: u32, c_lflag: u32,
-        c_line: u8, c_cc: [u8; 32], c_ispeed: u32, c_ospeed: u32,
-    }
-    let mut t = Termios::default();
-    if tcgetattr(fd, &mut t) != 0 { return Err(std::io::Error::last_os_error()); }
-    if on { t.c_lflag |= 0o10u32 } else { t.c_lflag &= !0o10u32 } // set / clear ECHO
-    if tcsetattr(fd, TCSAFLUSH, &t) != 0 { return Err(std::io::Error::last_os_error()); }
+    // The libc crate (already a unix dependency for mcp's kill_on_drop)
+    // owns the per-platform termios layout. The hand-rolled struct this
+    // replaces was 60 bytes where macOS's kernel writes 72 (tcflag_t is
+    // u64 there, c_cc is [u8; 20]) — tcgetattr ran 12 bytes past the end
+    // of the object, so every hidden-key prompt either scrambled the
+    // terminal settings or smashed the stack outright: `jingwei login`
+    // segfaulted right after the api key was read.
+    let mut t: libc::termios = std::mem::zeroed();
+    if libc::tcgetattr(fd, &mut t) != 0 { return Err(std::io::Error::last_os_error()); }
+    if on { t.c_lflag |= libc::ECHO } else { t.c_lflag &= !libc::ECHO }
+    if libc::tcsetattr(fd, libc::TCSAFLUSH, &t) != 0 { return Err(std::io::Error::last_os_error()); }
     Ok(())
 }
 
