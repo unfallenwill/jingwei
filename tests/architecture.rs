@@ -7,8 +7,9 @@
 //   L0  ui (the port), core (mod, ir, session, turn) — pure data types + state machines (turn is per-run, no IO)
 //   L1  cancel, file_io, format, core::agents_md, core::reminder
 //                                                  — infra primitives (agents_md walks the FS — IO, no other crate deps)
-//   L3  config, settings, core::context, tools (+ edit/ledger/runtime), login, mcp + submodules
-//                                                  — tool/config tier; reaches into api (L4) for the Vendor port + policy enums
+//   L3  config (+ settings/login), core::context, tools (+ edit/ledger/runtime), mcp + submodules
+//                                                  — the user's wishes and the tool tier; reaches into api (L4)
+//                                                  for the Vendor port + policy enums
 //   L4  api (+ api::minimax/zai/deepseek)          — vendor + transport
 //   L5  lib, main, core::agent, ui::plain, ui::tui (+ model/update/view)
 //                                                  — composition root + the loop + the port's adapters
@@ -47,8 +48,8 @@ fn layer_of(mod_name: &str) -> Option<Layer> {
     let l = match mod_name {
         "ui" | "core" | "core::ir" | "core::session" | "core::turn" => Layer::L0, // pure data types + state machines + the ui port (turn is per-run, no IO)
         "cancel" | "file_io" | "format" | "core::agents_md" | "core::reminder" => Layer::L1, // infra primitives (agents_md walks the FS — IO, no other crate deps; reminder is pure data the agent core threads through Context)
-        "config" | "settings" | "core::context" => Layer::L3, // tool/config tier; may reach into api (L4) for the Vendor port + policy enums; context builds the per-turn model state
-        "tools" | "tools::edit" | "tools::ledger" | "tools::runtime" | "login" | "mcp" | "mcp::wire" | "mcp::health"
+        "config" | "config::settings" | "config::login" | "core::context" => Layer::L3, // tool/config tier; may reach into api (L4) for the Vendor port + policy enums; context builds the per-turn model state
+        "tools" | "tools::edit" | "tools::ledger" | "tools::runtime" | "mcp" | "mcp::wire" | "mcp::health"
             | "mcp::config" | "mcp::client" | "mcp::stdio" | "mcp::http" | "mcp::inner"
             | "mcp::stub" => Layer::L3, // tool/config tier; MCP is a tool-provider sibling to `tools`
         "api" | "api::minimax" | "api::zai" | "api::deepseek" => Layer::L4,
@@ -146,6 +147,7 @@ fn collect_edges() -> HashMap<String, Vec<String>> {
                 "core" => &["agent", "agents_md", "context", "ir", "reminder", "session", "turn"],
                 "mcp" => &["wire", "health", "config", "client", "stdio", "http", "inner", "stub"],
                 "tools" => &["edit", "ledger", "runtime"],
+                "config" => &["settings", "login"],
                 "ui" => &["plain", "tui"],
                 _ => &[],
             };

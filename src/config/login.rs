@@ -11,7 +11,7 @@
 // what's already on disk).
 
 use crate::api::VENDORS;
-use crate::settings::{Profile, Settings};
+use crate::config::settings::{Profile, Settings};
 use crate::{Error, Result};
 use std::io::{self, BufRead, IsTerminal, Write};
 

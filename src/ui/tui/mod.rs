@@ -43,7 +43,7 @@ use crate::config::Config;
 use crate::ui::{ChannelSink, Msg, Sev, Show as DisplayShow};
 use crate::mcp::Hub;
 use crate::core::session::Convo;
-use crate::settings::Settings;
+use crate::config::settings::Settings;
 use crate::{agent_turn, user_message, Error};
 
 fn home_dir() -> Option<std::path::PathBuf> {

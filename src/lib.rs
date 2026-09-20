@@ -17,9 +17,7 @@ mod config;
 mod core;
 mod file_io;
 mod format;
-mod login;
 mod mcp;
-mod settings;
 mod tools;
 /// The ui port (this module's `mod.rs`) plus the two frontends that
 /// implement it. `pub` because the thin binary renders its final error
@@ -37,8 +35,7 @@ use crate::core::session;
 use crate::core::turn::Turn;
 use crate::ui::{Msg, Sev, Show};
 use crate::mcp::Hub;
-use crate::settings::Settings;
-use clap::{Parser, Subcommand};
+use crate::config::settings::Settings;
 use serde_json::Value;
 use std::env;
 use std::io;
@@ -104,15 +101,10 @@ impl Error {
 /// binary that calls this; everything agent-shaped lives here, where
 /// tests and future frontends can reach it without spawning a process.
 pub async fn run() -> Result<()> {
-    // parse() exits the process on error; we want our own error path so
-    // the binary's stderr formatting (the red " jingwei: ... " banner)
-    // matches what every other code path uses.
-    let cli = Cli::try_parse_from(env::args()).map_err(|e| Error::Msg(short_clap_err(&e)))?;
-    if cli.help {
-        crate::config::print_help();
-        return Ok(());
-    }
-    let mut args = args_from_cli(cli)?;
+    // The argv grammar is config's; `parse_env_args` owns clap end to end
+    // (including --help, answered and reported as `None`) so nothing above
+    // config ever learns what clap looks like.
+    let Some(mut args) = crate::config::parse_env_args()? else { return Ok(()) };
     // Settings is the layer between persisted preferences and vendor defaults.
     // We fold its active profile into `args` here so `build_config` (which
     // only reads args) sees a fully-resolved request. The chain is
@@ -151,186 +143,6 @@ pub async fn run() -> Result<()> {
     let hub = Hub::spawn(&workspace, user_mcp.as_ref());
     run_with_hub(args, cfg, ctx, hub, agents_ctx).await
 }
-
-// ---- cli -------------------------------------------------------------------
-
-/// The argv grammar: top-level subcommands for `login` / `list` / `resume`,
-/// and a flat flag set for the default invocation (one-shot or REPL).
-/// clap does the parsing; `args_from_cli` flattens it back into the
-/// internal [`Args`] shape so the rest of the binary never learns
-/// what clap looks like.
-#[derive(Parser, Debug)]
-#[command(name = "jingwei", disable_help_flag = true, disable_version_flag = true)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Cmd>,
-
-    // connection
-    #[arg(long)] api_key: Option<String>,
-    #[arg(long)] base_url: Option<String>,
-    #[arg(short = 'm', long)] model: Option<String>,
-    #[arg(long)] protocol: Option<String>,
-
-    // behavior
-    #[arg(long)] cache: Option<String>,
-    #[arg(long)] thinking: Option<String>,
-    #[arg(long)] effort: Option<String>,
-    #[arg(long)] max_tokens: Option<String>,
-    #[arg(long)] context_size: Option<String>,
-    #[arg(long)] max_turns: Option<String>,
-    #[arg(short = 's', long)] stream: bool,
-    #[arg(short = 'S', long)] no_stream: bool,
-
-    // sessions
-    #[arg(short = 'c', long)] r#continue: bool,
-    /// Resume a session by id prefix. Bare `--resume` is like `-c`.
-    /// clap's `Option<Option<String>>` idiom: outer `Some` means "flag
-    /// present", inner `Some` means "value given".
-    #[arg(long, num_args = 0..=1, default_missing_value = "")]
-    resume: Option<Option<String>>,
-    /// List this project's saved sessions.
-    #[arg(long)] list: bool,
-    /// With `--list`, list every project's sessions.
-    #[arg(long)] all: bool,
-
-    /// Skip AGENTS.md discovery entirely. The agent runs with no
-    /// project conventions loaded — for paranoid sessions, or when
-    /// the repo's AGENTS.md is known to be stale or misleading.
-    #[arg(long)] no_agents_md: bool,
-
-    // prompt — everything else, captured verbatim. clap's
-    // `trailing_var_arg` lets the prompt begin after `--`, so users
-    // who want to send `--help` as a literal task can still do so.
-    #[arg(trailing_var_arg = true)]
-    prompt: Vec<String>,
-
-    // -h / --help: clap's auto-generated help is disabled in favour
-    // of the hand-written one in config::HELP (lists every vendor by
-    // name and reads the same to a first-time user as the README).
-    #[arg(short = 'h', long, action = clap::ArgAction::SetTrue)]
-    help: bool,
-}
-
-#[derive(Subcommand, Debug)]
-enum Cmd {
-    /// Set up providers / api keys / active model.
-    Login {
-        #[arg(long)] show: bool,
-        #[arg(long)] reset: bool,
-        #[arg(long)] reveal: bool,
-    },
-    /// List sessions for this project.
-    List {
-        #[arg(long)] all: bool,
-    },
-    /// Resume a session by id prefix; bare `resume` is like `-c`.
-    Resume {
-        id: Option<String>,
-    },
-}
-
-/// Translate [`Cli`] into the internal [`Args`] shape. Subcommands are
-/// mapped onto `Args.resume` / `Args.cont` / `Args.list`; numeric flags
-/// stay as strings here and parse later. Bare `--resume` and
-/// `--resume <id>` both funnel through the same path.
-fn args_from_cli(c: Cli) -> Result<Args> {
-    let mut a = Args {
-        streaming: true,
-        ..Default::default()
-    };
-    if c.command.is_some() { a.list = false; } // subcommands carry their own intent
-    match c.command {
-        Some(Cmd::Login { show, reset, reveal }) => {
-            crate::login::run(show, reset, reveal)?;
-            std::process::exit(0);
-        }
-        Some(Cmd::List { all }) => {
-            a.list = true;
-            a.all = all;
-            return Ok(a);
-        }
-        Some(Cmd::Resume { id }) => resume_into(&mut a, id),
-        None => {
-            // the default invocation — copy flags into Args
-            a.api_key = c.api_key;
-            a.base_url = c.base_url;
-            a.model = c.model;
-            a.protocol = c.protocol;
-            a.cache = c.cache;
-            a.thinking = c.thinking;
-            a.effort = c.effort;
-            // numeric flags stay as strings here so a parse error gets the
-            // same message text build_config would produce later
-            a.max_tokens = parse_num_flag("--max-tokens", c.max_tokens)?;
-            a.context_size = parse_num_flag("--context-size", c.context_size)?;
-            a.max_turns = parse_num_flag("--max-turns", c.max_turns)?;
-            if c.no_stream { a.streaming = false; }
-            if let Some(r) = c.resume {
-                resume_into(&mut a, r);
-            }
-            a.cont |= c.r#continue;
-            a.list = c.list;
-            a.all = c.all;
-            a.prompt = c.prompt;
-            a.no_agents_md = c.no_agents_md;
-        }
-    }
-    Ok(a)
-}
-
-/// Both the subcommand arm (`resume <id>`) and the flag arm (`--resume [id]`)
-/// spell the same rule: a non-empty value is the id, anything else is
-/// "the newest session" (`cont`).
-fn resume_into(a: &mut Args, id: Option<String>) {
-    match id {
-        Some(s) if !s.is_empty() => a.resume = Some(s),
-        _ => a.cont = true,
-    }
-}
-
-/// Parse a numeric flag, naming the flag in the error so the user can
-/// tell which one rejected its value.
-fn parse_num_flag<T: std::str::FromStr>(flag: &str, raw: Option<String>) -> Result<Option<T>>
-where T::Err: std::fmt::Display {
-    match raw {
-        None => Ok(None),
-        Some(s) => s.parse::<T>().map(Some).map_err(|_| Error::Msg(format!("{flag} expects a number"))),
-    }
-}
-
-/// Test-only entrypoint: parse an argv slice (no leading program name)
-/// and yield the internal [`Args`] the same way `run()` does. Used by
-/// `config::tests` to exercise the resolver without spinning up clap
-/// from inside `config.rs`.
-#[cfg(test)]
-pub(crate) fn parse_argv(argv: &[&str]) -> Result<Args> {
-    let mut full = vec!["jingwei".to_string()];
-    full.extend(argv.iter().cloned().map(str::to_string));
-    // `try_parse_from` returns `Err(clap::Error)`. We pull a short
-    // summary from it so the message that ends up in `Error::Msg`
-    // names the bad token when clap can.
-    let cli = Cli::try_parse_from(full)
-        .map_err(|e| Error::Msg(short_clap_err(&e)))?;
-    args_from_cli(cli)
-}
-
-/// Reduce a clap error to a single line that mentions the offending
-/// argument when clap can identify one. Long help blocks the user
-/// cannot easily scroll past.
-fn short_clap_err(e: &clap::Error) -> String {
-    use clap::error::{ContextKind, ContextValue};
-    let mut bad = None;
-    for (kind, val) in e.context() {
-        if matches!(kind, ContextKind::InvalidArg) { if let ContextValue::String(s) = val { bad = Some(s.clone()); } }
-    }
-    match (e.kind(), bad) {
-        (clap::error::ErrorKind::UnknownArgument, Some(a)) => format!("unknown flag: {a}\ntry --help"),
-        (_, Some(a)) => format!("invalid argument {a}: {e}"),
-        (_, None) => e.to_string(),
-    }
-}
-
-
 
 /// The rest of `run` after the hub is spawned. The TUI and plain REPL take
 /// the hub by value (it is `Clone` — handing a clone is a clone of an
@@ -454,104 +266,7 @@ fn begin_session(args: &Args, cfg: &Config, interactive: bool) -> Result<(sessio
 /// binary never touches it.
 #[cfg(test)]
 mod tests {
-    #![allow(unused_imports)]
     use super::*;
-    use crate::api::{Protocol, CacheMode, Thinking};
-    use crate::config::{Args, DEFAULT_CONTEXT_SIZE, DEFAULT_MAX_TURNS};
-
-    // ---- flags & config ----
-
-    fn flags(list: &[&str]) -> Result<Args> { crate::parse_argv(list) }
-
-    #[test]
-    fn flags_parse_and_validate() {
-        let a = flags(&["--base-url", "https://x/v1", "--api-key", "k", "-m", "m1",
-            "--protocol", "zai", "--cache", "auto", "--thinking", "strip",
-            "--max-tokens", "4096", "--context-size", "100000", "--max-turns", "5",
-            "-S", "do", "stuff"]).unwrap();
-        assert_eq!(a.prompt, vec!["do", "stuff"]);
-        assert!(!a.streaming);
-        let cfg = build_config(&a).unwrap();
-        assert_eq!(cfg.protocol, Protocol::ZAI);
-        assert_eq!(cfg.cache, CacheMode::Auto);
-        assert_eq!(cfg.thinking, Thinking::Strip);
-        assert_eq!(cfg.max_tokens, 4096);
-        assert_eq!(cfg.context_size, 100000);
-        assert_eq!(cfg.max_turns, 5);
-        // --max-turns defaults and rejects 0 / garbage
-        let default = build_config(&flags(&["--api-key", "k", "--base-url", "https://x", "-m", "m"]).unwrap()).unwrap();
-        assert_eq!(default.max_turns, crate::config::DEFAULT_MAX_TURNS);
-        assert_eq!(default.max_tokens, crate::config::DEFAULT_MAX_TOKENS);
-        assert_eq!(default.context_size, crate::config::DEFAULT_CONTEXT_SIZE);
-        assert!(build_config(&flags(&["--api-key", "k", "--base-url", "https://x", "-m", "m",
-            "--max-turns", "0"]).unwrap()).is_err());
-        // active cache belongs to the Messages wire — the chat-completions
-        // vendors reject it in their own words
-        assert!(build_config(&flags(&["--api-key", "k", "--base-url", "https://x", "-m", "m",
-            "--protocol", "zai", "--cache", "active"]).unwrap()).is_err());
-        // required fields — and the one vendor that names its own endpoint
-        // and flagship: a key alone is a whole config
-        assert!(build_config(&flags(&[]).unwrap()).is_err());
-        let bare = build_config(&flags(&["--api-key", "k"]).unwrap()).unwrap();
-        assert_eq!((bare.protocol_label(), bare.base_url.as_str(), bare.model.as_str()),
-            ("minimax", "https://api.minimax.cn/anthropic", "MiniMax-M3"));
-        // every vendor names its endpoint now, but deepseek leaves the
-        // model to the user — flash or pro is a choice, not a default
-        assert!(build_config(&flags(&["--api-key", "k", "--protocol", "deepseek"]).unwrap()).is_err());
-        // bad flags
-        assert!(flags(&["--nope"]).is_err());
-        assert!(flags(&["--max-tokens", "abc"]).is_err());
-        assert!(flags(&["--max-turns", "abc"]).is_err());
-        assert!(flags(&["--base-url"]).is_err());
-        assert!(flags(&["--context-size"]).is_err());
-        assert!(flags(&["-s"]).unwrap().streaming); // -s is the explicit default
-    }
-
-    #[test]
-    fn session_flags_parse_with_optional_resume_value() {
-        // -c and a bare --resume both mean "the newest session"
-        assert!(flags(&["-c"]).unwrap().resuming());
-        assert!(flags(&["--continue"]).unwrap().resuming());
-        assert!(flags(&["--resume"]).unwrap().resuming());
-        assert_eq!(flags(&["--resume"]).unwrap().resume, None);
-        // a value is an id-prefix selector
-        assert_eq!(flags(&["--resume", "20250916"]).unwrap().resume.as_deref(), Some("20250916"));
-        // the optional value never swallows a flag that follows it
-        let a = flags(&["--resume", "--model", "m"]).unwrap();
-        assert_eq!(a.resume, None);
-        assert_eq!(a.model.as_deref(), Some("m"));
-        // --list is a mode of its own
-        assert!(flags(&["--list"]).unwrap().list);
-        assert!(!flags(&["--list"]).unwrap().resuming());
-        assert!(!flags(&["task", "words"]).unwrap().resuming(), "a task alone resumes nothing");
-    }
-
-    #[test]
-    fn enum_flags_case_insensitive_and_list_available_values() {
-        let parse = |extra: &[&str]| {
-            let mut argv: Vec<&str> = vec!["--api-key", "k", "--base-url", "https://x", "-m", "m"];
-            argv.extend_from_slice(extra);
-            crate::parse_argv(&argv).unwrap()
-        };
-        // spellings are case-insensitive in every position
-        assert_eq!(build_config(&parse(&["--protocol", "ZAI"])).unwrap().protocol, Protocol::ZAI);
-        let cfg = build_config(&parse(&["--cache", "Active", "--thinking", "STRIP"])).unwrap();
-        assert_eq!(cfg.cache, CacheMode::Active);
-        assert_eq!(cfg.thinking, Thinking::Strip);
-        // an unknown value names the flag and lists what is accepted
-        let err = match build_config(&parse(&["--cache", "turbo"])) {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("--cache turbo should be rejected"),
-        };
-        assert!(err.contains("invalid cache 'turbo'"), "got: {err}");
-        assert!(err.contains("auto, active"), "got: {err}");
-    }
-
-    // ---- zai vendor: dialect conversion ----
-
-    // ---- api over local mocks ----
-
-    // ---- deepseek vendor ----
 
     #[test]
     fn error_display() {
