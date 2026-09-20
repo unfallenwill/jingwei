@@ -300,7 +300,7 @@ mod tests {
             r#"data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}"#, "\n\n",
             r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
             r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answ"}}"#, "\n\n");
-        let port = mock_stall(tool, stalled);
+        let (port, stalled_written) = mock_stall(tool, stalled);
         let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
         let mut turn = Turn::new(0);
         let err = block_on(async {
@@ -308,8 +308,17 @@ mod tests {
             let mut cx = crate::test_util::ctx();
             let token = Arc::new(CancelToken::new());
             let t = token.clone();
+            // Cancel only once the mock has actually written the stalled
+            // bytes — the interruption then provably lands mid-stream,
+            // whatever the scheduler is doing with the other 487 tests.
+            // (A fixed 400ms delay raced the stall setup and flaked under
+            // parallel load; this waits for the fact, not the clock.)
             tokio::task::spawn_blocking(move || {
-                std::thread::sleep(std::time::Duration::from_millis(400));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !stalled_written.load(std::sync::atomic::Ordering::SeqCst) {
+                    if std::time::Instant::now() > deadline { panic!("mock never wrote the stalled response"); }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
                 t.cancel();
             });
             let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), true), &mut cx, &mut history, &mut turn, &token, &hub, &sink()).await;

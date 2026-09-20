@@ -155,19 +155,27 @@ pub(crate) fn mock_seq(responses: Vec<(u16, String)>) -> (u16, Arc<Mutex<Vec<Str
 /// consumer sits on an open connection waiting for content that never
 /// arrives. The test cancels from outside to land the wedge test exactly.
 #[cfg(test)]
-pub(crate) fn mock_stall(first: &'static str, stalled: &'static str) -> u16 {
+/// Like [`mock_seq`] but the second response stalls: the head and the
+/// given events are written, then the connection is *held open* — the
+/// client waits for content that never arrives. Returns the port plus a
+/// flag that turns true once the stalled bytes are on the wire, so a
+/// cancellation test can wait for the exact moment to interrupt instead
+/// of racing a fixed delay against scheduler load.
+pub(crate) fn mock_stall(first: &'static str, stalled: &'static str) -> (u16, std::sync::Arc<std::sync::atomic::AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let stalled_written = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stalled_written.clone();
     std::thread::spawn(move || {
         for (i, body) in [first, stalled].into_iter().enumerate() {
             let Ok((mut s, _)) = listener.accept() else { return };
             let mut buf = [0u8; 8192];
             let _ = s.read(&mut buf);
             // The first response is complete (Content-Length set, Connection
-            // close); the second is *deliberately* open-ended — no
-            // Content-Length, no Connection: close — and the thread sleeps
-            // so the client sits on the stream waiting for content that
-            // never arrives. Cancellation races against this wait.
+            // close); the second is open-ended — no Content-Length — and the
+            // thread sleeps so the client sits on the stream waiting for
+            // content that never arrives. Cancellation lands against this
+            // wait.
             let head = if i == 0 {
                 format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
             } else {
@@ -176,12 +184,26 @@ pub(crate) fn mock_stall(first: &'static str, stalled: &'static str) -> u16 {
             let _ = s.write_all(head.as_bytes());
             let _ = s.write_all(body.as_bytes());
             let _ = s.flush();
-            if i == 1 {
+            if i == 0 {
+                // Drain until the client closes: dropping the socket while
+                // the client may still be reading (or still writing its
+                // request) races a reset into its stream — the flake this
+                // guard exists for. EOF is the client's move, not ours.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while std::time::Instant::now() < deadline {
+                    match s.read(&mut buf) {
+                        Ok(0) => break,
+                        Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            } else {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_secs(10));
             }
         }
     });
-    port
+    (port, stalled_written)
 }
 
 #[cfg(test)]
