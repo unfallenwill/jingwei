@@ -7,7 +7,10 @@ use std::process::{Command, Stdio};
 fn spawn_repl() -> std::process::Child {
     let bin = env!("CARGO_BIN_EXE_jingwei");
     // Sessions live under the home directory — sandbox it so the test
-    // never touches the real one.
+    // never touches the real one. The cwd is sandboxed for the same
+    // reason: the hub reads `<cwd>/.mcp.json`, and without this the
+    // test would spawn the *repo's* real MCP servers (npx, network,
+    // npm cache) on every run — the opposite of hermetic.
     let mut home = std::env::temp_dir();
     home.push(format!("jingwei_repl_it_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
@@ -15,6 +18,7 @@ fn spawn_repl() -> std::process::Child {
     Command::new(bin)
         .env("HOME", &home)
         .env("USERPROFILE", &home)
+        .current_dir(&home)
         .args(["--api-key", "dummy", "--base-url", "http://127.0.0.1:1", "-m", "dummy"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
