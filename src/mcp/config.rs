@@ -284,18 +284,13 @@ mod tests {
         read("test", &raw, &mut warnings)
     }
 
-    /// Take the process-wide environment lock. Tests that move the environment
-    /// under it share one lock so they cannot race each other.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     /// The environment the expansion tests read: the lock is held for as long
     /// as the guard lives, because the process has one environment and a test
-    /// that moved it under another test's feet would be a flake.
+    /// that moved it under another test's feet would be a flake. The lock is
+    /// [`crate::test_util::env_lock`] — the one every module's env-mutating
+    /// tests share.
     fn expansion_env() -> std::sync::MutexGuard<'static, ()> {
-        let guard = env_lock();
+        let guard = crate::test_util::env_lock();
         unsafe {
             std::env::set_var("MCP_TOKEN", "token");
             std::env::remove_var("MCP_NOPE");
@@ -506,7 +501,7 @@ mod tests {
 
     #[test]
     fn the_two_files_are_merged_with_the_project_winning() {
-        let _g = env_lock();
+        let _g = crate::test_util::env_lock();
         // `user` is the contents of `~/.jingwei/mcp.json`, already read by the
         // binary; `project` is the raw `.mcp.json` body. Both carry their
         // servers under `mcpServers` (the shape every MCP client writes).
@@ -541,7 +536,7 @@ mod tests {
 
     #[test]
     fn no_files_is_no_servers() {
-        let _g = env_lock();
+        let _g = crate::test_util::env_lock();
         let (found, warnings) = files(None, None);
         assert!(found.is_empty());
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -549,7 +544,7 @@ mod tests {
 
     #[test]
     fn a_workspace_mcp_json_that_cannot_be_read_is_a_warning_rather_than_an_error() {
-        let _g = env_lock();
+        let _g = crate::test_util::env_lock();
         let workspace = workspace();
         std::fs::write(workspace.join(".mcp.json"), "{ also not json").unwrap();
         let (found, warnings) = entries(&workspace, None);
@@ -561,7 +556,7 @@ mod tests {
 
     #[test]
     fn a_table_that_is_not_a_table_is_a_warning() {
-        let _g = env_lock();
+        let _g = crate::test_util::env_lock();
         // `user_settings` is the contents of `~/.jingwei/mcp.json`; a list
         // rather than an object is the table-that-is-not-a-table the warning
         // catches.
@@ -573,7 +568,7 @@ mod tests {
 
     #[test]
     fn a_flat_workspace_table_is_read_as_no_servers_with_a_warning() {
-        let _g = env_lock();
+        let _g = crate::test_util::env_lock();
         // A file that writes the servers as top-level keys (jingwei's old
         // shape, before the project adopted the community one) is read as
         // having no servers. The warning names the file and says what to
@@ -593,7 +588,7 @@ mod tests {
 
     #[test]
     fn an_entry_that_cannot_be_used_is_kept_as_the_reason() {
-        let _g = env_lock();
+        let _g = crate::test_util::env_lock();
         let (found, _) = files(
             Some(json!({
                 "mcpServers": {
@@ -612,7 +607,7 @@ mod tests {
 
     #[test]
     fn an_entry_with_no_name_is_skipped() {
-        let _g = env_lock();
+        let _g = crate::test_util::env_lock();
         let (found, warnings) = files(
             Some(json!({
                 "mcpServers": {" ": {"command": "npx"}}
@@ -631,7 +626,7 @@ mod tests {
     /// warning that names the file and the missing key.
     #[test]
     fn a_workspace_file_in_the_community_shape_lists_its_servers() {
-        let _g = env_lock();
+        let _g = crate::test_util::env_lock();
         let (found, warnings) = files(
             None,
             Some(json!({
@@ -660,7 +655,7 @@ mod tests {
 
     #[test]
     fn a_user_file_in_the_community_shape_is_just_as_welcome() {
-        let _g = env_lock();
+        let _g = crate::test_util::env_lock();
         let (found, warnings) = files(
             Some(json!({
                 "mcpServers": {
@@ -677,7 +672,7 @@ mod tests {
 
     #[test]
     fn an_empty_object_is_a_file_with_no_servers_and_no_warning() {
-        let _g = env_lock();
+        let _g = crate::test_util::env_lock();
         // `{}` is a syntactically valid MCP config: there are no servers.
         // A warning would be noise — the user wrote exactly what they meant.
         let (found, warnings) = files(Some(json!({})), None);
@@ -687,7 +682,7 @@ mod tests {
 
     #[test]
     fn extra_keys_alongside_mcp_servers_are_silently_ignored() {
-        let _g = env_lock();
+        let _g = crate::test_util::env_lock();
         // A file that carries `mcpServers` and a few stray fields (say,
         // a `metadata` block a future client might add) still works: only
         // `mcpServers` is read. No warning for the extras — they are not
@@ -708,7 +703,7 @@ mod tests {
 
     #[test]
     fn an_mcp_servers_value_that_is_not_an_object_is_reported_as_such() {
-        let _g = env_lock();
+        let _g = crate::test_util::env_lock();
         // A file that writes `{"mcpServers": null}` (or an array, or a
         // string) has a server table that is not a table — the warning
         // names the file and the value's kind so the user can see the
@@ -736,7 +731,7 @@ mod tests {
 
     #[test]
     fn the_project_winning_rule_holds_inside_mcp_servers() {
-        let _g = env_lock();
+        let _g = crate::test_util::env_lock();
         // Both files are written in the community shape. The project
         // still wins for a shared name — the `mcpServers` wrapping does
         // not change which file is more specific.
