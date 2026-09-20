@@ -1,0 +1,75 @@
+%% jingwei's module dependency graph, after the cluster regrouping.
+%% Render me: paste into https://mermaid.live (or `mmdc -i jingwei-deps.mmd`).
+%% The enforced contract is tests/architecture.rs; this picture is the tour.
+%% Rule: dependencies point downward only. The ui port sits at the bottom
+%% (everything emits through it); its adapters sit at the top (nothing may
+%% depend on a frontend).
+
+flowchart TD
+    subgraph L5["L5 — composition"]
+        bin["main.rs — the thin binary"]
+        lib["lib.rs — run, Error, the composition root"]
+        loop_["core::agent — the agent loop"]
+        plain["ui::plain — the log adapter"]
+        tui["ui::tui — the terminal adapter"]
+    end
+
+    subgraph L4["L4 — the model port"]
+        api["api — transport, retry, policy<br/>(minimax · zai · deepseek)"]
+    end
+
+    subgraph L3["L3 — wishes & effects"]
+        config["config — argv grammar, resolver<br/>(settings · login)"]
+        context["core::context — system text,<br/>reminders, tool list, trim"]
+        tools["tools — the registry<br/>(edit · ledger · runtime)"]
+        mcp["mcp — external servers' tools<br/>(client · http · stdio · wire · config · health)"]
+    end
+
+    subgraph L1["L1 — infra primitives"]
+        cancel["cancel — the Ctrl-C token"]
+        fileio["file_io — atomic writes"]
+        agentsmd["core::agents_md —<br/>convention discovery"]
+        reminder["core::reminder —<br/>in-band system reminders"]
+    end
+
+    subgraph L0["L0 — data & ports"]
+        ir["core::ir — the conversation<br/>language + user_message"]
+        session["core::session — persistence"]
+        turn["core::turn — run state machine"]
+        uip["ui — the output port<br/>(Msg · Sev · Show · paint)"]
+        format["format — bytes & width"]
+    end
+
+    bin --> lib
+    lib --> loop_
+    lib --> plain
+    lib --> tui
+    lib --> config
+    lib --> mcp
+
+    loop_ --> api
+    loop_ --> tools
+    loop_ --> context
+    loop_ --> uip
+    tui --> api
+    tui --> config
+
+    api --> context
+    api --> config
+    api --> uip
+    api --> ir
+
+    context --> ir
+    context --> tools
+    context --> mcp
+    context --> reminder
+    context --> agentsmd
+
+    tools --> uip
+    tools --> fileio
+    mcp --> cancel
+
+    session --> ir
+    session --> format
+    turn --> session
+    agentsmd --> ir
