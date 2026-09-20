@@ -114,20 +114,24 @@ fn default_model_for(protocol: &str) -> Option<&'static str> {
     parse_pick(protocol).and_then(|(_, p)| p.default_model())
 }
 
+/// Print `prompt` (with the bracketed `hint`, when non-empty) and read
+/// one line from `input`, trimmed. The two ask-variants decide what an
+/// empty line means: a default or a skip.
+fn prompt_line(output: &mut dyn Write, input: &mut dyn BufRead, prompt: &str, hint: Option<&str>) -> Result<String> {
+    let suffix = match hint { Some(h) if !h.is_empty() => format!(" [{h}]"), _ => String::new() };
+    write!(output, "{prompt}{suffix}: ")?;
+    output.flush()?;
+    let mut buf = String::new();
+    input.read_line(&mut buf).map_err(|e| Error::Msg(format!("read: {e}")))?;
+    Ok(buf.trim().to_string())
+}
+
 /// Print `prompt` with an optional `default` and read a line from
 /// `input`. Returns the trimmed value, or the default if the line is
 /// empty. An *empty* default and an *empty* line collapse to `None`
 /// at the call site — useful for "press Enter to skip".
 fn ask(output: &mut dyn Write, input: &mut dyn BufRead, prompt: &str, default: Option<&str>) -> Result<String> {
-    let suffix = match default {
-        Some(d) if !d.is_empty() => format!(" [{d}]"),
-        _ => String::new(),
-    };
-    write!(output, "{prompt}{suffix}: ")?;
-    output.flush()?;
-    let mut buf = String::new();
-    input.read_line(&mut buf).map_err(|e| Error::Msg(format!("read: {e}")))?;
-    let line = buf.trim().to_string();
+    let line = prompt_line(output, input, prompt, default)?;
     Ok(if line.is_empty() { default.unwrap_or("").to_string() } else { line })
 }
 
@@ -136,15 +140,7 @@ fn ask(output: &mut dyn Write, input: &mut dyn BufRead, prompt: &str, default: O
 /// gesture). The optional `hint` is shown in brackets for context
 /// ("base URL [https://api.x]") but does not auto-fill.
 fn ask_optional(output: &mut dyn Write, input: &mut dyn BufRead, prompt: &str, hint: Option<&str>) -> Result<Option<String>> {
-    let suffix = match hint {
-        Some(h) if !h.is_empty() => format!(" [{h}]"),
-        _ => String::new(),
-    };
-    write!(output, "{prompt}{suffix}: ")?;
-    output.flush()?;
-    let mut buf = String::new();
-    input.read_line(&mut buf).map_err(|e| Error::Msg(format!("read: {e}")))?;
-    let line = buf.trim().to_string();
+    let line = prompt_line(output, input, prompt, hint)?;
     Ok(if line.is_empty() { None } else { Some(line) })
 }
 
@@ -168,10 +164,10 @@ fn ask_secret_api_key(output: &mut dyn Write, input: &mut dyn BufRead, prompt: &
         use std::os::unix::io::AsRawFd;
         let fd = io::stdin().as_raw_fd();
         // piped / redirected stdin: tcgetattr fails with ENOTTY → fall through
-        if unsafe { turn_echo_off(fd) }.is_ok() {
+        if unsafe { set_echo(fd, false) }.is_ok() {
             let mut buf = String::new();
             let res = input.read_line(&mut buf);
-            let _ = unsafe { turn_echo_on(fd) };
+            let _ = unsafe { set_echo(fd, true) };
             println!();
             return res.map(|_| buf.trim().to_string()).map_err(|e| Error::Msg(format!("read: {e}")));
         }
@@ -186,15 +182,11 @@ fn ask_secret_api_key(output: &mut dyn Write, input: &mut dyn BufRead, prompt: &
     // In tests we drive the wizard with a Cursor over a script of
     // inputs — the real Stdin is irrelevant. Skip the termios dance
     // entirely and read straight off the supplied `input`.
-    write!(output, "{prompt}: ")?;
-    output.flush()?;
-    let mut buf = String::new();
-    input.read_line(&mut buf).map_err(|e| Error::Msg(format!("read: {e}")))?;
-    Ok(buf.trim().to_string())
+    prompt_line(output, input, prompt, None)
 }
 
 #[cfg(all(unix, not(test)))]
-unsafe fn turn_echo_off(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+unsafe fn set_echo(fd: std::os::unix::io::RawFd, on: bool) -> std::io::Result<()> {
     // termios magic numbers — ECHO is bit 0o10 on the local-mode word
     extern "C" { fn tcgetattr(fd: i32, termios: *mut Termios) -> i32; fn tcsetattr(fd: i32, when: i32, termios: *const Termios) -> i32; }
     static TCSAFLUSH: i32 = 2;
@@ -206,24 +198,7 @@ unsafe fn turn_echo_off(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
     }
     let mut t = Termios::default();
     if tcgetattr(fd, &mut t) != 0 { return Err(std::io::Error::last_os_error()); }
-    t.c_lflag &= !0o10u32; // clear ECHO
-    if tcsetattr(fd, TCSAFLUSH, &t) != 0 { return Err(std::io::Error::last_os_error()); }
-    Ok(())
-}
-
-#[cfg(all(unix, not(test)))]
-unsafe fn turn_echo_on(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
-    extern "C" { fn tcgetattr(fd: i32, termios: *mut Termios) -> i32; fn tcsetattr(fd: i32, when: i32, termios: *const Termios) -> i32; }
-    static TCSAFLUSH: i32 = 2;
-    #[repr(C)]
-    #[derive(Default, Clone, Copy)]
-    struct Termios {
-        c_iflag: u32, c_oflag: u32, c_cflag: u32, c_lflag: u32,
-        c_line: u8, c_cc: [u8; 32], c_ispeed: u32, c_ospeed: u32,
-    }
-    let mut t = Termios::default();
-    if tcgetattr(fd, &mut t) != 0 { return Err(std::io::Error::last_os_error()); }
-    t.c_lflag |= 0o10u32; // set ECHO
+    if on { t.c_lflag |= 0o10u32 } else { t.c_lflag &= !0o10u32 } // set / clear ECHO
     if tcsetattr(fd, TCSAFLUSH, &t) != 0 { return Err(std::io::Error::last_os_error()); }
     Ok(())
 }
