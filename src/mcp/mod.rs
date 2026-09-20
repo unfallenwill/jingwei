@@ -86,25 +86,25 @@ enum Command {
     List {
         reply: oneshot::Sender<Vec<ServerStatus>>,
     },
-    Enable {
-        name: String,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
-    Disable {
-        name: String,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
-    Reconnect {
-        name: String,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
-    Disconnect {
+    ServerOp {
+        op: ServerOp,
         name: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
+}
+
+/// The four ways to change one server's state — one variant because the
+/// four are one fact with four words: each takes a name, each answers
+/// `Result<(), String>`, and the actor spells the quartet exactly once.
+#[derive(Clone, Copy)]
+enum ServerOp {
+    Enable,
+    Disable,
+    Reconnect,
+    Disconnect,
 }
 
 /// A handle to the hub's actor task.
@@ -120,6 +120,36 @@ pub struct Hub {
 }
 
 impl Hub {
+    /// One ask-reply round trip — the whole of every method below: build
+    /// the command around a fresh reply channel, send it, await the
+    /// actor's answer. `shut` is what the caller sees when the mailbox is
+    /// closed (the actor is gone); `dropped` when the reply never arrives
+    /// (the actor died mid-command). Every public method is one `ask`
+    /// plus its two fallback answers.
+    async fn ask<R>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<R>) -> Command,
+        shut: impl FnOnce() -> R,
+        dropped: impl FnOnce() -> R,
+    ) -> R {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(build(reply)).await.is_err() {
+            return shut();
+        }
+        rx.await.unwrap_or_else(|_| dropped())
+    }
+
+    /// The four `ServerOp` verbs share everything but their name — one
+    /// spelling here, four one-line methods below.
+    async fn server_op(&self, op: ServerOp, name: &str) -> Result<(), String> {
+        self.ask(
+            |reply| Command::ServerOp { op, name: name.to_string(), reply },
+            || Err("mcp hub is shut down".into()),
+            || Err("mcp hub dropped the reply".into()),
+        )
+        .await
+    }
+
     /// A hub with no servers behind it. The actor task is started up at once
     /// and answers every call as though no server were configured: the
     /// "unknown tool" message is the only thing the model ever sees.
@@ -167,62 +197,37 @@ impl Hub {
     /// One tool call, answered with the text the model reads. Never fails —
     /// see the module-level third decision.
     pub async fn call(&self, tool: &str, args: &str) -> String {
-        let (reply, rx) = oneshot::channel();
-        if self
-            .tx
-            .send(Command::Call {
-                tool: tool.to_string(),
-                args: args.to_string(),
-                reply,
-            })
-            .await
-            .is_err()
-        {
-            return "error: mcp hub is shut down".into();
-        }
-        rx.await
-            .unwrap_or_else(|_| "error: mcp hub dropped the reply".into())
+        self.ask(
+            |reply| Command::Call { tool: tool.to_string(), args: args.to_string(), reply },
+            || "error: mcp hub is shut down".into(),
+            || "error: mcp hub dropped the reply".into(),
+        )
+        .await
     }
 
     /// The tools currently offered to the model. Each entry is the
     /// wire-shaped JSON object (`{name, description, input_schema}`) the
     /// agent loop appends to its schemas list as-is.
     pub async fn definitions(&self) -> Vec<Value> {
-        let (reply, rx) = oneshot::channel();
-        if self.tx.send(Command::Definitions { reply }).await.is_err() {
-            return Vec::new();
-        }
-        rx.await.unwrap_or_default()
+        self.ask(|reply| Command::Definitions { reply }, Vec::new, Vec::new).await
     }
 
     /// What the session says about MCP when it starts: one line per server
     /// that came up, one per server that did not, and the warnings picked up
     /// along the way.
     pub async fn notes(&self) -> Vec<String> {
-        let (reply, rx) = oneshot::channel();
-        if self.tx.send(Command::Notes { reply }).await.is_err() {
-            return Vec::new();
-        }
-        rx.await.unwrap_or_default()
+        self.ask(|reply| Command::Notes { reply }, Vec::new, Vec::new).await
     }
 
     /// What `/mcp` prints: every server, what it offers, and what is wrong.
     pub async fn report(&self) -> Vec<String> {
-        let (reply, rx) = oneshot::channel();
-        if self.tx.send(Command::Report { reply }).await.is_err() {
-            return Vec::new();
-        }
-        rx.await.unwrap_or_default()
+        self.ask(|reply| Command::Report { reply }, Vec::new, Vec::new).await
     }
 
     /// One row per server, with the state it stands in and how many of its
     /// tools are being offered. What `/mcp list` prints.
     pub async fn list(&self) -> Vec<ServerStatus> {
-        let (reply, rx) = oneshot::channel();
-        if self.tx.send(Command::List { reply }).await.is_err() {
-            return Vec::new();
-        }
-        rx.await.unwrap_or_default()
+        self.ask(|reply| Command::List { reply }, Vec::new, Vec::new).await
     }
 
     /// Bring a `Disabled` server back online: open a fresh connection with
@@ -230,79 +235,27 @@ impl Hub {
     /// Errors out if the server is in any other state (`Ready`, `Failed`,
     /// `Disconnected`) or is not configured.
     pub async fn enable(&self, name: &str) -> Result<(), String> {
-        let (reply, rx) = oneshot::channel();
-        if self
-            .tx
-            .send(Command::Enable {
-                name: name.to_string(),
-                reply,
-            })
-            .await
-            .is_err()
-        {
-            return Err("mcp hub is shut down".into());
-        }
-        rx.await
-            .unwrap_or_else(|_| Err("mcp hub dropped the reply".into()))
+        self.server_op(ServerOp::Enable, name).await
     }
 
     /// Take a `Ready` server offline: close its connection and pull its
     /// tools out of the offered set. The configuration is kept so an
     /// `enable` can bring the server back.
     pub async fn disable(&self, name: &str) -> Result<(), String> {
-        let (reply, rx) = oneshot::channel();
-        if self
-            .tx
-            .send(Command::Disable {
-                name: name.to_string(),
-                reply,
-            })
-            .await
-            .is_err()
-        {
-            return Err("mcp hub is shut down".into());
-        }
-        rx.await
-            .unwrap_or_else(|_| Err("mcp hub dropped the reply".into()))
+        self.server_op(ServerOp::Disable, name).await
     }
 
     /// Reconnect a server in any state: close any live connection, then
     /// open a fresh one with the stored configuration.
     pub async fn reconnect(&self, name: &str) -> Result<(), String> {
-        let (reply, rx) = oneshot::channel();
-        if self
-            .tx
-            .send(Command::Reconnect {
-                name: name.to_string(),
-                reply,
-            })
-            .await
-            .is_err()
-        {
-            return Err("mcp hub is shut down".into());
-        }
-        rx.await
-            .unwrap_or_else(|_| Err("mcp hub dropped the reply".into()))
+        self.server_op(ServerOp::Reconnect, name).await
     }
 
     /// Close a `Ready` server's connection without touching its
     /// configuration. The server sits in `Disconnected` until `reconnect`
     /// brings it back.
     pub async fn disconnect(&self, name: &str) -> Result<(), String> {
-        let (reply, rx) = oneshot::channel();
-        if self
-            .tx
-            .send(Command::Disconnect {
-                name: name.to_string(),
-                reply,
-            })
-            .await
-            .is_err()
-        {
-            return Err("mcp hub is shut down".into());
-        }
-        rx.await
-            .unwrap_or_else(|_| Err("mcp hub dropped the reply".into()))
+        self.server_op(ServerOp::Disconnect, name).await
     }
 
     /// End every connection. Called by the binary at process exit so the
@@ -342,17 +295,14 @@ where
                 Command::List { reply } => {
                     let _ = reply.send(inner.list());
                 }
-                Command::Enable { name, reply } => {
-                    let _ = reply.send(inner.enable(&name).await);
-                }
-                Command::Disable { name, reply } => {
-                    let _ = reply.send(inner.disable(&name).await);
-                }
-                Command::Reconnect { name, reply } => {
-                    let _ = reply.send(inner.reconnect(&name).await);
-                }
-                Command::Disconnect { name, reply } => {
-                    let _ = reply.send(inner.disconnect(&name).await);
+                Command::ServerOp { op, name, reply } => {
+                    let out = match op {
+                        ServerOp::Enable => inner.enable(&name).await,
+                        ServerOp::Disable => inner.disable(&name).await,
+                        ServerOp::Reconnect => inner.reconnect(&name).await,
+                        ServerOp::Disconnect => inner.disconnect(&name).await,
+                    };
+                    let _ = reply.send(out);
                 }
                 Command::Shutdown { reply } => {
                     inner.shutdown_all().await;
