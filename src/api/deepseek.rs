@@ -7,8 +7,8 @@ use super::{chat_blocking, chat_messages, chat_streaming, chat_to_internal, chat
 use crate::cancel::CancelToken;
 use crate::config::Config;
 use crate::core::context::Context;
-use crate::display::Show;
-use crate::display::Usage;
+use crate::ui::Show;
+use crate::ui::Usage;
 use crate::core::ir::{Message, Response};
 use crate::Result;
 use serde_json::{json, Value};

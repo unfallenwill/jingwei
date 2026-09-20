@@ -14,7 +14,7 @@ mod edit;
 mod ledger;
 pub(crate) mod runtime;
 
-use crate::display::{Msg, Show};
+use crate::ui::{Msg, Show};
 use crate::file_io::write_atomic;
 use crate::tools::edit::edit_tool;
 use crate::tools::ledger::{ledger_note, stale};
@@ -294,7 +294,7 @@ mod tests {
     /// A sink that captures every Msg handed to it: the tests assert on
     /// the message the frontends would receive, not on a string.
     struct CapturingSink(std::sync::Mutex<Vec<Msg>>);
-    impl crate::display::Show for CapturingSink {
+    impl crate::ui::Show for CapturingSink {
         fn show(&self, m: Msg) { self.0.lock().unwrap().push(m); }
     }
 

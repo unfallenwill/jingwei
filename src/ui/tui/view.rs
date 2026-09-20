@@ -16,11 +16,11 @@
 //! because they are previews, not record: a row that rewrites itself every
 //! frame owes the pane a predictable shape, not the whole line.
 //!
-//! Styling honors [`crate::display::color_on`]: with NO_COLOR the same
+//! Styling honors [`crate::ui::color_on`]: with NO_COLOR the same
 //! structure renders without color, exactly like the plain frontend.
 
 use super::model::{App, Completion, Fold, Mode, Row, THINK_TAIL_SHOWN};
-use crate::display::{color_on, disp_width, elapsed_str, prompt_w, thought_folded, truncate_cols, wrap_cols, Usage, ERR_BG, FOLD_GUTTER, PROMPT_GUTTER, PROMPT_HEAD, WARN_BG};
+use crate::ui::{color_on, disp_width, elapsed_str, prompt_w, thought_folded, truncate_cols, wrap_cols, Usage, ERR_BG, FOLD_GUTTER, PROMPT_GUTTER, PROMPT_HEAD, WARN_BG};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -427,8 +427,8 @@ fn row_lines(row: &Row, w: usize, out: &mut Vec<Line<'static>>, lay: Lay) {
         }
         Row::Note(sev, text) => {
             let (bg, err) = match sev {
-                crate::display::Sev::Warn => (WARN_BG, false),
-                crate::display::Sev::Err => (ERR_BG, true),
+                crate::ui::Sev::Warn => (WARN_BG, false),
+                crate::ui::Sev::Err => (ERR_BG, true),
             };
             emit(out, text, w, lay, note_style(bg, err), vec![]);
         }
@@ -618,10 +618,10 @@ fn note_style(bg: (u8, u8, u8), err: bool) -> Style {
 #[cfg(test)]
 mod tests {
     use super::super::model::{App, CompletionItem, CompletionKind};
-    use crate::display::Usage;
+    use crate::ui::Usage;
     use super::super::update::{set_completion, dismiss_completion, update, Ev, Action};
     use super::*;
-    use crate::display::Msg;
+    use crate::ui::Msg;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, KeyEventKind, KeyEventState};
 
     /// The width bar_text was pinned against before it learned the pane's.
@@ -1119,7 +1119,7 @@ mod tests {
         let _env = crate::test_util::env_lock();
         std::env::set_var("NO_COLOR", "1");
         let mut a = App::new();
-        update(&mut a, Ev::Msg(Msg::Note { sev: crate::display::Sev::Err, text: "api 429".into() }));
+        update(&mut a, Ev::Msg(Msg::Note { sev: crate::ui::Sev::Err, text: "api 429".into() }));
         let row = flush_lines(&a, 60, 0).into_iter().find(|l| {
             l.spans.iter().any(|sp| sp.content.contains("api 429"))
         }).expect("error row rendered");

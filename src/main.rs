@@ -7,7 +7,7 @@
 // a process. If you are adding behavior, it almost certainly does not
 // belong in this file.
 
-use jingwei::display::{ERR_BG, paint};
+use jingwei::ui::{ERR_BG, paint};
 use jingwei::{run, Error};
 use std::time::Duration;
 

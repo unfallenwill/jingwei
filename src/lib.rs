@@ -15,17 +15,16 @@ mod api;
 mod cancel;
 mod config;
 mod core;
-/// The display port. `pub` because the thin binary renders its final
-/// error banner through the same vocabulary the frontends share.
-pub mod display;
 mod file_io;
 mod format;
 mod login;
 mod mcp;
-mod plain;
 mod settings;
 mod tools;
-mod tui;
+/// The ui port (this module's `mod.rs`) plus the two frontends that
+/// implement it. `pub` because the thin binary renders its final error
+/// banner through the same vocabulary the frontends share.
+pub mod ui;
 
 #[cfg(test)] mod test_util;
 use crate::cancel::CancelToken;
@@ -36,7 +35,7 @@ use crate::core::context::Context;
 use crate::core::ir::user_message;
 use crate::core::session;
 use crate::core::turn::Turn;
-use crate::display::{Msg, Sev, Show};
+use crate::ui::{Msg, Sev, Show};
 use crate::mcp::Hub;
 use crate::settings::Settings;
 use clap::{Parser, Subcommand};
@@ -350,16 +349,16 @@ async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agent
     }
     if interactive {
         // A terminal gets the TUI; pipes, tests, and one-shots get the log.
-        return if tui::wanted() {
-            tui::run(cfg, ctx, convo, banners, hub).await
+        return if ui::tui::wanted() {
+            ui::tui::run(cfg, ctx, convo, banners, hub).await
         } else {
-            plain::plain_repl(&cfg, ctx, convo, banners, hub).await
+            ui::plain::plain_repl(&cfg, ctx, convo, banners, hub).await
         };
     }
     // One-shot: always the plain frontend — its output must stay in the
     // terminal after the process exits, and an alt-screen would take it.
     let prompt = args.prompt.join(" ");
-    let sink = plain::PlainSink::new();
+    let sink = ui::plain::PlainSink::new();
     for b in &banners {
         sink.show(Msg::Banner(b.clone()));
     }

@@ -56,8 +56,8 @@ use std::sync::{Arc, Mutex};
 #[cfg(test)]
 pub(crate) struct NullSink;
 #[cfg(test)]
-impl crate::display::Show for NullSink {
-    fn show(&self, _m: crate::display::Msg) {}
+impl crate::ui::Show for NullSink {
+    fn show(&self, _m: crate::ui::Msg) {}
 }
 #[cfg(test)]
 pub(crate) fn sink() -> NullSink {

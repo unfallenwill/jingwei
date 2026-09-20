@@ -3,11 +3,11 @@
 //! (folding, scrolling, editing, the status bar) is a fact about this data
 //! that a test can pin.
 
-use crate::display::{Sev, Usage};
+use crate::ui::{Sev, Usage};
 use std::time::Duration;
 
 /// The one heartbeat cadence; the task clock accumulates the *measured*
-/// deltas each tick carries (see [`crate::tui::update::Ev::Tick`]). Keeping
+/// deltas each tick carries (see [`crate::ui::tui::update::Ev::Tick`]). Keeping
 /// time *in the state* (not read from the wall clock at render time) is
 /// what makes views deterministic and testable.
 pub const TICK: Duration = Duration::from_millis(120);
@@ -333,7 +333,7 @@ impl App {
     /// Live rows above the input block right now: the think block's head
     /// plus its shown tail ([`THINK_TAIL_SHOWN`]), and the streaming
     /// partial when one is in flight. The same arithmetic
-    /// [`crate::tui::view`] renders — kept beside it in the model so the
+    /// [`crate::ui::tui::view`] renders — kept beside it in the model so the
     /// floor the pane pads to can never drift from what it shows.
     fn live_rows(&self) -> usize {
         let mut n = 0;

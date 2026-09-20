@@ -5,7 +5,7 @@
 //! unit-tested without a terminal.
 
 use super::model::{App, Completion, CompletionItem, CompletionKind, Mode, Row, Scroll, Task};
-use crate::display::Msg;
+use crate::ui::Msg;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::Duration;
 
@@ -317,7 +317,7 @@ fn input_mode(app: &mut App, k: KeyEvent) -> Action {
             }
             // `/exit` is a command, not a task: it submits nothing and
             // recalls nothing — the line clears and the REPL quits
-            if crate::display::is_exit(&line) {
+            if crate::ui::is_exit(&line) {
                 input_clear(app);
                 app.quit = true;
                 return Action::None;
@@ -538,7 +538,7 @@ fn history(app: &mut App, d: i32) {
 mod tests {
     use super::*;
     use super::super::model::TICK;
-    use crate::display::Usage;
+    use crate::ui::Usage;
     use crossterm::event::KeyEventKind;
 
     fn key(code: KeyCode, mods: KeyModifiers) -> Ev {

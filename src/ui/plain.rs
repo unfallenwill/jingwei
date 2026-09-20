@@ -1,9 +1,9 @@
 //! The plain frontend: a pure fold over [`Msg`]s into a line-oriented log,
 //! plus the dumb line reader that drives it (pipes, one-shot runs). The
-//! TUI's sibling — same port, same vocabulary (`crate::display`), none of
+//! TUI's sibling — same port, same vocabulary (`crate::ui`), none of
 //! the terminal machinery.
 
-use crate::display::{self, Msg, Sev, Show};
+use crate::ui::{self, Msg, Sev, Show};
 use crate::mcp::Hub;
 use std::io::{IsTerminal, Write};
 
@@ -16,7 +16,7 @@ pub enum Stream {
 
 /// How many body lines the plain log echoes per tool call. The log has no
 /// unfolding, so its echo must be self-sufficient — hence 20 lines, where
-/// the TUI's collapsed fold shows only [`crate::tui::view::TOOL_TAIL_SHOWN`]
+/// the TUI's collapsed fold shows only [`crate::ui::tui::view::TOOL_TAIL_SHOWN`]
 /// because Ctrl-O exists to unfold the rest.
 const PLAIN_TOOL_LINES: usize = 20;
 
@@ -43,7 +43,7 @@ impl Plain {
         match m {
             Msg::Banner(b) => lines.push((Stream::Out, b)),
             Msg::TaskBegin(t) => {
-                lines.push((Stream::Out, format!("{}{}{t}", display::PROMPT_HEAD, display::PROMPT_GUTTER)))
+                lines.push((Stream::Out, format!("{}{}{t}", ui::PROMPT_HEAD, ui::PROMPT_GUTTER)))
             }
             Msg::TaskEnd => self.end_of_turn(&mut lines),
             Msg::Text(t) => {
@@ -61,7 +61,7 @@ impl Plain {
                     lines.push((Stream::Out, format!("│ {l}")));
                 }
                 if all.len() > shown {
-                    lines.push((Stream::Out, format!("{}… +{} more lines", display::FOLD_GUTTER, all.len() - shown)));
+                    lines.push((Stream::Out, format!("{}… +{} more lines", ui::FOLD_GUTTER, all.len() - shown)));
                 }
             }
             // both severities ride stderr: notes are asides to the answer,
@@ -109,7 +109,7 @@ impl Plain {
         self.thoughts += 1;
         let mut all = text.lines();
         let first = all.next().unwrap_or("");
-        lines.push((Stream::Out, display::thought_folded(self.thoughts, first, all.count())));
+        lines.push((Stream::Out, ui::thought_folded(self.thoughts, first, all.count())));
     }
 }
 
@@ -179,7 +179,7 @@ pub async fn plain_repl(
             // from what `prompt_w()` (TUI-aligned) measures, so a
             // screenshot of the prompt and the task line did not line
             // up. Plain keeps the leading space.
-            print!("{}{} ", display::PROMPT_HEAD, display::PROMPT_GUTTER);
+            print!("{}{} ", ui::PROMPT_HEAD, ui::PROMPT_GUTTER);
             let _ = std::io::stdout().flush();
         }
         let mut line = String::new();
@@ -199,7 +199,7 @@ pub async fn plain_repl(
         // `/exit` leaves the log REPL too — the same word the TUI speaks,
         // checked at the same place in the flow: after the trim, before
         // the line becomes a task
-        if display::is_exit(&line) {
+        if ui::is_exit(&line) {
             break;
         }
         // `/mcp` is its own little command family: handled before the
@@ -324,7 +324,7 @@ mod tests {
         ]);
         let texts: Vec<String> = out.iter().map(|(_, l)| l.clone()).collect();
         assert_eq!(texts, vec![
-            format!("{}{}count files", display::PROMPT_HEAD, display::PROMPT_GUTTER),
+            format!("{}{}count files", ui::PROMPT_HEAD, ui::PROMPT_GUTTER),
             "▸ thought #1 · step one … +1".to_string(),
             "there are 3 files".to_string(),
         ]);
@@ -396,7 +396,7 @@ mod tests {
     fn usage_and_out_tokens_are_swallowed() {
         // the plain log has no status bar — usage messages emit nothing
         let out = run(vec![
-            Msg::Usage(crate::display::Usage { input: 1, output: 2, cache_read: 0, cache_write: 0 }),
+            Msg::Usage(crate::ui::Usage { input: 1, output: 2, cache_read: 0, cache_write: 0 }),
             Msg::OutTokens(42),
         ]);
         assert!(out.is_empty(), "usage / OutTokens do not produce output: {out:?}");
@@ -470,7 +470,7 @@ mod tests {
 
     // ---- /mcp command handling: same path the REPL takes ------------------
 
-    use crate::display::Show;
+    use crate::ui::Show;
 
     /// Capture sink that records banner / note messages verbatim.
     struct BagSink(std::sync::Mutex<Vec<Msg>>);

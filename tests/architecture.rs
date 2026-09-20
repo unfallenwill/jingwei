@@ -4,14 +4,14 @@
 //
 // Layering (lower → higher, deps go downward only):
 //
-//   L0  display, core (mod, ir, session, turn)     — pure data types + state machines (turn is per-run, no IO)
-//   L1  cancel, file_io, format, ledger, core::agents_md, core::reminder
+//   L0  ui (the port), core (mod, ir, session, turn) — pure data types + state machines (turn is per-run, no IO)
+//   L1  cancel, file_io, format, core::agents_md, core::reminder
 //                                                  — infra primitives (agents_md walks the FS — IO, no other crate deps)
-//   L3  config, settings, core::context, edit, tools, tool_runtime, login, mcp + submodules
+//   L3  config, settings, core::context, tools (+ edit/ledger/runtime), login, mcp + submodules
 //                                                  — tool/config tier; reaches into api (L4) for the Vendor port + policy enums
 //   L4  api (+ api::minimax/zai/deepseek)          — vendor + transport
-//   L5  lib, main, core::agent, plain, tui (+ tui::model/update/view)
-//                                                  — composition root + frontends + the loop that composes them
+//   L5  lib, main, core::agent, ui::plain, ui::tui (+ model/update/view)
+//                                                  — composition root + the loop + the port's adapters
 //                                                  (lib/main are the same composition root split across the lib/bin edge)
 //   T   test_util                                  — test-only helpers
 //
@@ -45,14 +45,14 @@ impl Layer {
 
 fn layer_of(mod_name: &str) -> Option<Layer> {
     let l = match mod_name {
-        "display" | "core" | "core::ir" | "core::session" | "core::turn" => Layer::L0, // pure data types + state machines (turn is per-run, no IO)
+        "ui" | "core" | "core::ir" | "core::session" | "core::turn" => Layer::L0, // pure data types + state machines + the ui port (turn is per-run, no IO)
         "cancel" | "file_io" | "format" | "core::agents_md" | "core::reminder" => Layer::L1, // infra primitives (agents_md walks the FS — IO, no other crate deps; reminder is pure data the agent core threads through Context)
         "config" | "settings" | "core::context" => Layer::L3, // tool/config tier; may reach into api (L4) for the Vendor port + policy enums; context builds the per-turn model state
         "tools" | "tools::edit" | "tools::ledger" | "tools::runtime" | "login" | "mcp" | "mcp::wire" | "mcp::health"
             | "mcp::config" | "mcp::client" | "mcp::stdio" | "mcp::http" | "mcp::inner"
             | "mcp::stub" => Layer::L3, // tool/config tier; MCP is a tool-provider sibling to `tools`
         "api" | "api::minimax" | "api::zai" | "api::deepseek" => Layer::L4,
-        "lib" | "main" | "core::agent" | "plain" | "tui" | "tui::model" | "tui::update" | "tui::view" => Layer::L5,
+        "lib" | "main" | "core::agent" | "ui::plain" | "ui::tui" | "ui::tui::model" | "ui::tui::update" | "ui::tui::view" => Layer::L5, // the port (ui) sits at L0; its adapters sit at L5
         "test_util" => Layer::T,
         _ => return None,
     };
@@ -146,7 +146,7 @@ fn collect_edges() -> HashMap<String, Vec<String>> {
                 "core" => &["agent", "agents_md", "context", "ir", "reminder", "session", "turn"],
                 "mcp" => &["wire", "health", "config", "client", "stdio", "http", "inner", "stub"],
                 "tools" => &["edit", "ledger", "runtime"],
-                "tui" => &["model", "update", "view"],
+                "ui" => &["plain", "tui"],
                 _ => &[],
             };
             if !submods.is_empty() {

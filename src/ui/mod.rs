@@ -1,7 +1,7 @@
 //! The display port: the agent core never touches a terminal. It emits
 //! [`Msg`]s through a [`Show`] sink, and a *frontend* interprets them — the
-//! plain frontend (`crate::plain`) folds them into a log, the TUI
-//! (`crate::tui`) folds them into application state, and a remote adapter (a
+//! plain frontend (`crate::ui::plain`) folds them into a log, the TUI
+//! (`crate::ui::tui`) folds them into application state, and a remote adapter (a
 //! web socket, say) would ship them as JSON to a browser. No frontend lives
 //! here: the port is the contract ([`Msg`], [`Usage`], the [`Show`] trait)
 //! plus the small rendering vocabulary the terminal frontends share. Nothing
@@ -15,6 +15,9 @@ use std::time::Duration;
 use std::io::{self, IsTerminal};
 use unicode_segmentation::UnicodeSegmentation;
 use tokio::sync::mpsc::UnboundedSender;
+
+pub(crate) mod plain;
+pub(crate) mod tui;
 
 /// Severity of a note row (warnings scroll with the transcript).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

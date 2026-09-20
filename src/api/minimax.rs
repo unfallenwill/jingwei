@@ -11,7 +11,7 @@ use super::{empty_usage, merge_usage, request, response_from_value, show_turn, s
 use crate::cancel::CancelToken;
 use crate::config::Config;
 use crate::core::context::Context;
-use crate::display::{Msg, Show};
+use crate::ui::{Msg, Show};
 use crate::core::ir::{Block, Message, Response};
 use crate::{Error, Result};
 use serde_json::{json, Value};
@@ -144,7 +144,7 @@ async fn streaming(url: String, body: Value, key: String, token: &CancelToken, s
             }
             Some("message_delta") => {
                 merge_usage(&mut usage, v["usage"].as_object());
-                sink.show(Msg::Usage(crate::display::Usage::from_value(&usage)));
+                sink.show(Msg::Usage(crate::ui::Usage::from_value(&usage)));
                 if let Some(n) = v["usage"]["output_tokens"].as_u64() { sink.show(Msg::OutTokens(n)); }
             }
             Some("message_stop") => break,
@@ -343,7 +343,7 @@ mod tests {
         assert_eq!(resp.usage["cache_read_input_tokens"], 800, "message_start cache_read must persist");
         assert_eq!(resp.usage["output_tokens"], 5);
         // And the ctx gauge can read it: context_in() = input + cache_read + cache_write.
-        let u = crate::display::Usage::from_value(&resp.usage);
+        let u = crate::ui::Usage::from_value(&resp.usage);
         assert_eq!(u.context_in(), 2034, "ctx_in must include input + cache_read");
     }
 

@@ -12,9 +12,9 @@
 use crate::config::Config;
 use crate::cancel::CancelToken;
 use crate::core::context::Context;
-use crate::display::{Msg, Show};
+use crate::ui::{Msg, Show};
 use crate::core::ir::{Block, Message, Response};
-use crate::display::Usage;
+use crate::ui::Usage;
 use crate::{Error, Result};
 use serde_json::{json, Value};
 use std::future::Future;
@@ -614,7 +614,7 @@ mod tests {
             "usage": {"input_tokens": 1, "output_tokens": 2}
         });
         // a minimal usage_of stub
-        let usage_of = |u: &Value| (u.clone(), crate::display::Usage::default());
+        let usage_of = |u: &Value| (u.clone(), crate::ui::Usage::default());
         let r = chat_to_internal(&v, usage_of);
         assert_eq!(r.blocks.len(), 3, "thinking, text, tool_use");
         match &r.blocks[0] {
@@ -644,7 +644,7 @@ mod tests {
             }}],
             "usage": {}
         });
-        let usage_of = |_: &Value| (Value::Null, crate::display::Usage::default());
+        let usage_of = |_: &Value| (Value::Null, crate::ui::Usage::default());
         let r = chat_to_internal(&v, usage_of);
         assert_eq!(r.blocks.len(), 1);
         assert!(matches!(&r.blocks[0], Block::Text(t) if t == "answer only"));

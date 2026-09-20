@@ -40,7 +40,7 @@ pub mod view;
 
 use crate::api::VENDORS;
 use crate::config::Config;
-use crate::display::{ChannelSink, Msg, Sev, Show as DisplayShow};
+use crate::ui::{ChannelSink, Msg, Sev, Show as DisplayShow};
 use crate::mcp::Hub;
 use crate::core::session::Convo;
 use crate::settings::Settings;
@@ -761,7 +761,7 @@ fn dispatch_slash(cmd: SlashCmd<'_>, cfg: &Config, convo: &Arc<AsyncMutex<Convo>
             let sink = sink.clone();
             let rest = cmd.args.join(" ");
             tokio::spawn(async move {
-                crate::plain::handle_mcp_command(&rest, &hub, &sink).await;
+                crate::ui::plain::handle_mcp_command(&rest, &hub, &sink).await;
             });
             HandleOutcome::None
         }
@@ -1273,9 +1273,9 @@ mod tests {
         // helper duplicates wide chars back into chars so 精卫 (4 display
         // cols) lands as 4 chars. caret.col is in display columns, so the
         // draft's display width is `caret.col - prompt_w`.
-        let prefix = format!("{}{}", crate::display::PROMPT_HEAD, crate::display::PROMPT_GUTTER);
+        let prefix = format!("{}{}", crate::ui::PROMPT_HEAD, crate::ui::PROMPT_GUTTER);
         let after = input.strip_prefix(&prefix).expect("prompt prefix");
-        let draft: String = after.chars().take((caret.col as usize).saturating_sub(crate::display::prompt_w())).collect();
+        let draft: String = after.chars().take((caret.col as usize).saturating_sub(crate::ui::prompt_w())).collect();
         assert_eq!(draft, "精精卫卫 fill", "the draft renders compact under the prompt: {input:?}");
         assert_eq!(input.chars().nth(caret.col as usize), Some(' '), "the column the caret sits on is free");
     }
