@@ -45,7 +45,7 @@
 //! the internal representation, which every wire adapter already speaks —
 //! a session started on one protocol resumes on another for free.
 
-use crate::ir::Message;
+use crate::core::ir::Message;
 use crate::Error;
 
 fn home_dir() -> Option<std::path::PathBuf> {
@@ -632,7 +632,7 @@ mod tests {
 
     fn history() -> Vec<Message> {
         vec![
-            crate::user_message("count files"),
+            crate::core::ir::user_message("count files"),
             Message::from_value(&json!({"role": "assistant", "content": [
                 {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}}]})),
             Message::from_value(&json!({"role": "user", "content": [
@@ -694,7 +694,7 @@ mod tests {
         assert_eq!(hist, h, "payload-blind: the same values, byte for byte");
         // the loaded session keeps the file's identity — new turns append
         let mut h2 = h.clone();
-        h2.push(crate::user_message("again"));
+        h2.push(crate::core::ir::user_message("again"));
         loaded.sync(&h2).unwrap();
         let (_, hist2) = load_in(&d, Some(s.id())).unwrap();
         assert_eq!(hist2, h2);
@@ -758,13 +758,13 @@ mod tests {
     fn load_resolves_newest_unique_prefix_and_ambiguity() {
         let d = dir("resolve");
         let mut older = Session::create(Some(&d), &prov(), 1, 1000);
-        older.sync(&[crate::user_message("old")]).unwrap();
+        older.sync(&[crate::core::ir::user_message("old")]).unwrap();
         let mut newer = Session::create(Some(&d), &prov(), 1, 2000);
-        newer.sync(&[crate::user_message("new")]).unwrap();
+        newer.sync(&[crate::core::ir::user_message("new")]).unwrap();
 
         let (got, hist) = load_in(&d, None).unwrap();
         assert_eq!(got.id(), newer.id(), "no selector: the newest");
-        assert_eq!(hist, vec![crate::user_message("new")]);
+        assert_eq!(hist, vec![crate::core::ir::user_message("new")]);
 
         let (got, _) = load_in(&d, Some(older.id())).unwrap();
         assert_eq!(got.id(), older.id(), "a unique prefix resolves");
@@ -788,10 +788,10 @@ mod tests {
     fn list_is_newest_first_with_first_task_and_counts() {
         let d = dir("list");
         let mut a = Session::create(Some(&d), &prov(), 1, 1000);
-        a.sync(&[crate::user_message("first task")]).unwrap();
+        a.sync(&[crate::core::ir::user_message("first task")]).unwrap();
         let mut b = Session::create(Some(&d), &prov(), 1, 2000);
         b.sync(&[
-            crate::user_message("second task"),
+            crate::core::ir::user_message("second task"),
             Message::from_value(&json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]})),
         ])
         .unwrap();
@@ -899,7 +899,7 @@ mod tests {
         // keys make serialization canonical — the file's bytes are a
         // fixed point — and numbers round-trip exactly.
         let h = vec![
-            crate::user_message("count 精卫 \"quoted\" \\backslash\\ \nnewline\ttab 🪨"),
+            crate::core::ir::user_message("count 精卫 \"quoted\" \\backslash\\ \nnewline\ttab 🪨"),
             Message::from_value(&json!({"role": "assistant", "content": [
                 {"type": "thinking", "thinking": "考虑\n多行推理 é\u{301}"},
                 {"type": "tool_use", "id": "t1", "name": "bash", "input": {
@@ -914,8 +914,8 @@ mod tests {
         let (_, loaded) = load_in(&d, Some(s.id())).unwrap();
         assert_eq!(h, loaded, "the value tree comes back identical");
         assert_eq!(
-            serde_json::to_string(&crate::ir::history_value(&h)).unwrap(),
-            serde_json::to_string(&crate::ir::history_value(&loaded)).unwrap(),
+            serde_json::to_string(&crate::core::ir::history_value(&h)).unwrap(),
+            serde_json::to_string(&crate::core::ir::history_value(&loaded)).unwrap(),
             "bytes identical — the resumed request replays into the same prefix"
         );
     }
@@ -923,7 +923,7 @@ mod tests {
     #[test]
     fn ephemeral_convo_persists_nothing_and_never_panics() {
         let mut c = Convo::ephemeral();
-        c.history.push(crate::user_message("hi"));
+        c.history.push(crate::core::ir::user_message("hi"));
         c.persist().unwrap(); // a quiet no-op — one-shots leave no session behind
         assert_eq!(c.history.len(), 1);
     }

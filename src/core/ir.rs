@@ -148,6 +148,13 @@ impl Message {
 
 /// The whole history as one JSON array — the shape `est_tokens` measures and
 /// session tests compare.
+/// The one constructor of a user task message. The internal history
+/// shape belongs to `ir` — so its constructor does too, and no caller
+/// spells the shape by hand.
+pub fn user_message(text: &str) -> Message {
+    Message::User(text.to_string())
+}
+
 pub fn history_value(history: &[Message]) -> Value {
     Value::Array(history.iter().map(Message::to_value).collect())
 }
@@ -163,6 +170,11 @@ pub struct Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_message_is_the_single_spelling_of_a_task() {
+        assert_eq!(user_message("count files").to_value(), json!({"role": "user", "content": "count files"}));
+    }
 
     #[test]
     fn message_round_trips_every_shape() {

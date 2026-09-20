@@ -28,12 +28,28 @@
 //!   first". A pluggable `TrimPolicy` is straightforward when there's
 //!   more than one policy worth offering; for now one policy lives here.
 
-use crate::agents_md::AgentsMdContext;
-use crate::ir::{history_value, Block, Message};
+use crate::core::agents_md::AgentsMdContext;
+use crate::core::ir::{history_value, Block, Message};
 use crate::mcp::Hub;
-use crate::reminder::{ReminderId, SystemReminder};
+use crate::core::reminder::{ReminderId, SystemReminder};
 use crate::tools::tools;
 use serde_json::{json, Value};
+
+/// The static system prompt — the runtime contract with the model, shipped
+/// on every request. It lives here (not at the crate root) because context
+/// owns everything the model sees; every wire starts from this string.
+pub(crate) const SYSTEM: &str = "You are jingwei (精卫), a coding agent with these tools: \
+    bash (run a shell command), read_file, write_file, edit_file (search/replace; exact match with line-aligned indentation fallback). \
+    Pick the smallest tool that fits: read_file to inspect (not cat via bash); edit_file for a few lines; write_file only to create or wholesale-replace; bash for the rest — running tests, git, grep, ls. \
+    Read a file before you edit it — never guess its contents. \
+    Prefer small, targeted commands. \
+    Never start a command that waits for input or never returns (editors, pagers, watch or server modes) — everything you run must terminate. \
+    Never run destructive commands unless the user explicitly asks. \
+    Never run git commit, push, reset, checkout, clean, or rebase unless the user explicitly asks. \
+    Write for a terminal, not a Markdown renderer: plain text, no headings/tables/bold markers, short lines, with exact copy-pasteable paths and commands. And since your reasoning is folded away and unseen, put every conclusion in the visible answer. \
+    Don't stop until the task is actually delivered: make the change, then verify it by running the build, the tests, or the exact command, fix what fails, and repeat until it passes — only then summarize. If you cannot finish, say exactly what is done, what is left, and what blocked you. \
+    When asked your name, say you are jingwei (精卫). \
+    When finished, reply with a concise 1-3 sentence summary of what you did.";
 
 /// The per-turn context the model sees. Vendors consume it; the agent
 /// loop mutates `history` and asks `refresh()` to update the parts that
@@ -41,7 +57,7 @@ use serde_json::{json, Value};
 /// list after a runtime injection).
 #[derive(Clone)]
 pub(crate) struct Context {
-    /// The static system prompt — exactly `crate::SYSTEM`, nothing else.
+    /// The static system prompt — exactly `SYSTEM`, nothing else.
     /// Vendors send this as the first system block on every wire. It is
     /// never augmented: AGENTS.md and runtime context ride in `reminders`,
     /// not here. That single rule is what keeps cache-breakpoint shape
@@ -62,7 +78,7 @@ pub(crate) struct Context {
 
 impl Context {
     /// Build the per-session context. Compose the static system text
-    /// from `crate::SYSTEM` alone (AGENTS.md content rides in a
+    /// from `SYSTEM` alone (AGENTS.md content rides in a
     /// reminder, not in this string), enqueue AGENTS.md reminders when
     /// the loader found files, and seed the tool list with the built-in
     /// registry. MCP tools join in on the first `refresh()` — they
@@ -112,7 +128,7 @@ impl Context {
             });
         }
         Self {
-            system_text: crate::SYSTEM.to_string(),
+            system_text: SYSTEM.to_string(),
             reminders,
             tools: builtin_tools(),
         }
@@ -214,8 +230,8 @@ fn drop_result_and_pair(history: &mut Vec<Message>, mi: usize, bi: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents_md::AgentsMdContext;
-    use crate::ir::{Block, Message, ToolResult};
+    use crate::core::agents_md::AgentsMdContext;
+    use crate::core::ir::{Block, Message, ToolResult};
     use crate::test_util::temp_dir;
     use serde_json::json;
 
@@ -263,7 +279,7 @@ mod tests {
         let dir = temp_dir("ctx_none");
         let md = AgentsMdContext::load(&dir);
         let ctx = Context::new(&md);
-        assert_eq!(ctx.system_text, crate::SYSTEM);
+        assert_eq!(ctx.system_text, SYSTEM);
         assert!(md.found_path.is_none());
         assert!(ctx.reminders.is_empty(),
             "no AGENTS.md ⇒ no reminder enqueued; the wire is byte-equivalent to the old behavior");
@@ -280,7 +296,7 @@ mod tests {
         let ctx = Context::new(&md);
 
         // system_text is just SYSTEM — AGENTS.md does NOT leak in here
-        assert!(ctx.system_text.contains(crate::SYSTEM));
+        assert!(ctx.system_text.contains(SYSTEM));
         assert!(!ctx.system_text.contains("use rustfmt"),
             "AGENTS.md body must not live in system_text; it rides in reminders");
 
@@ -324,7 +340,7 @@ mod tests {
         std::fs::write(dir.join("AGENTS.md"), "use rustfmt").unwrap();
         let md = AgentsMdContext::load(&dir);
         let ctx = Context::new(&md);
-        assert_eq!(ctx.system_text, crate::SYSTEM,
+        assert_eq!(ctx.system_text, SYSTEM,
             "system_text is the bare SYSTEM constant; all AGENTS.md content rides in reminders");
     }
 

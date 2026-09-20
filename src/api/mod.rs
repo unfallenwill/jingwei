@@ -11,9 +11,9 @@
 
 use crate::config::Config;
 use crate::cancel::CancelToken;
-use crate::context::Context;
+use crate::core::context::Context;
 use crate::display::{Msg, Show};
-use crate::ir::{Block, Message, Response};
+use crate::core::ir::{Block, Message, Response};
 use crate::display::Usage;
 use crate::{Error, Result};
 use serde_json::{json, Value};
@@ -464,7 +464,8 @@ pub(crate) mod deepseek;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{Block, Message};
+    use crate::core::ir::{Block, Message};
+    use crate::test_util::{block_on, cfg, mock_seq, sink};
     use serde_json::json;
 
     // ---- Protocol: the dispatcher's typed handle --------------------------
@@ -576,10 +577,10 @@ mod tests {
         // concatenates verbatim with no extra insertion
         let dir = crate::test_util::temp_dir("chat_sys_compose");
         std::fs::write(dir.join("AGENTS.md"), "x").unwrap();
-        let md = crate::agents_md::AgentsMdContext::load(&dir);
-        let cx = crate::context::Context::new(&md);
+        let md = crate::core::agents_md::AgentsMdContext::load(&dir);
+        let cx = crate::core::context::Context::new(&md);
         let s = chat_system_text(&cx);
-        assert!(s.starts_with(crate::SYSTEM),
+        assert!(s.starts_with(crate::core::context::SYSTEM),
             "system_text comes first");
         assert!(s.contains("# Project conventions"),
             "AGENTS.md section rides in");
@@ -737,7 +738,7 @@ mod tests {
         // through without inspection
         let msgs = vec![
             Message::User("task".into()),
-            Message::ToolResults(vec![crate::ir::ToolResult { id: "t".into(), content: "ok".into() }]),
+            Message::ToolResults(vec![crate::core::ir::ToolResult { id: "t".into(), content: "ok".into() }]),
         ];
         let stripped = strip_thinking(&msgs);
         assert_eq!(stripped.len(), 2);
@@ -816,5 +817,52 @@ mod tests {
             assert!(deepseek_accepts(CacheMode::Auto, Thinking::Strip, e).is_err(),
                 "auto+strip+{e:?} should fail");
         }
+    }
+
+    // ---- retry: the transport's own rule ----------------------------------
+
+    #[test]
+    fn backoff_doubles_then_caps() {
+        assert_eq!(backoff(1), std::time::Duration::from_millis(500));
+        assert_eq!(backoff(2), std::time::Duration::from_millis(1000));
+        assert_eq!(backoff(3), std::time::Duration::from_millis(2000));
+        assert_eq!(backoff(4), std::time::Duration::from_millis(4000));
+        assert_eq!(backoff(5), RETRY_MAX, "doubling is capped");
+        assert_eq!(backoff(99), RETRY_MAX, "and stays capped");
+    }
+
+    /// A response's blocks as JSON, read like a `content` array.
+    fn blocks(b: &[Block]) -> Value {
+        Value::Array(b.iter().map(Block::to_value).collect())
+    }
+
+    #[test]
+    fn a_transient_failure_is_resent_through_the_one_door() {
+        // 429 first, then the real answer: the door resends and the turn
+        // succeeds where it used to die on the first status
+        let (port, reqs) = mock_seq(vec![
+            (429, r#"{"error":{"message":"rate limited"}}"#.into()),
+            (200, r#"{"content":[{"type":"text","text":"after retry"}],"usage":{}}"#.into()),
+        ]);
+        let cx = crate::test_util::ctx();
+        let (resp, _, _) = block_on(call_api(
+            &cfg(format!("http://127.0.0.1:{port}"), false), &cx, &[], &CancelToken::new(), &sink(),
+        )).unwrap();
+        assert_eq!(blocks(&resp.blocks)[0]["text"], "after retry");
+        assert_eq!(reqs.lock().unwrap().len(), 2, "the request went out twice");
+    }
+
+    #[test]
+    fn a_request_fault_is_not_resent() {
+        // a 400 is the request's own; it must fail on the first answer
+        let (port, reqs) = mock_seq(vec![
+            (400, r#"{"error":{"message":"bad model"}}"#.into()),
+        ]);
+        let cx = crate::test_util::ctx();
+        let err = block_on(call_api(
+            &cfg(format!("http://127.0.0.1:{port}"), false), &cx, &[], &CancelToken::new(), &sink(),
+        )).unwrap_err();
+        assert!(err.to_string().contains("bad model"), "got: {err}");
+        assert_eq!(reqs.lock().unwrap().len(), 1, "no second request");
     }
 }

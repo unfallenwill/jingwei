@@ -12,9 +12,9 @@ use super::{chat_blocking, chat_messages, chat_streaming, chat_to_internal, chat
             Thinking};
 use crate::cancel::CancelToken;
 use crate::config::Config;
-use crate::context::Context;
+use crate::core::context::Context;
 use crate::display::Show;
-use crate::ir::{Message, Response};
+use crate::core::ir::{Message, Response};
 use crate::display::Usage;
 use crate::Result;
 use serde_json::{json, Value};
@@ -106,16 +106,16 @@ mod tests {
         use crate::test_util::temp_dir;
         let dir = temp_dir("agents_md_wire");
         std::fs::write(dir.join("AGENTS.md"), "always use pnpm").unwrap();
-        let md = crate::agents_md::AgentsMdContext::load(&dir);
+        let md = crate::core::agents_md::AgentsMdContext::load(&dir);
         assert!(md.found_path.is_some());
 
         let mut c = cfg("https://x".into(), true);
         c.protocol = Protocol::ZAI;
-        let cx = crate::context::Context::new(&md);
-        let msgs = vec![crate::ir::Message::User("task".into())];
+        let cx = crate::core::context::Context::new(&md);
+        let msgs = vec![crate::core::ir::Message::User("task".into())];
         let b = super::body(&c, &cx, &msgs, false);
         let system = b["messages"][0]["content"].as_str().unwrap();
-        assert!(system.contains(crate::SYSTEM), "base SYSTEM stays in the wire");
+        assert!(system.contains(crate::core::context::SYSTEM), "base SYSTEM stays in the wire");
         assert!(system.contains("always use pnpm"), "AGENTS.md body rides in");
         assert!(system.contains("# Project conventions"), "extras are labelled");
         assert!(system.contains(&dir.display().to_string()),
@@ -140,7 +140,7 @@ mod tests {
         let (resp, _, _) = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
         assert_eq!(resp.blocks.len(), 3, "thinking + text + tool_use");
         let thinking_text = match &resp.blocks[0] {
-            crate::ir::Block::Thinking { text, .. } => text.clone(),
+            crate::core::ir::Block::Thinking { text, .. } => text.clone(),
             _ => panic!("expected thinking block, got {:?}", resp.blocks[0]),
         };
         assert_eq!(thinking_text, "thinking…");

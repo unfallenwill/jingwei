@@ -150,8 +150,8 @@ impl Show for PlainSink {
 /// path keeps the shell's own history (up-arrow) and line editing.
 pub async fn plain_repl(
     cfg: &crate::config::Config,
-    mut ctx: crate::context::Context,
-    mut convo: crate::session::Convo,
+    mut ctx: crate::core::context::Context,
+    mut convo: crate::core::session::Convo,
     banners: Vec<String>,
     hub: Hub,
 ) -> crate::Result<()> {
@@ -210,14 +210,14 @@ pub async fn plain_repl(
             handle_mcp_command(rest, &hub, &sink).await;
             continue;
         }
-        convo.history.push(crate::user_message(&line));
+        convo.history.push(crate::core::ir::user_message(&line));
         if let Err(e) = convo.persist() {
             sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
         }
         // the task is on disk before the first stone moves
         sink.show(Msg::TaskBegin(line));
         let token = crate::cancel::CancelToken::new();
-        let mut turn = crate::turn::Turn::new(0);
+        let mut turn = crate::core::turn::Turn::new(0);
         match agent_turn(cfg, &mut ctx, &mut convo.history, &mut turn, &token, &hub, &sink).await {
             Err(crate::Error::Interrupted) => {}
             Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),

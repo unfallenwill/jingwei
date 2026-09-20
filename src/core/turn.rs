@@ -3,7 +3,7 @@
 //!
 //! Two facts keep this module small:
 //!
-//! - The session ([`crate::session`]) owns the long-lived things — identity,
+//! - The session ([`crate::core::session`]) owns the long-lived things — identity,
 //!   history, archive, fork, rename. It does not run.
 //! - The turn owns the short-lived thing — one execution. It does not
 //!   outlive its terminal state.

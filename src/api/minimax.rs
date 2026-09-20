@@ -10,9 +10,9 @@ use super::{empty_usage, merge_usage, request, response_from_value, show_turn, s
             CacheMode, Thinking};
 use crate::cancel::CancelToken;
 use crate::config::Config;
-use crate::context::Context;
+use crate::core::context::Context;
 use crate::display::{Msg, Show};
-use crate::ir::{Block, Message, Response};
+use crate::core::ir::{Block, Message, Response};
 use crate::{Error, Result};
 use serde_json::{json, Value};
 
@@ -34,7 +34,7 @@ pub(super) fn body(cfg: &Config, ctx: &Context, messages: &[Message], stream: bo
     use super::chat_system_text;
     let active = cfg.cache == CacheMode::Active;
     // The system side is rendered as multiple blocks: `system_text` first
-    // (just `crate::SYSTEM`), then one block per reminder. Every session-
+    // (just `crate::core::context::SYSTEM`), then one block per reminder. Every session-
     // stable reminder carries a `cache_control: ephemeral` marker so its
     // body sits in the cached prefix; unstable reminders skip the marker
     // and land as fresh blocks (no prefix pollution).
@@ -197,7 +197,7 @@ mod tests {
     }
 
     /// AGENTS.md content rides in its own system block, separate from
-    /// `system_text` (which holds only `crate::SYSTEM`), and lands in
+    /// `system_text` (which holds only `crate::core::context::SYSTEM`), and lands in
     /// the cached prefix via the stable reminder's `cache_control`
     /// marker. Two blocks = two cache segments: `SYSTEM` and the AGENTS.md
     /// body can change independently without invalidating each other's
@@ -207,11 +207,11 @@ mod tests {
         use crate::test_util::temp_dir;
         let dir = temp_dir("agents_md_minimax");
         std::fs::write(dir.join("AGENTS.md"), "use rustfmt").unwrap();
-        let md = crate::agents_md::AgentsMdContext::load(&dir);
+        let md = crate::core::agents_md::AgentsMdContext::load(&dir);
 
         let mut c = cfg("https://x".into(), true);
         c.cache = crate::api::CacheMode::Active; // exercise the array-with-cache branch
-        let cx = crate::context::Context::new(&md);
+        let cx = crate::core::context::Context::new(&md);
         let b = super::body(&c, &cx, &[], false);
         let arr = b["system"].as_array().expect("active cache ⇒ array of blocks");
         assert_eq!(arr.len(), 2,
@@ -219,7 +219,7 @@ mod tests {
 
         // block 0: just SYSTEM, with cache marker
         let sys_block = &arr[0];
-        assert_eq!(sys_block["text"], crate::SYSTEM,
+        assert_eq!(sys_block["text"], crate::core::context::SYSTEM,
             "system_text holds the SYSTEM constant alone; AGENTS.md does not leak in here");
         assert!(sys_block.get("cache_control").is_some(),
             "SYSTEM rides in the cached prefix");
@@ -245,16 +245,16 @@ mod tests {
         use crate::test_util::temp_dir;
         let dir = temp_dir("agents_md_minimax_none");
         // no AGENTS.md written — `load` returns the empty context
-        let md = crate::agents_md::AgentsMdContext::load(&dir);
+        let md = crate::core::agents_md::AgentsMdContext::load(&dir);
 
         let mut c = cfg("https://x".into(), true);
         c.cache = crate::api::CacheMode::Active;
-        let cx = crate::context::Context::new(&md);
+        let cx = crate::core::context::Context::new(&md);
         let b = super::body(&c, &cx, &[], false);
         let arr = b["system"].as_array().expect("active cache ⇒ array of blocks");
         assert_eq!(arr.len(), 1,
             "no AGENTS.md ⇒ no reminder ⇒ one SYSTEM block — same as the old wire shape");
-        assert_eq!(arr[0]["text"], crate::SYSTEM);
+        assert_eq!(arr[0]["text"], crate::core::context::SYSTEM);
         assert!(arr[0].get("cache_control").is_some());
     }
 

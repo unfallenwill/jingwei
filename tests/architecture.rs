@@ -4,14 +4,15 @@
 //
 // Layering (lower → higher, deps go downward only):
 //
-//   L0  display, ir, session, turn                  — pure data types + state machines (turn is per-run, no IO)
-//   L1  cancel, file_io, format, ledger, agents_md — infra primitives (agents_md walks the FS — IO, no other crate deps)
-//   L3  config, settings, context, edit, tools, tool_runtime, login, mcp + submodules
+//   L0  display, core (mod, ir, session, turn)     — pure data types + state machines (turn is per-run, no IO)
+//   L1  cancel, file_io, format, ledger, core::agents_md, core::reminder
+//                                                  — infra primitives (agents_md walks the FS — IO, no other crate deps)
+//   L3  config, settings, core::context, edit, tools, tool_runtime, login, mcp + submodules
 //                                                  — tool/config tier; reaches into api (L4) for the Vendor port + policy enums
 //   L4  api (+ api::minimax/zai/deepseek)          — vendor + transport
-//   L5  lib, main, plain, tui (+ tui::model/update/view)
-//                                                  — composition root + frontends (lib/main are the
-//                                                  same composition root split across the lib/bin edge)
+//   L5  lib, main, core::agent, plain, tui (+ tui::model/update/view)
+//                                                  — composition root + frontends + the loop that composes them
+//                                                  (lib/main are the same composition root split across the lib/bin edge)
 //   T   test_util                                  — test-only helpers
 //
 // Rules:
@@ -44,14 +45,14 @@ impl Layer {
 
 fn layer_of(mod_name: &str) -> Option<Layer> {
     let l = match mod_name {
-        "display" | "ir" | "session" | "turn" => Layer::L0, // turn is the pure per-run state machine; data + transfer rules, no IO
-        "cancel" | "file_io" | "format" | "ledger" | "agents_md" | "reminder" => Layer::L1, // agents_md walks the FS — IO primitive, no other crate deps; reminder is pure data the agent core threads through Context
-        "config" | "settings" | "context" => Layer::L3, // tool/config tier; may reach into api for the Vendor port + policy enums; context builds the per-turn model state
+        "display" | "core" | "core::ir" | "core::session" | "core::turn" => Layer::L0, // pure data types + state machines (turn is per-run, no IO)
+        "cancel" | "file_io" | "format" | "ledger" | "core::agents_md" | "core::reminder" => Layer::L1, // infra primitives (agents_md walks the FS — IO, no other crate deps; reminder is pure data the agent core threads through Context)
+        "config" | "settings" | "core::context" => Layer::L3, // tool/config tier; may reach into api (L4) for the Vendor port + policy enums; context builds the per-turn model state
         "edit" | "tools" | "tool_runtime" | "login" | "mcp" | "mcp::wire" | "mcp::health"
             | "mcp::config" | "mcp::client" | "mcp::stdio" | "mcp::http" | "mcp::inner"
             | "mcp::stub" => Layer::L3, // tool/config tier; MCP is a tool-provider sibling to `tools`
         "api" | "api::minimax" | "api::zai" | "api::deepseek" => Layer::L4,
-        "main" | "lib" | "plain" | "tui" | "tui::model" | "tui::update" | "tui::view" => Layer::L5,
+        "lib" | "main" | "core::agent" | "plain" | "tui" | "tui::model" | "tui::update" | "tui::view" => Layer::L5,
         "test_util" => Layer::T,
         _ => return None,
     };
@@ -134,14 +135,23 @@ fn collect_edges() -> HashMap<String, Vec<String>> {
             // followed by a sub-item). Strip sub-items: `api::minimax::Effort`
             // → target `api::minimax`.
             let top = rest.split("::").next().unwrap_or("");
-            // Special-case api/mod.rs: top-level `use crate::api` from outside
-            // api means "the api module". Use crate::api::minimax → "api::minimax".
+            // Cluster modules carry their layer in the second path segment
+            // (`crate::core::ir` → "core::ir"); for flat modules the first
+            // segment is the module ("crate::cancel" → "cancel"). Only known
+            // submodules join — `crate::tools::dispatch` (an item, not a
+            // submodule) must stay "tools".
             let mut target = top.to_string();
-            if target == "api" {
-                // Check if the next segment is one of the known submodules.
+            let submods: &[&str] = match top {
+                "api" => &["minimax", "zai", "deepseek"],
+                "core" => &["agent", "agents_md", "context", "ir", "reminder", "session", "turn"],
+                "mcp" => &["wire", "health", "config", "client", "stdio", "http", "inner", "stub"],
+                "tui" => &["model", "update", "view"],
+                _ => &[],
+            };
+            if !submods.is_empty() {
                 let next = rest.split("::").nth(1).unwrap_or("");
-                if matches!(next, "minimax" | "zai" | "deepseek") {
-                    target = format!("api::{next}");
+                if submods.contains(&next) {
+                    target = format!("{top}::{next}");
                 }
             }
             if target != mod_name {

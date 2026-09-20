@@ -42,7 +42,7 @@ use crate::api::VENDORS;
 use crate::config::Config;
 use crate::display::{ChannelSink, Msg, Sev, Show as DisplayShow};
 use crate::mcp::Hub;
-use crate::session::Convo;
+use crate::core::session::Convo;
 use crate::settings::Settings;
 use crate::{agent_turn, user_message, Error};
 
@@ -400,7 +400,7 @@ fn needs_paint(
 /// `convo` is the conversation to run on; `hub` is the MCP hub: a clone
 /// the TUI shares with the agent loop, and uses itself for `/mcp`
 /// slash commands while idle.
-pub async fn run(cfg: Config, mut ctx: crate::context::Context, convo: Convo, banners: Vec<String>, hub: Hub) -> crate::Result<()> {
+pub async fn run(cfg: Config, mut ctx: crate::core::context::Context, convo: Convo, banners: Vec<String>, hub: Hub) -> crate::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sink = ChannelSink::new(tx);
     sink.show(Msg::Banner(format!(
@@ -866,12 +866,12 @@ fn slash_model(args: Vec<&str>, cfg: &Config, convo: &Arc<AsyncMutex<Convo>>) ->
     // Open a fresh session under the new identity. The session module's
     // `Session::new` is a fresh file under the project subdirectory;
     // the previous file stays on disk under its own id.
-    let prov = crate::session::Provenance {
+    let prov = crate::core::session::Provenance {
         model: new_cfg.model.clone(),
         protocol: new_cfg.protocol_label().into(),
         base_url: new_cfg.base_url.clone(),
     };
-    let new_session = crate::session::Session::new(&prov, crate::config::HISTORY_FORMAT);
+    let new_session = crate::core::session::Session::new(&prov, crate::config::HISTORY_FORMAT);
     let announce = format!(
         "switched to {} (new session {})",
         selected_key,
@@ -881,7 +881,7 @@ fn slash_model(args: Vec<&str>, cfg: &Config, convo: &Arc<AsyncMutex<Convo>>) ->
         Some(p) => format!("session {} · {}", new_session.id(), p.display()),
         None => format!("session {} · no home directory: this conversation stays in memory", new_session.id()),
     };
-    let new_convo = crate::session::Convo::persistent(new_session, vec![]);
+    let new_convo = crate::core::session::Convo::persistent(new_session, vec![]);
     Ok(HandleOutcome::Switch { cfg: new_cfg, convo: new_convo, banners: vec![banner], announce })
 }
 
@@ -896,7 +896,7 @@ fn protocol_of(name: &str) -> Option<crate::api::Protocol> {
 /// keeps its current cfg and convo. Slash commands on the input line
 /// resolve here too: dispatching `/model` returns `Switch` with the
 /// newly-built Config and Convo.
-fn handle(action: Action, cfg: &Config, ctx: &mut crate::context::Context, convo: &Arc<AsyncMutex<Convo>>,
+fn handle(action: Action, cfg: &Config, ctx: &mut crate::core::context::Context, convo: &Arc<AsyncMutex<Convo>>,
           agent: &mut Option<Agent>, sink: &ChannelSink, hub: &Hub) -> HandleOutcome {
     match action {
         Action::None => HandleOutcome::None,
@@ -942,7 +942,7 @@ fn handle(action: Action, cfg: &Config, ctx: &mut crate::context::Context, convo
                     sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
                 }
                 // the task is on disk before the first stone moves
-                let mut turn = crate::turn::Turn::new(0);
+                let mut turn = crate::core::turn::Turn::new(0);
                 match agent_turn(&cfg, &mut ctx, &mut c.history, &mut turn, &tok, &hub, &sink).await {
                     Err(Error::Interrupted) => {}
                     Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
@@ -1691,7 +1691,7 @@ mod tests {
         let sink = ChannelSink::new(tx);
         let cfg = tcfg("http://127.0.0.1:1");
         let mut convo = Convo::ephemeral();
-        convo.history.push(crate::ir::Message::User("seed".into()));
+        convo.history.push(crate::core::ir::Message::User("seed".into()));
         let convo = Arc::new(AsyncMutex::new(convo));
         let mut agent: Option<Agent> = None;
         let hub = crate::mcp::Hub::empty();
@@ -1724,11 +1724,11 @@ mod tests {
         let sink = ChannelSink::new(tx);
         let cfg = tcfg("http://127.0.0.1:1");
         let mut convo = Convo::ephemeral();
-        convo.history.push(crate::ir::Message::User("seed".into()));
+        convo.history.push(crate::core::ir::Message::User("seed".into()));
         let convo = Arc::new(AsyncMutex::new(convo));
         let mut agent: Option<Agent> = None;
         let hub = crate::mcp::Hub::empty();
-        let mut cx = crate::context::Context::new(&crate::agents_md::AgentsMdContext::empty(&std::path::PathBuf::from(".")));
+        let mut cx = crate::core::context::Context::new(&crate::core::agents_md::AgentsMdContext::empty(&std::path::PathBuf::from(".")));
         // tokio::test gives us the runtime; handle does its own tokio::spawn.
         handle(Action::Submit("hello world".into()), &cfg, &mut cx, &convo, &mut agent, &sink, &hub);
         assert!(agent.is_some(), "submit sets the agent slot");
@@ -1760,7 +1760,7 @@ mod tests {
         let mut agent: Option<Agent>;
         let first_token = Arc::new(crate::cancel::CancelToken::new());
         let hub = crate::mcp::Hub::empty();
-        let mut cx = crate::context::Context::new(&crate::agents_md::AgentsMdContext::empty(&std::path::PathBuf::from(".")));
+        let mut cx = crate::core::context::Context::new(&crate::core::agents_md::AgentsMdContext::empty(&std::path::PathBuf::from(".")));
         // tokio::test wraps us in a runtime; spawn the pre-existing agent
         // slot inside this scope so its JoinHandle has a home.
         let first_job = tokio::spawn(async {});
@@ -1930,7 +1930,7 @@ mod tests {
         // `/garbage` does not exist; the dispatcher surfaces a warning
         // and returns None so the loop keeps its current cfg / convo.
         let cfg = tcfg("https://x");
-        let convo = Arc::new(AsyncMutex::new(crate::session::Convo::ephemeral()));
+        let convo = Arc::new(AsyncMutex::new(crate::core::session::Convo::ephemeral()));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
         let cmd = SlashCmd { name: "garbage", args: vec![] };
@@ -1945,7 +1945,7 @@ mod tests {
     #[tokio::test]
     async fn slash_help_announces_available_commands() {
         let cfg = tcfg("https://x");
-        let convo = Arc::new(AsyncMutex::new(crate::session::Convo::ephemeral()));
+        let convo = Arc::new(AsyncMutex::new(crate::core::session::Convo::ephemeral()));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
         let cmd = SlashCmd { name: "help", args: vec![] };
@@ -1973,7 +1973,7 @@ mod tests {
         std::env::set_var("HOME", dir);
         // No settings file written — slash_model loads an empty Settings.
         let cfg = tcfg("https://x");
-        let convo = Arc::new(AsyncMutex::new(crate::session::Convo::ephemeral()));
+        let convo = Arc::new(AsyncMutex::new(crate::core::session::Convo::ephemeral()));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let _sink = ChannelSink::new(tx);
         let r = slash_model(vec!["minimax/MiniMax-M3"], &cfg, &convo);

@@ -83,12 +83,12 @@ pub(crate) fn cfg(base: String, streaming: bool) -> crate::config::Config {
 /// A bare `Context` for tests that don't care about AGENTS.md or the
 /// tool list. Vendors take `&Context`; tests that exercise `body()` or
 /// `call_api()` need a handle, and wiring one by hand is noise. The empty
-/// AGENTS.md context gives us a system_text equal to `crate::SYSTEM`,
+/// AGENTS.md context gives us a system_text equal to `crate::core::context::SYSTEM`,
 /// which is what nearly every test wants anyway.
 #[cfg(test)]
-pub(crate) fn ctx() -> crate::context::Context {
-    let md = crate::agents_md::AgentsMdContext::empty(&std::path::PathBuf::from("."));
-    crate::context::Context::new(&md)
+pub(crate) fn ctx() -> crate::core::context::Context {
+    let md = crate::core::agents_md::AgentsMdContext::empty(&std::path::PathBuf::from("."));
+    crate::core::context::Context::new(&md)
 }
 
 /// Serve one HTTP response on a fresh port: `response` as JSON (status 200)
@@ -185,18 +185,18 @@ pub(crate) fn mock_stall(first: &'static str, stalled: &'static str) -> u16 {
 }
 
 #[cfg(test)]
-pub(crate) fn block_text(b: &crate::ir::Block) -> Option<&str> {
-    match b { crate::ir::Block::Text(t) => Some(t), _ => None }
+pub(crate) fn block_text(b: &crate::core::ir::Block) -> Option<&str> {
+    match b { crate::core::ir::Block::Text(t) => Some(t), _ => None }
 }
 
 #[cfg(test)]
-pub(crate) fn block_name(b: &crate::ir::Block) -> &str {
-    match b { crate::ir::Block::ToolUse { name, .. } => name, _ => "" }
+pub(crate) fn block_name(b: &crate::core::ir::Block) -> &str {
+    match b { crate::core::ir::Block::ToolUse { name, .. } => name, _ => "" }
 }
 
 #[cfg(test)]
-pub(crate) fn block_input(b: &crate::ir::Block) -> &serde_json::Value {
-    match b { crate::ir::Block::ToolUse { input, .. } => input, _ => &serde_json::Value::Null }
+pub(crate) fn block_input(b: &crate::core::ir::Block) -> &serde_json::Value {
+    match b { crate::core::ir::Block::ToolUse { input, .. } => input, _ => &serde_json::Value::Null }
 }
 
 
@@ -211,7 +211,7 @@ pub(crate) trait BlockExt {
     fn input(&self) -> &serde_json::Value;
 }
 #[cfg(test)]
-impl BlockExt for crate::ir::Block {
+impl BlockExt for crate::core::ir::Block {
     fn text(&self) -> Option<&str> { block_text(self) }
     fn name(&self) -> &str { block_name(self) }
     fn input(&self) -> &serde_json::Value { block_input(self) }
