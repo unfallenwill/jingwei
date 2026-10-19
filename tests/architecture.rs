@@ -13,7 +13,7 @@
 //   L3  config (+ settings/login), tools (+ edit/ledger/runtime), mcp + submodules
 //                                                  — the user's wishes and the tool tier
 //   L4  api (+ api::minimax/zai/deepseek)          — vendor + transport
-//   L5  lib, main, agent (+ runner), workflow, ui::plain, ui::tui (+ model/update/view)
+//   L5  lib, main, agent (+ runner/roster), workflow, ui::plain, ui::tui (+ model/update/view)
 //                                                  — composition root + the loop + the port's adapters
 //   T   test_util                                  — test-only helpers
 //
@@ -116,6 +116,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("main", Layer::L5),
     ("agent", Layer::L5),               // the agent as a value
     ("agent::runner", Layer::L5),       // the turn loop
+    ("agent::roster", Layer::L5),       // the registry of live agents
     ("workflow", Layer::L5),            // the run boundary
     ("ui::plain", Layer::L5),
     ("ui::tui", Layer::L5),

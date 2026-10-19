@@ -39,6 +39,7 @@ pub mod update;
 pub mod view;
 
 use crate::api::VENDORS;
+use crate::agent::roster::Roster;
 use crate::config::Config;
 use crate::ui::{error_note, ChannelSink, Msg, Sev, Show as DisplayShow};
 use crate::mcp::Hub;
@@ -600,12 +601,12 @@ pub async fn run(cfg: Config, ctx: crate::core::context::Context, convo: Convo, 
                             // crossed a slash-command boundary — sync the
                             // menu from scratch (cheap when nothing changes).
                             refresh_completion(&mut app, &hub).await;
-                            apply_outcome(handle(action, &cfg, &session, &mut run, &sink, &hub, &router), &mut cfg, &mut app, &sink);
+                            apply_outcome(handle(action, &cfg, &session, &mut run, &sink, &hub, &router, &app.roster), &mut cfg, &mut app, &sink);
                         }
                         crossterm::event::Event::Paste(p) => {
                             let action = step(&mut app, Ev::Paste(p));
                             refresh_completion(&mut app, &hub).await;
-                            apply_outcome(handle(action, &cfg, &session, &mut run, &sink, &hub, &router), &mut cfg, &mut app, &sink);
+                            apply_outcome(handle(action, &cfg, &session, &mut run, &sink, &hub, &router, &app.roster), &mut cfg, &mut app, &sink);
                         }
                         // a resize needs no arm of its own: the Input arm
                         // polls the size every frame and redraws the viewport
@@ -935,7 +936,8 @@ fn protocol_of(name: &str) -> Option<crate::api::Protocol> {
 /// resolve here too: dispatching `/model` returns `Switch` with the
 /// newly-built Config.
 fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
-          run: &mut Option<RunHandle>, sink: &ChannelSink, hub: &Hub, router: &Arc<ToolRouter>) -> HandleOutcome {
+          run: &mut Option<RunHandle>, sink: &ChannelSink, hub: &Hub, router: &Arc<ToolRouter>,
+          roster: &Roster) -> HandleOutcome {
     match action {
         Action::None => HandleOutcome::None,
         Action::Cancel => {
@@ -971,6 +973,7 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
             let scope = crate::cancel::CancelScope::new();
             let run_scope = scope.clone();
             let sink = sink.clone(); // one for the spawned task, one for the shell
+            let roster = roster.clone(); // the registry of live agents, for the run
             let job = tokio::spawn(async move {
                 // The session lock is held for the whole turn: the
                 // transcript the model sees and the file it lands in are
@@ -982,7 +985,7 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
                 // out — it hands the task to the run, which owns the
                 // begin, the saves, the end, and the note a failure
                 // earns (inside the run's bracket, where it belongs).
-                let _ = run_task(&line, &cfg, ctx, convo, &router, &run_scope, &sink, &error_note).await;
+                let _ = run_task(&line, &cfg, ctx, convo, &router, &run_scope, &roster, &sink, &error_note).await;
             });
             *run = Some(RunHandle { scope, job });
             HandleOutcome::None
@@ -1741,7 +1744,7 @@ mod tests {
         let mut run: Option<RunHandle> = None;
         let hub = crate::mcp::Hub::empty();
         let router = router(&hub);
-        handle(action, &cfg, &session, &mut run, &sink, &hub, &router);
+        handle(action, &cfg, &session, &mut run, &sink, &hub, &router, &Roster::new());
         (sink, run)
     }
 
@@ -1773,7 +1776,7 @@ mod tests {
         let hub = crate::mcp::Hub::empty();
         let router = router(&hub);
         // tokio::test gives us the runtime; handle does its own tokio::spawn.
-        handle(Action::Submit("hello world".into()), &cfg, &session, &mut run, &sink, &hub, &router);
+        handle(Action::Submit("hello world".into()), &cfg, &session, &mut run, &sink, &hub, &router, &Roster::new());
         assert!(run.is_some(), "submit sets the run slot");
         // a task begin landed in the sink. The begin comes from the run
         // the job spawned, so we wait for it rather than assume it is
@@ -1813,7 +1816,7 @@ mod tests {
         // slot inside this scope so its JoinHandle has a home.
         let first_job = tokio::spawn(async {});
         run = Some(RunHandle { scope: first_scope.clone(), job: first_job });
-        handle(Action::Submit("second task".into()), &cfg, &session, &mut run, &sink, &hub, &router);
+        handle(Action::Submit("second task".into()), &cfg, &session, &mut run, &sink, &hub, &router, &Roster::new());
         // the original run is still there — the same scope, not replaced.
         // The scope is the tree, and the tree has no pointer to compare:
         // cancel through the run's own scope and ask the first one.

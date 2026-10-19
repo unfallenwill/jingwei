@@ -26,6 +26,7 @@
 use crate::core::turn::{Turn, TurnState};
 use crate::ui::Usage;
 
+pub(crate) mod roster;
 pub(crate) mod runner;
 
 pub(crate) use crate::core::ids::AgentId;

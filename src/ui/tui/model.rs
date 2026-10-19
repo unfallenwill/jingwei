@@ -3,6 +3,7 @@
 //! (folding, scrolling, editing, the status bar) is a fact about this data
 //! that a test can pin.
 
+use crate::agent::roster::Roster;
 use crate::ui::{Sev, Usage};
 use std::time::Duration;
 
@@ -233,6 +234,10 @@ pub struct App {
     /// `/mcp` subcommands + server names). `None` while the input is not
     /// a slash command — and the only state the menu itself owns.
     pub completion: Option<Completion>,
+    /// The registry of live agents. The run site clones it into the
+    /// spawned task, so the agent a run starts is registered while it
+    /// runs and gone when it ends.
+    pub roster: Roster,
 }
 
 /// One row in the slash-command menu. `insert` is what Tab writes into
@@ -307,6 +312,7 @@ impl App {
             quit: false,
             scroll: Scroll::Tail,
             completion: None,
+            roster: Roster::new(),
         }
     }
 

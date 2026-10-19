@@ -9,6 +9,7 @@
 //! (`crate::workflow` or a frontend), which is exactly why every
 //! piece can be tested with mocks and why new frontends cost nothing.
 
+use crate::agent::roster::Roster;
 use crate::agent::Agent;
 use crate::api::call_api as api_call_api;
 use crate::cancel::{CancelScope, CancelToken};
@@ -44,7 +45,40 @@ const MAX_TOOL_OUTPUT: usize = 50_000;
 /// after the wrapper returns to read the terminal state — the wrapper owns
 /// the cancel select (`tokio::select!` against Ctrl-C) and the
 /// double-signal semantics, not to hide the lifecycle from anyone.
-pub(crate) async fn run_agent(agent: &mut Agent, cfg: &Config, ctx: &mut Context, router: &ToolRouter, scope: &CancelScope, sink: &dyn Show) -> crate::Result<()> {
+///
+/// `roster` is the registry of live agents: the agent is registered for
+/// the length of the run and lets itself go when the run ends, on every
+/// path out. The roster holds the *scope* the run was handed, so a stop
+/// request that reaches the roster stops the run and everything under it.
+pub(crate) async fn run_agent(
+    agent: &mut Agent,
+    cfg: &Config,
+    ctx: &mut Context,
+    router: &ToolRouter,
+    scope: &CancelScope,
+    roster: &Roster,
+    sink: &dyn Show,
+) -> crate::Result<()> {
+    roster.register(agent.id, scope.clone());
+    let res = run_under_scope(agent, cfg, ctx, router, scope, sink).await;
+    roster.remove(agent.id);
+    res
+}
+
+/// The run itself, under the scope the caller handed in.
+///
+/// Split out of [`run_agent`] so the registration above has exactly one
+/// way out: the body below returns from inside a `tokio::select!`, and a
+/// deregistration that sat next to the registration would be skipped on
+/// that path — leaving a finished agent in the roster for ever.
+async fn run_under_scope(
+    agent: &mut Agent,
+    cfg: &Config,
+    ctx: &mut Context,
+    router: &ToolRouter,
+    scope: &CancelScope,
+    sink: &dyn Show,
+) -> crate::Result<()> {
     // The run's own leaf, under the scope the caller handed in.
     let token = scope.token();
     let run = agent_loop(agent, cfg, ctx, router, &token, sink);
@@ -195,10 +229,10 @@ mod tests {
     use crate::agent::{AgentRole, AgentId};
     use crate::cancel::{CancelScope, CancelToken};
     use crate::mcp::Hub;
-    use crate::test_util::{block_on, cfg, mock_seq, mock_stall, sink};
+    use crate::test_util::{block_on, cfg, mock_seq, mock_seq_with, mock_stall, sink};
     use serde_json::json;
     use serde_json::Value;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// History back as JSON, for the assertions the tests have always made.
     fn hist(history: &[Message]) -> Value {
@@ -454,7 +488,7 @@ mod tests {
         let mut cx = ctx_with("say hi");
         block_on(async {
             let (router, hub) = router();
-            run_agent(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &CancelScope::new(), &sink()).await.unwrap();
+            run_agent(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &CancelScope::new(), &Roster::new(), &sink()).await.unwrap();
             hub.shutdown().await;
         });
         // the wrapper drove Queued → InProgress → Completed on the agent
@@ -481,7 +515,7 @@ mod tests {
         scope.cancel();
         let err = block_on(async {
             let (router, hub) = router();
-            let res = run_agent(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &scope, &sink()).await;
+            let res = run_agent(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &scope, &Roster::new(), &sink()).await;
             hub.shutdown().await;
             res
         }).unwrap_err();
@@ -490,5 +524,43 @@ mod tests {
         let reqs = reqs.lock().unwrap();
         assert!(reqs.is_empty(), "a run under a dead scope sends no request: {reqs:?}");
         assert_eq!(agent.state(), TurnState::Interrupted);
+    }
+
+    /// The runner registers the agent it runs and lets it go when the run
+    /// ends.
+    ///
+    /// The roster is what a stop request reaches through, so the
+    /// registration has to cover the whole run — and end with it. The
+    /// mock's request hook looks at the roster at the exact moment the
+    /// request is in flight, so the assertion is about the fact rather
+    /// than about a timing.
+    #[test]
+    fn the_runner_registers_the_agent_it_runs_and_lets_it_go_when_the_run_ends() {
+        let done = r#"{"content":[{"type":"text","text":"all done"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let roster = Roster::new();
+        // what the roster held while the request was in flight
+        let during = Arc::new(Mutex::new(Vec::new()));
+        let seen = during.clone();
+        let watch = roster.clone();
+        let (port, _) = mock_seq_with(vec![(200, done.into())], move || {
+            seen.lock().unwrap().extend(watch.live_ids());
+        });
+        let mut agent = Agent::main("say hi");
+        let mut cx = ctx_with("say hi");
+        block_on(async {
+            let (router, hub) = router();
+            run_agent(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &CancelScope::new(), &roster, &sink()).await.unwrap();
+            hub.shutdown().await;
+        });
+        assert_eq!(
+            during.lock().unwrap().clone(),
+            vec![agent.id],
+            "the agent was registered while it ran"
+        );
+        assert!(
+            roster.live_ids().is_empty(),
+            "and it let the roster go when the run ended: {:?}",
+            roster.live_ids()
+        );
     }
 }

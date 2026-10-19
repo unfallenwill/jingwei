@@ -27,6 +27,7 @@ mod workflow;
 pub mod ui;
 
 #[cfg(test)] mod test_util;
+use crate::agent::roster::Roster;
 use crate::cancel::CancelScope;
 use crate::config::{Args, Config, build_config};
 use crate::core::agents_md::AgentsMdContext;
@@ -145,7 +146,8 @@ async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agent
     // exit code stays the run's own. It says nothing about a failure
     // itself: the error is the process's, and the binary paints it.
     let scope = CancelScope::new();
-    let res = run_task(&prompt, &cfg, &mut ctx, &mut convo, &router, &scope, &sink, &|_| None).await;
+    let roster = Roster::new();
+    let res = run_task(&prompt, &cfg, &mut ctx, &mut convo, &router, &scope, &roster, &sink, &|_| None).await;
     hub.shutdown().await;
     res
 }

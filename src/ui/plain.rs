@@ -174,6 +174,9 @@ pub async fn plain_repl(
         sink.show(Msg::Banner(note));
     }
     let stdin = std::io::stdin();
+    // The registry of live agents: one for the whole REPL, so an agent
+    // that is running is registered for as long as it runs.
+    let roster = crate::agent::roster::Roster::new();
     loop {
         if tty {
             // The interactive prompt must match the TaskBegin banner
@@ -219,7 +222,7 @@ pub async fn plain_repl(
         // earns, said inside the run's bracket so it belongs to the
         // task it is about.
         let scope = crate::cancel::CancelScope::new();
-        let _ = crate::workflow::run_task(&line, cfg, &mut ctx, &mut convo, &router, &scope, &sink, &ui::error_note).await;
+        let _ = crate::workflow::run_task(&line, cfg, &mut ctx, &mut convo, &router, &scope, &roster, &sink, &ui::error_note).await;
     }
     Ok(())
 }

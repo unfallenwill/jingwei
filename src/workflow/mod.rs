@@ -13,6 +13,8 @@
 //!   mid-run leaves a transcript rather than a silence;
 //! - the run is bracketed by exactly one `TaskBegin` and one `TaskEnd` —
 //!   *always*, including the error path, so a frontend never dangles;
+//! - the agent the run works is **registered while it runs** and gone when
+//!   it ends, so a stop request that reaches the roster finds it;
 //! - a failed save **warns and does not abort**: the conversation lives
 //!   in memory either way, and the agent must not die because the disk
 //!   did.
@@ -27,6 +29,7 @@
 //! stays right. Presentation belongs to the frontend, and the boundary
 //! only decides *when* it is said.
 
+use crate::agent::roster::Roster;
 use crate::agent::runner::run_agent;
 use crate::agent::Agent;
 use crate::cancel::CancelScope;
@@ -55,6 +58,10 @@ use crate::ui::{Msg, Sev, Show};
 /// `scope` is the run's cancel scope: the run mints its leaf from it, so
 /// a cancel of the scope stops the run and everything under it — and a run
 /// that starts under an already-cancelled scope does no work.
+///
+/// `roster` is the registry of live agents: the run registers the agent
+/// it runs and lets it go when the run ends, so a stop request that
+/// reaches the roster finds the agent it is meant to stop.
 pub(crate) async fn run_task(
     task: &str,
     cfg: &Config,
@@ -62,6 +69,7 @@ pub(crate) async fn run_task(
     convo: &mut Convo,
     router: &ToolRouter,
     scope: &CancelScope,
+    roster: &Roster,
     sink: &dyn Show,
     on_error: &(dyn Fn(&crate::Error) -> Option<Msg> + Sync),
 ) -> crate::Result<()> {
@@ -72,7 +80,7 @@ pub(crate) async fn run_task(
         sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
     }
     let mut agent = Agent::main(task);
-    let res = run_agent(&mut agent, cfg, ctx, router, scope, sink).await;
+    let res = run_agent(&mut agent, cfg, ctx, router, scope, roster, sink).await;
     // the failure is said inside the run: a note after the run's end
     // would belong to nothing
     if let Err(e) = &res {
@@ -193,7 +201,7 @@ mod tests {
         block_on(async {
             let (router, hub) = router();
             let res = run_task(task, &cfg(format!("http://127.0.0.1:{port}"), false),
-                               ctx, convo, &router, &CancelScope::new(), sink, on_error).await;
+                               ctx, convo, &router, &CancelScope::new(), &Roster::new(), sink, on_error).await;
             hub.shutdown().await;
             res
         })
