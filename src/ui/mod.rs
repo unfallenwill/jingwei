@@ -123,6 +123,10 @@ pub enum AgentMsg {
     /// A note — a warning, an error, the final report.
     Note { sev: Sev, text: String },
     /// The agent reached a terminal state, with its report.
+    ///
+    /// The report is empty when the agent already streamed it: the
+    /// frontends have the text, and saying it again would print the
+    /// answer twice.
     Finished { state: TurnState, report: String },
 }
 

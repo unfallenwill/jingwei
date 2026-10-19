@@ -92,6 +92,7 @@ pub(crate) async fn run_worker(job: WorkerJob) {
     let sink = CountingSink {
         inner: AgentSink::new(job.sink.clone(), job.id),
         count: job.tools.clone(),
+        seen: Mutex::new(String::new()),
     };
     // The main agent's run, verbatim: one implementation, two callers.
     let _ = run_agent(
@@ -110,7 +111,16 @@ pub(crate) async fn run_worker(job: WorkerJob) {
     // and its report never land, and its chip never leaves the status
     // bar. The announcement goes straight to the session's sink — the
     // `AgentSink`'s drop list would swallow a wrapped event.
-    sink.inner.finished(agent.state(), agent.report.clone().unwrap_or_default());
+    //
+    // The report is announced only when the frontends have not seen it.
+    // The report *is* the last thing the worker said, and the worker
+    // streams what it says, so by the time it ends the human has read
+    // the answer already; saying it again would print it twice. A
+    // worker that was stopped before it spoke, or one that answered
+    // outside the stream, still has something to announce.
+    let report = agent.report.clone().unwrap_or_default();
+    let announce = if sink.has_seen(&report) { String::new() } else { report };
+    sink.inner.finished(agent.state(), announce);
     let done = WorkerDone { agent, elapsed: started.elapsed() };
     if let Ok(mut slot) = job.done.lock() {
         *slot = Some(done);
@@ -150,12 +160,35 @@ fn last_text(ctx: &crate::core::context::Context) -> Option<String> {
 struct CountingSink {
     inner: AgentSink,
     count: Arc<AtomicUsize>,
+    /// The prose the human has been shown so far.
+    seen: Mutex<String>,
+}
+
+impl CountingSink {
+    /// Has the human already read this text?
+    ///
+    /// The worker streams what it says, so the frontends have its last
+    /// answer before the worker ends — and the report is that answer.
+    fn has_seen(&self, report: &str) -> bool {
+        let report = report.trim();
+        if report.is_empty() {
+            return false;
+        }
+        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        seen.trim_end().ends_with(report)
+    }
 }
 
 impl Show for CountingSink {
     fn show(&self, m: Msg) {
-        if matches!(m, Msg::Tool { .. }) {
-            self.count.fetch_add(1, Ordering::Relaxed);
+        match &m {
+            Msg::Tool { .. } => {
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
+            Msg::Text(t) => {
+                self.seen.lock().unwrap_or_else(|e| e.into_inner()).push_str(t);
+            }
+            _ => {}
         }
         self.inner.show(m);
     }

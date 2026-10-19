@@ -578,8 +578,34 @@ mod tests {
     /// A model that answers once and stops.
     const ANSWER: &str =
         r#"{"content":[{"type":"text","text":"the report"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
+    /// A model that answers with nothing to say.
+    const SILENT: &str = r#"{"content":[],"usage":{"input_tokens":1,"output_tokens":1}}"#;
     /// A model that refuses.
     const REFUSED: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"no"}}"#;
+
+    /// The announcement a worker made when it ended, if it made one.
+    fn announcement(msgs: &[Msg]) -> Option<(TurnState, String)> {
+        msgs.iter().find_map(|m| match m {
+            Msg::FromAgent { event, .. } => match &**event {
+                AgentMsg::Finished { state, report } => Some((*state, report.clone())),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
+    /// The prose a worker streamed, as the frontends received it.
+    fn prose(msgs: &[Msg]) -> String {
+        msgs.iter()
+            .filter_map(|m| match m {
+                Msg::FromAgent { event, .. } => match &**event {
+                    AgentMsg::Text(t) => Some(t.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
 
     /// The world a fleet lives in: the fleet itself, the run's scope, the
     /// sink every event goes through, the main's own context, and the
@@ -736,8 +762,8 @@ mod tests {
     fn a_worker_announces_its_end() {
         // The frontends hold a worker's prose until it says it is over:
         // without the announcement the prose stays buffered in the TUI,
-        // the summary and the report never land, and the chip never
-        // leaves the status bar.
+        // the summary never lands, and the chip never leaves the status
+        // bar.
         let (port, _reqs) = mock_seq(vec![(200, ANSWER.into())]);
         let h = block_on(async {
             let h = Harness::new(port, AgentCfg { max_agents: 4, wait_ms: 2_000 });
@@ -746,16 +772,34 @@ mod tests {
             h
         });
         let msgs = h.rec.msgs();
-        let finished = msgs.iter().find_map(|m| match m {
-            Msg::FromAgent { event, .. } => match &**event {
-                AgentMsg::Finished { state, report } => Some((*state, report.clone())),
-                _ => None,
-            },
-            _ => None,
-        });
-        let (state, report) = finished.expect("the worker announced its end");
+        let (state, report) = announcement(&msgs).expect("the worker announced its end");
         assert_eq!(state, TurnState::Completed, "and said how it ended");
-        assert_eq!(report, "the report", "and carried its report");
+        // The report is the worker's last answer, and the worker streams
+        // its answers: the frontends have it already, so the announcement
+        // does not say it a second time.
+        assert_eq!(report, "", "the answer is not said twice: {msgs:?}");
+        assert!(
+            prose(&msgs).contains("the report"),
+            "but the answer itself did reach them: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn a_worker_that_said_nothing_says_so() {
+        // The report is announced when the frontends have not seen it: a
+        // worker that finished without answering has nothing to repeat,
+        // and the human is owed the fact that it said nothing.
+        let (port, _reqs) = mock_seq(vec![(200, SILENT.into())]);
+        let h = block_on(async {
+            let h = Harness::new(port, AgentCfg { max_agents: 4, wait_ms: 2_000 });
+            h.fleet.spawn("count the files", None).unwrap();
+            h.fleet.wait(&[], &CancelToken::new()).await;
+            h
+        });
+        let msgs = h.rec.msgs();
+        let (state, report) = announcement(&msgs).expect("the worker announced its end");
+        assert_eq!(state, TurnState::Completed, "and said how it ended");
+        assert_eq!(report, "no answer", "and said it had nothing to say: {msgs:?}");
     }
 
     #[test]
