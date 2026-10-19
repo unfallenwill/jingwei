@@ -105,6 +105,12 @@ pub(crate) async fn run_worker(job: WorkerJob) {
     )
     .await;
     agent.report = report_of(&ctx, agent.state());
+    // The worker announces its end. Without this the frontends never hear
+    // that it is over: its prose stays buffered in the TUI, its summary
+    // and its report never land, and its chip never leaves the status
+    // bar. The announcement goes straight to the session's sink — the
+    // `AgentSink`'s drop list would swallow a wrapped event.
+    sink.inner.finished(agent.state(), agent.report.clone().unwrap_or_default());
     let done = WorkerDone { agent, elapsed: started.elapsed() };
     if let Ok(mut slot) = job.done.lock() {
         *slot = Some(done);

@@ -571,7 +571,7 @@ mod tests {
     use crate::agent::tools::AgentTools;
     use crate::core::ports::ToolProvider;
     use crate::test_util::{block_on, cfg, mock_seq, request_body, Recorder};
-    use crate::ui::Msg;
+    use crate::ui::{AgentMsg, Msg};
     use serde_json::json;
     use std::io::{Read, Write};
 
@@ -730,6 +730,32 @@ mod tests {
         // session's tokens
         assert!(!msgs.iter().any(|m| matches!(m, Msg::TaskEnd | Msg::TaskBegin(_))), "got: {msgs:?}");
         assert!(!msgs.iter().any(|m| matches!(m, Msg::Usage(_) | Msg::OutTokens(_))), "got: {msgs:?}");
+    }
+
+    #[test]
+    fn a_worker_announces_its_end() {
+        // The frontends hold a worker's prose until it says it is over:
+        // without the announcement the prose stays buffered in the TUI,
+        // the summary and the report never land, and the chip never
+        // leaves the status bar.
+        let (port, _reqs) = mock_seq(vec![(200, ANSWER.into())]);
+        let h = block_on(async {
+            let h = Harness::new(port, AgentCfg { max_agents: 4, wait_ms: 2_000 });
+            h.fleet.spawn("count the files", None).unwrap();
+            h.fleet.wait(&[], &CancelToken::new()).await;
+            h
+        });
+        let msgs = h.rec.msgs();
+        let finished = msgs.iter().find_map(|m| match m {
+            Msg::FromAgent { event, .. } => match &**event {
+                AgentMsg::Finished { state, report } => Some((*state, report.clone())),
+                _ => None,
+            },
+            _ => None,
+        });
+        let (state, report) = finished.expect("the worker announced its end");
+        assert_eq!(state, TurnState::Completed, "and said how it ended");
+        assert_eq!(report, "the report", "and carried its report");
     }
 
     #[test]
