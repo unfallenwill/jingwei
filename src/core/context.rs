@@ -88,10 +88,11 @@ pub(crate) struct Context {
     pub(crate) tools: Vec<Value>,
     /// The transcript — the conversation this agent is having. The
     /// Context is its only owner: the agent loop appends to it, the
-    /// vendors read it, and the trim policy shrinks it. Private, so
-    /// that every change to it goes through the methods below — the
-    /// pairing invariant the trim policy maintains stays one step away
-    /// from being broken.
+    /// vendors read it, and the trim policy shrinks it. The field is
+    /// private, but `history_mut` hands the whole vector out, so the
+    /// pairing invariant the trim policy maintains — never two
+    /// assistant messages in a row — is kept by the agent loop's
+    /// discipline, not by the type. `push` is the ordinary way in.
     history: Vec<Message>,
     /// The trim budget: the token estimate the transcript must fit. It
     /// comes from `--context-size`, and it is this agent's own — two

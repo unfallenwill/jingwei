@@ -92,9 +92,11 @@ async fn agent_loop(cfg: &Config, ctx: &mut Context, turn: &mut Turn, token: &Ca
         .map_err(|e| Error::Msg(e.to_string()))?;
 
     let result = run_turn(cfg, ctx, token, router, sink).await;
-    // The Result → TurnOutcome translation lives here because `Error`
-    // is a crate-root type and turn.rs deliberately does not depend on it.
-    // From TurnOutcome onward, the mapping is the turn's own concern.
+    // The Result → TurnOutcome translation lives here because `core::turn`
+    // deliberately keeps no dependency on the error vocabulary: the turn
+    // carries a failure as a `String`, and turning the error type into
+    // that string is the agent's own concern. From TurnOutcome onward,
+    // the mapping is the turn's own.
     let outcome = match &result {
         Ok(()) => TurnOutcome::Completed,
         Err(Error::Interrupted) => TurnOutcome::Interrupted,
@@ -187,10 +189,6 @@ mod tests {
     /// History back as JSON, for the assertions the tests have always made.
     fn hist(history: &[Message]) -> Value {
         crate::core::ir::history_value(history)
-    }
-    /// A response's blocks as JSON, read like a `content` array.
-    fn blocks(b: &[Block]) -> Value {
-        Value::Array(b.iter().map(Block::to_value).collect())
     }
     /// A router over the four built-ins and an empty hub — the tool list
     /// the model sees is the built-in list, and every call goes to the

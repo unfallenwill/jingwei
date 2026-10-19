@@ -79,10 +79,12 @@ const LAYERS: &[(&str, Layer)] = &[
     ("core::agents_md", Layer::L1),    // walks the FS
     ("core::reminder", Layer::L1),
     // L2 — per-agent state and the ports.
-    ("core::context", Layer::L2),      // the per-turn model state. It takes
-                                        // the tool list from the router, so
-                                        // it no longer reaches into the
-                                        // tool tier
+    ("core::context", Layer::L2),      // the per-session model state: the
+                                        // system text, the reminders, the
+                                        // tool list, the transcript, the
+                                        // budget. It takes the tool list
+                                        // from the router, so it no longer
+                                        // reaches into the tool tier
     ("core::ports", Layer::L2),        // the tool boundary
     ("core::prompt", Layer::L2),       // the prompt's own module
     // L3 — the tool/config tier. May reach into api (L4); see the

@@ -99,7 +99,6 @@ mod tests {
         assert!(!Error::Interrupted.is_transient(), "a cancellation is not a failure to retry");
     }
 
-    #[test]
     // ---- Error: the type's display & conversions -------------------------
 
     #[test]
