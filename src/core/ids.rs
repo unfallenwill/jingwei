@@ -34,6 +34,20 @@ impl AgentId {
     pub(crate) fn next() -> AgentId {
         AgentId(NEXT.fetch_add(1, Ordering::Relaxed))
     }
+
+    /// Read an id back from the tag a human sees.
+    ///
+    /// The fleet's tools speak ids in the display form — the model writes
+    /// `a1`, the human types `a1` — so something has to turn that string
+    /// back into the identity underneath it. Only the worker form parses:
+    /// `main` is the conversation, not a background agent, and `a0` is the
+    /// one number the counter never hands out.
+    #[allow(dead_code)] // the fleet slice hands ids back; until then only the tests do
+    pub(crate) fn parse(s: &str) -> Option<AgentId> {
+        let n: u64 = s.strip_prefix('a')?.parse().ok()?;
+        if n == 0 { return None; }
+        Some(AgentId(n))
+    }
 }
 
 /// The process-wide counter of minted ids.
@@ -83,5 +97,22 @@ mod tests {
     fn a_worker_id_reads_as_a1() {
         assert_eq!(AgentId(1).to_string(), "a1");
         assert_eq!(AgentId(42).to_string(), "a42");
+    }
+
+    #[test]
+    fn an_id_parses_from_its_display_form() {
+        assert_eq!(AgentId::parse("a1"), Some(AgentId(1)));
+        assert_eq!(AgentId::parse("a42"), Some(AgentId(42)));
+        // a round trip: what a human reads is what a model can hand back
+        let id = AgentId::next();
+        assert_eq!(AgentId::parse(&id.to_string()), Some(id));
+        // the main agent is the conversation, not a background worker
+        assert_eq!(AgentId::parse("main"), None);
+        // a0 is the number the counter never hands out
+        assert_eq!(AgentId::parse("a0"), None);
+        // and a name is not an id
+        assert_eq!(AgentId::parse("build"), None);
+        assert_eq!(AgentId::parse(""), None);
+        assert_eq!(AgentId::parse("a"), None);
     }
 }
