@@ -168,7 +168,22 @@ mod tests {
     use crate::api::{Effort, Thinking as CThinking};
     use crate::core::ir::{Block, Message, ToolResult};
     use crate::test_util::{block_on, cfg, ctx as make_ctx, mock, mock_seq, request_body, sink, BlockExt};
+    use crate::ui::{Msg, Show};
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    /// A sink that keeps every message: this test is about the sequence
+    /// the port receives, not about what a frontend would draw with it.
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<Msg>>>);
+
+    impl Recorder {
+        fn msgs(&self) -> Vec<Msg> { self.0.lock().unwrap().clone() }
+    }
+
+    impl Show for Recorder {
+        fn show(&self, m: Msg) { self.0.lock().unwrap().push(m); }
+    }
 
     #[test]
     fn body_thinking_toggle_and_verbatim_echo() {
@@ -352,6 +367,33 @@ mod tests {
         // And the ctx gauge can read it: context_in() = input + cache_read + cache_write.
         let u = crate::ui::Usage::from_value(&resp.usage);
         assert_eq!(u.context_in(), 2034, "ctx_in must include input + cache_read");
+    }
+
+    #[test]
+    fn a_stream_with_no_usage_delta_still_ends_with_a_done() {
+        // the wire can end a request without a usage delta: the port then
+        // sees a `Done` and no `Usage`, and the frontend's accounting has
+        // to leave the numbers alone rather than fold the last reading
+        // a second time. The api layer must not invent a `Usage` it does
+        // not have — the frontend is the one that copes.
+        let stream = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1234}}}"#, "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#, "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n");
+        let port = mock(stream, 200, true);
+        let c = cfg(format!("http://127.0.0.1:{port}"), true);
+        let token = crate::cancel::CancelToken::new();
+        let cx = make_ctx();
+        let rec = Recorder::default();
+        let (resp, _, _) = block_on(call_api(&c, &cx, &token, &rec)).unwrap();
+        // The tokens the wire did report are still ours to keep — what is
+        // missing is the delta, not the reading.
+        assert_eq!(resp.usage["input_tokens"], 1234, "the reported tokens are kept: {}", resp.usage);
+        let msgs = rec.msgs();
+        assert!(msgs.iter().any(|m| matches!(m, Msg::Done)), "the request still ends: {msgs:?}");
+        assert!(!msgs.iter().any(|m| matches!(m, Msg::Usage(_))), "no usage was reported: {msgs:?}");
     }
 
     #[test]
