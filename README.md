@@ -315,6 +315,14 @@ cannot answer, or one to a server that was disabled mid-session, comes
 back as a sentence the model can read: `error: mcp server <name> is
 disabled; enable it with /mcp enable <name>`.
 
+A command takes effect on the registry at once — the tool list changes at
+once, so the model stops seeing a disabled server's tools on the next turn
+— and on the server's connection at that server's next safe point. A call
+already running on that server is allowed to finish: the command neither
+cancels it nor waits for it. Calls to different servers overlap; calls to
+one server are one at a time, because one connection is a request/response
+protocol.
+
 1. POST `{base}/v1/messages` (minimax — base defaulting to
    `https://api.minimax.cn/anthropic`, model to `MiniMax-M3`) or
    `{base}/chat/completions` (zai — base defaulting to

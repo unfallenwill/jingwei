@@ -708,6 +708,71 @@ mod tests {
         assert_eq!(stub.received().last().map(String::as_str), Some("eof"));
     }
 
+    /// The `gate` tool holds a call until its file appears. The hub's own
+    /// tests depend on that, and a fixture that did not hold would make them
+    /// pass for the wrong reason — so the fixture's contract is proved here,
+    /// at the protocol layer.
+    #[tokio::test]
+    async fn a_gated_call_waits_for_the_gate_to_open() {
+        let stub = Stub::new();
+        let gate = stub.gate();
+        let gate_path = gate.to_string_lossy().into_owned();
+        let connection = Connection::open(
+            &stub.config(&[("STUB_TOOLS", "gate"), ("STUB_GATE", gate_path.as_str())]),
+        )
+        .await
+        .expect("the stub server comes up");
+        let handle = tokio::spawn(async move { connection.call("gate", json!({"text": "hi there"})).await });
+        // The request reaches the server, and the server waits at the gate.
+        assert!(
+            stub.wait_for(r#""method":"tools/call""#).await,
+            "the call reached the server"
+        );
+        assert!(!handle.is_finished(), "the call is held until the gate opens");
+        std::fs::write(&gate, "open").unwrap();
+        let answer = handle.await.unwrap().expect("the gated call answers");
+        assert_eq!(answer, "called with {text:hi there}");
+    }
+
+    /// The transport can carry two calls to one server at once: the answers
+    /// are paired by their id, not by the order they were sent in. The hub
+    /// is what keeps one server's calls serial — a server that could only
+    /// take one call at a time would make the hub's rule untestable.
+    #[tokio::test]
+    async fn two_calls_to_one_server_can_be_in_flight_at_once() {
+        let stub = Stub::new();
+        let gate = stub.gate();
+        let gate_path = gate.to_string_lossy().into_owned();
+        let connection = Connection::open(
+            &stub.config(&[("STUB_TOOLS", "gate"), ("STUB_GATE", gate_path.as_str())]),
+        )
+        .await
+        .expect("the stub server comes up");
+        let connection = std::sync::Arc::new(connection);
+        let first = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.call("gate", json!({"text": "one"})).await }
+        });
+        assert!(
+            stub.wait_for(r#""method":"tools/call""#).await,
+            "the first call reached the server"
+        );
+        // The server's read loop is free while the first call is held, so
+        // the second call reaches it too.
+        let second = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.call("gate", json!({"text": "two"})).await }
+        });
+        assert!(
+            stub.wait_for(r#""text":"two""#).await,
+            "the second call reached the server as well"
+        );
+
+        std::fs::write(&gate, "open").unwrap();
+        assert_eq!(first.await.unwrap().unwrap(), "called with {text:one}");
+        assert_eq!(second.await.unwrap().unwrap(), "called with {text:two}");
+    }
+
     #[test]
     fn a_tool_without_a_name_is_not_a_tool() {
         assert!(read_tool(&json!({"name": "echo"})).is_some());

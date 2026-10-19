@@ -5,14 +5,21 @@
 //! holds the only `HubInner`. The split is on purpose — the protocol and the
 //! routing are the protocol layer's, and `HubInner` is the only thing that
 //! has to know both at once.
+//!
+//! The registry holds no connection. A connection lives in the task that owns
+//! it, and the registry holds the queue that task takes its work from. That
+//! is what lets the actor answer `/mcp` and the tool list while a call is in
+//! flight: the registry is cheap to read and is never held across a call.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde_json::{Value, json};
+use tokio::sync::{mpsc, oneshot};
 
-use super::client::Connection;
+use super::client::{Connection, RemoteTool};
 use super::config::{self, Entry};
+use super::{Command, ServerOp};
 
 /// What a tool the model named is: which server offers it, and what it is
 /// called there.
@@ -21,9 +28,54 @@ struct Route {
     tool: String,
 }
 
+/// A call the registry has resolved: the server that owns it, the tool's own
+/// name there, and the arguments it was given.
+struct Prepared {
+    server: String,
+    tool: String,
+    arguments: Value,
+}
+
+/// One call, handed to the server that owns it.
+struct Call {
+    /// The tool's own name on that server — not the public `mcp__server__tool`.
+    tool: String,
+    /// The arguments, already known to be a JSON object.
+    arguments: Value,
+    /// Where the answer goes. The task sends it; nobody waits for it here.
+    reply: oneshot::Sender<String>,
+}
+
+/// What the actor says to one server's task.
+enum ServerMsg {
+    /// Run one call on this server's connection.
+    Call(Call),
+    /// Open a fresh connection with this configuration and take it over. The
+    /// reply is answered by the actor, once the registry has been told what
+    /// the new connection offers.
+    Adopt {
+        op: ServerOp,
+        config: config::ServerConfig,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Close the connection at the next safe point, and keep the task.
+    Retire,
+    /// Close the connection and end the task.
+    Stop { done: oneshot::Sender<()> },
+}
+
+/// What a task reports when it has opened a connection: enough for the
+/// registry to describe the server and to rebuild its routes.
+pub(super) struct Adoption {
+    pub(super) identity: String,
+    pub(super) protocol: String,
+    pub(super) tools: Vec<RemoteTool>,
+    pub(super) notes: Vec<String>,
+}
+
 /// The state of one server, as the hub sees it. The public summary type:
-/// external callers do not need to see the [`Connection`] held inside the
-/// internal `Ready`, so this flat enum fits a `Vec` for `/mcp list`.
+/// external callers do not need to see what the internal `Ready` holds, so
+/// this flat enum fits a `Vec` for `/mcp list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerState {
     /// It came up and is offering its tools to the model.
@@ -49,13 +101,14 @@ pub struct ServerStatus {
 }
 
 /// The state of one server, as the hub sees it.
-#[allow(clippy::large_enum_variant)] // The actor task owns this; boxing Connection would
-// add a heap indirection the only consumer never shares.
 enum InternalState {
     /// It came up, and it offered these tools (the server's own names, in the
-    /// order the connection reported them).
+    /// order the connection reported them). The connection itself lives in
+    /// the server's task; what is kept here is what `/mcp` shows and what a
+    /// call needs to find it.
     Ready {
-        connection: Connection,
+        identity: String,
+        protocol: String,
         tools: Vec<String>,
     },
     /// It did not, and this is what there is to say about it.
@@ -69,7 +122,7 @@ enum InternalState {
 }
 
 impl InternalState {
-    /// The summary callers see, without the `Connection` inside.
+    /// The summary callers see, without the connection's details inside.
     fn summary(&self) -> ServerState {
         match self {
             InternalState::Ready { .. } => ServerState::Ready,
@@ -96,6 +149,11 @@ struct ServerEntry {
     /// up the file again.
     config: Result<config::ServerConfig, String>,
     state: InternalState,
+    /// The task that owns this server's connection, and the queue it takes
+    /// calls from. Present for *every* configured server — including one
+    /// that failed to start — because `enable` and `reconnect` have to be
+    /// able to reach a server whose connection was closed.
+    queue: mpsc::UnboundedSender<ServerMsg>,
 }
 
 /// Every server a session talks to, and the tools they offer between them.
@@ -145,15 +203,26 @@ impl HubInner {
     /// every server, and doing this one server at a time would make that wait
     /// the sum of theirs. A server that is slow to start is slow either way,
     /// and this way it is no one else's cost.
-    pub(super) async fn from_workspace(workspace: &Path, user_settings: Option<&Value>) -> Self {
+    ///
+    /// `actor` is the mailbox the server tasks report back through: a task
+    /// that opens a connection has to tell the registry what it found.
+    pub(super) async fn from_workspace(
+        workspace: &Path,
+        user_settings: Option<&Value>,
+        actor: mpsc::UnboundedSender<Command>,
+    ) -> Self {
         let (entries, warnings) = config::entries(workspace, user_settings);
-        Self::from_entries(entries, warnings).await
+        Self::from_entries(entries, warnings, actor).await
     }
 
     /// The same over entries that are already read: the file is where a
     /// session gets them from, and a test that has its own entries — a stub
     /// server, and no file to write — has no reason to go through one.
-    pub(super) async fn from_entries(entries: Vec<Entry>, warnings: Vec<String>) -> Self {
+    pub(super) async fn from_entries(
+        entries: Vec<Entry>,
+        warnings: Vec<String>,
+        actor: mpsc::UnboundedSender<Command>,
+    ) -> Self {
         let opened = futures_util::future::join_all(entries.iter().map(|entry| async move {
             match &entry.config {
                 Err(why) => Err(why.clone()),
@@ -161,15 +230,19 @@ impl HubInner {
             }
         }))
         .await;
-        Self::assemble(entries, opened, warnings)
+        Self::assemble(entries, opened, warnings, actor)
     }
 
     /// Build the hub from entries and whatever came of opening them: what
     /// the names are, which of them are offered, and what has to be said.
+    ///
+    /// Every entry gets a task, even one whose connection never came up: a
+    /// `reconnect` has to be able to reach a server that failed to start.
     fn assemble(
         entries: Vec<Entry>,
         opened: Vec<Result<Connection, String>>,
         warnings: Vec<String>,
+        actor: mpsc::UnboundedSender<Command>,
     ) -> Self {
         let mut inner = Self {
             servers: BTreeMap::new(),
@@ -179,95 +252,134 @@ impl HubInner {
             warnings,
         };
         for (entry, opened) in entries.into_iter().zip(opened) {
-            let how = how_to_reach(&entry);
-            let connection = match opened {
-                Ok(connection) => connection,
+            let Entry { name, from, config } = entry;
+            let how = how_to_reach(&config);
+            match opened {
                 Err(why) => {
+                    let queue = spawn_server(name.clone(), None, actor.clone());
                     inner.servers.insert(
-                        entry.name.clone(),
+                        name,
                         ServerEntry {
                             how,
-                            from: entry.from,
-                            config: entry.config,
+                            from,
+                            config,
                             state: InternalState::Failed(why),
+                            queue,
                         },
                     );
-                    continue;
                 }
-            };
-            let offered_names = inner.add_connection_tools(&entry.name, &connection);
-            for note in &connection.notes {
-                inner.warnings.push(format!("{}: {note}", entry.name));
+                Ok(mut connection) => {
+                    // The connection hands its tool list to the registry and
+                    // keeps the connection itself: the task owns that.
+                    let identity = connection.identity.clone();
+                    let protocol = connection.protocol.clone();
+                    let tools = std::mem::take(&mut connection.tools);
+                    let notes = std::mem::take(&mut connection.notes);
+                    let offered_names = inner.add_tools(&name, &tools);
+                    for note in &notes {
+                        inner.warnings.push(format!("{name}: {note}"));
+                    }
+                    let queue = spawn_server(name.clone(), Some(connection), actor.clone());
+                    inner.servers.insert(
+                        name,
+                        ServerEntry {
+                            how,
+                            from,
+                            config,
+                            state: InternalState::Ready {
+                                identity,
+                                protocol,
+                                tools: offered_names,
+                            },
+                            queue,
+                        },
+                    );
+                }
             }
-            inner.servers.insert(
-                entry.name.clone(),
-                ServerEntry {
-                    how,
-                    from: entry.from,
-                    config: entry.config,
-                    state: InternalState::Ready {
-                        connection,
-                        tools: offered_names,
-                    },
-                },
-            );
         }
         inner
     }
 
-    /// One tool call, answered with the text the model reads. Never fails:
-    /// a name nobody offers, a server that died, a refusal from the far end —
-    /// all of them come back as the result text.
-    pub(super) async fn call(&self, name: &str, args_json: &str) -> String {
+    /// Route one call to the server that owns it. Never awaits.
+    ///
+    /// The registry answers what it can answer at once — a name nobody
+    /// offers, a server that is not in service, arguments that are not an
+    /// object — and hands everything else to the server's own task, which
+    /// answers the caller when the call comes back.
+    pub(super) fn route_call(&self, name: &str, args_json: &str, reply: oneshot::Sender<String>) {
+        let prepared = match self.prepare(name, args_json) {
+            Ok(prepared) => prepared,
+            Err(message) => {
+                let _ = reply.send(message);
+                return;
+            }
+        };
+        let Prepared { server, tool, arguments } = prepared;
+        let Some(entry) = self.servers.get(&server) else {
+            // Unreachable: a route exists only for a server that came up. Said
+            // rather than assumed away, because a panic here would end a turn.
+            let _ = reply.send(format!("error: mcp server {server} is not connected"));
+            return;
+        };
+        let call = Call { tool, arguments, reply };
+        if let Err(sent) = entry.queue.send(ServerMsg::Call(call)) {
+            // The task is gone. The call still gets an answer: a call that is
+            // dropped looks to the model like a tool that returned nothing.
+            if let ServerMsg::Call(call) = sent.0 {
+                let _ = call.reply.send(format!("error: mcp server {server} is not connected"));
+            }
+        }
+    }
+
+    /// Everything the registry can say about a call without touching a
+    /// server: where it lands, and — when there is nowhere to send it — the
+    /// sentence the model reads instead.
+    fn prepare(&self, name: &str, args_json: &str) -> Result<Prepared, String> {
         let Some(route) = self.routes.get(name) else {
-            return format!(
+            return Err(format!(
                 "error: no MCP tool named {name:?} is offered. The MCP tools this session has \
                  are: {}",
                 self.offered_names()
-            );
+            ));
         };
         let Some(server) = self.servers.get(&route.server) else {
-            // Unreachable: a route exists only for a server that came up. Said
-            // rather than assumed away, because a panic here would end a turn.
-            return format!("error: mcp server {} is not connected", route.server);
+            return Err(format!("error: mcp server {} is not connected", route.server));
         };
-        let connection = match &server.state {
-            InternalState::Ready { connection, .. } => connection,
+        match &server.state {
+            InternalState::Ready { .. } => {}
             InternalState::Failed(why) => {
-                return format!(
+                return Err(format!(
                     "error: mcp server {} could not run {}: {why}",
                     route.server, route.tool
-                );
+                ));
             }
             InternalState::Disabled => {
-                return format!(
+                return Err(format!(
                     "error: mcp server {} is disabled; enable it with /mcp enable {}",
                     route.server, route.server
-                );
+                ));
             }
             InternalState::Disconnected => {
-                return format!(
+                return Err(format!(
                     "error: mcp server {} is disconnected; reconnect it with /mcp reconnect {}",
                     route.server, route.server
-                );
+                ));
             }
-        };
+        }
         let arguments = match serde_json::from_str::<Value>(args_json) {
             Ok(Value::Object(fields)) => Value::Object(fields),
             Ok(_) => {
-                return format!("error: the arguments of {name} have to be a JSON object");
+                return Err(format!("error: the arguments of {name} have to be a JSON object"));
             }
             Err(e) => {
-                return format!("error: the arguments of {name} are not valid JSON: {e}");
+                return Err(format!("error: the arguments of {name} are not valid JSON: {e}"));
             }
         };
-        match connection.call(&route.tool, arguments).await {
-            Ok(text) => text,
-            Err(why) => format!(
-                "error: mcp server {} could not run {}: {why}",
-                route.server, route.tool
-            ),
-        }
+        Ok(Prepared {
+            server: route.server.clone(),
+            tool: route.tool.clone(),
+            arguments,
+        })
     }
 
     /// The tools currently offered, in the order a request should send them
@@ -328,12 +440,10 @@ impl HubInner {
         let mut lines = Vec::new();
         for (name, entry) in &self.servers {
             match &entry.state {
-                InternalState::Ready { connection, tools } => lines.push(format!(
-                    "{name} · {} · {} tools · {} · protocol {} · from {}",
+                InternalState::Ready { identity, protocol, tools } => lines.push(format!(
+                    "{name} · {} · {} tools · {identity} · protocol {protocol} · from {}",
                     entry.how,
                     tools.len(),
-                    connection.identity,
-                    connection.protocol,
                     entry.from
                 )),
                 InternalState::Failed(why) => lines.push(format!(
@@ -383,111 +493,189 @@ impl HubInner {
             .collect()
     }
 
+    /// Apply one server operation. Never awaits.
+    ///
+    /// The registry's half of the work is done at once — the state changes,
+    /// and the tool list changes with it. The connection's half is handed to
+    /// the server's task, which does it at the server's next safe point: a
+    /// call already running on that server finishes, and the operation does
+    /// not cancel it and does not wait for it.
+    pub(super) fn server_op(
+        &mut self,
+        op: ServerOp,
+        name: &str,
+        reply: oneshot::Sender<Result<(), String>>,
+    ) {
+        match op {
+            ServerOp::Enable => self.enable(name, reply),
+            ServerOp::Disable => self.take_offline(name, InternalState::Disabled, reply),
+            ServerOp::Reconnect => self.reconnect(name, reply),
+            ServerOp::Disconnect => self.take_offline(name, InternalState::Disconnected, reply),
+        }
+    }
+
     /// Bring a `Disabled` server back online: open a fresh connection with
     /// its stored configuration, and route its tools to the model again.
-    pub(super) async fn enable(&mut self, name: &str) -> Result<(), String> {
-        let entry = self
-            .servers
-            .get(name)
-            .ok_or_else(|| format!("no MCP server named {name:?} is configured"))?;
+    ///
+    /// The connection is opened by the server's own task, so the actor is
+    /// free while it is being opened; the reply comes when the new
+    /// connection is up, or with the reason it did not come up.
+    fn enable(&mut self, name: &str, reply: oneshot::Sender<Result<(), String>>) {
+        let Some(entry) = self.servers.get(name) else {
+            let _ = reply.send(Err(format!("no MCP server named {name:?} is configured")));
+            return;
+        };
         match &entry.state {
             InternalState::Disabled => {}
             InternalState::Ready { .. } => {
-                return Err(format!("mcp server {name} is already enabled"));
+                let _ = reply.send(Err(format!("mcp server {name} is already enabled")));
+                return;
             }
             InternalState::Failed(why) => {
-                return Err(format!("mcp server {name} failed to start: {why}"));
+                let _ = reply.send(Err(format!("mcp server {name} failed to start: {why}")));
+                return;
             }
             InternalState::Disconnected => {
-                return Err(format!(
+                let _ = reply.send(Err(format!(
                     "mcp server {name} is disconnected; reconnect instead"
-                ));
+                )));
+                return;
             }
         }
-        let config = entry
-            .config
-            .as_ref()
-            .map_err(|why| format!("mcp server {name} cannot be enabled: {why}"))?
-            .clone();
-        // Drop the entry borrow before mutating `self`.
-        let connection = Connection::open(&config).await?;
-        self.adopt_connection(name, connection);
-        Ok(())
+        let config = match entry.config.as_ref() {
+            Ok(config) => config.clone(),
+            Err(why) => {
+                let _ = reply.send(Err(format!("mcp server {name} cannot be enabled: {why}")));
+                return;
+            }
+        };
+        let queue = entry.queue.clone();
+        if let Err(sent) = queue.send(ServerMsg::Adopt { op: ServerOp::Enable, config, reply }) {
+            if let ServerMsg::Adopt { reply, .. } = sent.0 {
+                let _ = reply.send(Err(format!("mcp server {name} is not connected")));
+            }
+        }
     }
 
-    /// Take a `Ready` server offline: close its connection and pull its
-    /// tools out of the offered set. The configuration is kept so an
-    /// `enable` can bring the server back.
-    pub(super) async fn disable(&mut self, name: &str) -> Result<(), String> {
-        let connection = self.take_ready_connection(name)?;
-        connection.shutdown().await;
-        self.remove_server_tools(name);
+    /// Take a `Ready` server offline: the registry forgets its tools at
+    /// once, and its connection is closed at the server's next safe point.
+    /// The configuration is kept so an `enable` can bring the server back.
+    fn take_offline(
+        &mut self,
+        name: &str,
+        state: InternalState,
+        reply: oneshot::Sender<Result<(), String>>,
+    ) {
+        let refused = match self.servers.get(name) {
+            None => Some(format!("no MCP server named {name:?} is configured")),
+            Some(entry) => match &entry.state {
+                InternalState::Ready { .. } => None,
+                InternalState::Failed(why) => Some(format!("mcp server {name} failed to start: {why}")),
+                InternalState::Disabled => Some(format!("mcp server {name} is disabled")),
+                InternalState::Disconnected => Some(format!("mcp server {name} is disconnected")),
+            },
+        };
+        if let Some(refused) = refused {
+            let _ = reply.send(Err(refused));
+            return;
+        }
+        let queue = self
+            .servers
+            .get(name)
+            .expect("the server was there a moment ago")
+            .queue
+            .clone();
         self.servers
             .get_mut(name)
-            .expect("server still present")
-            .state = InternalState::Disabled;
-        Ok(())
+            .expect("the server was there a moment ago")
+            .state = state;
+        self.remove_server_tools(name);
+        let _ = queue.send(ServerMsg::Retire);
+        let _ = reply.send(Ok(()));
     }
 
     /// Reconnect a server in any state: close any live connection, then
     /// open a fresh one with the stored configuration.
-    pub(super) async fn reconnect(&mut self, name: &str) -> Result<(), String> {
-        let entry = self
-            .servers
-            .get(name)
-            .ok_or_else(|| format!("no MCP server named {name:?} is configured"))?;
-        let config = entry
-            .config
-            .as_ref()
-            .map_err(|why| format!("mcp server {name} cannot be reconnected: {why}"))?
-            .clone();
-        // Close the old connection (if any) before opening the new one.
-        if let Ok(connection) = self.take_ready_connection(name) {
-            connection.shutdown().await;
-        }
-        // Drop any stale tool entries left over from a previous Ready state.
-        self.remove_server_tools(name);
-        match Connection::open(&config).await {
-            Ok(connection) => {
-                self.adopt_connection(name, connection);
-                Ok(())
-            }
+    fn reconnect(&mut self, name: &str, reply: oneshot::Sender<Result<(), String>>) {
+        let Some(entry) = self.servers.get(name) else {
+            let _ = reply.send(Err(format!("no MCP server named {name:?} is configured")));
+            return;
+        };
+        let config = match entry.config.as_ref() {
+            Ok(config) => config.clone(),
             Err(why) => {
-                self.servers
-                    .get_mut(name)
-                    .expect("server still present")
-                    .state = InternalState::Failed(why);
-                Err(format!("mcp server {name} failed to reconnect"))
+                let _ = reply.send(Err(format!("mcp server {name} cannot be reconnected: {why}")));
+                return;
+            }
+        };
+        let queue = entry.queue.clone();
+        // The registry forgets the server's tools at once: the connection
+        // that is being replaced is on its way out, and the model should
+        // not be offered a tool whose server is in the middle of a change.
+        self.remove_server_tools(name);
+        if let Err(sent) = queue.send(ServerMsg::Adopt { op: ServerOp::Reconnect, config, reply }) {
+            if let ServerMsg::Adopt { reply, .. } = sent.0 {
+                let _ = reply.send(Err(format!("mcp server {name} is not connected")));
             }
         }
     }
 
-    /// Close a `Ready` server's connection without touching its
-    /// configuration. The server sits in `Disconnected` until `reconnect`
-    /// brings it back.
-    pub(super) async fn disconnect(&mut self, name: &str) -> Result<(), String> {
-        let connection = self.take_ready_connection(name)?;
-        connection.shutdown().await;
-        self.remove_server_tools(name);
-        self.servers
-            .get_mut(name)
-            .expect("server still present")
-            .state = InternalState::Disconnected;
-        Ok(())
+    /// The actor's half of an adopt: the new connection is up, so the
+    /// registry can describe the server again and the operation can be
+    /// answered.
+    pub(super) fn finish_adopt(
+        &mut self,
+        server: &str,
+        op: ServerOp,
+        outcome: Result<Adoption, String>,
+        reply: oneshot::Sender<Result<(), String>>,
+    ) {
+        match outcome {
+            Ok(adoption) => {
+                let Adoption { identity, protocol, tools, notes } = adoption;
+                let names = self.adopt_tools(server, &tools);
+                for note in &notes {
+                    self.warnings.push(format!("{server}: {note}"));
+                }
+                if let Some(entry) = self.servers.get_mut(server) {
+                    entry.state = InternalState::Ready { identity, protocol, tools: names };
+                }
+                let _ = reply.send(Ok(()));
+            }
+            Err(why) => {
+                match op {
+                    // An `enable` that could not open its connection leaves
+                    // the server where it was — disabled — and says why.
+                    ServerOp::Enable => {
+                        let _ = reply.send(Err(why));
+                    }
+                    _ => {
+                        if let Some(entry) = self.servers.get_mut(server) {
+                            entry.state = InternalState::Failed(why);
+                        }
+                        let _ = reply.send(Err(format!("mcp server {server} failed to reconnect")));
+                    }
+                }
+            }
+        }
     }
 
     /// End every connection: what a session does on its way out, so that the
     /// programs it started do not outlive it.
+    ///
+    /// Every server's task is told to stop and is waited for, so the child
+    /// processes are gone before this returns.
     pub(super) async fn shutdown_all(&mut self) {
-        let mut connections: Vec<Connection> = Vec::new();
+        let mut stopped = Vec::new();
         for entry in self.servers.values_mut() {
-            if let InternalState::Ready { connection, .. } =
-                std::mem::replace(&mut entry.state, InternalState::Failed("shut down".into()))
-            {
-                connections.push(connection);
+            let (done, waiting) = oneshot::channel();
+            if entry.queue.send(ServerMsg::Stop { done }).is_ok() {
+                stopped.push(waiting);
             }
         }
-        futures_util::future::join_all(connections.iter().map(|c| c.shutdown())).await;
+        for waiting in stopped {
+            let _ = waiting.await;
+        }
     }
 
     /// The names it offers, as the model sees them, cut to the first few so
@@ -524,12 +712,12 @@ impl HubInner {
             .flat_map(|(_, tools)| tools.iter().map(String::as_str))
     }
 
-    /// Pull the tools a connection offers into `routes`, `offered`, and
+    /// Pull the tools a server offers into `routes`, `offered`, and
     /// `server_tools`. Returns the server's own tool names, in the order
     /// the connection reported them.
-    fn add_connection_tools(&mut self, server: &str, connection: &Connection) -> Vec<String> {
-        let mut names = Vec::with_capacity(connection.tools.len());
-        for tool in &connection.tools {
+    fn add_tools(&mut self, server: &str, tools: &[RemoteTool]) -> Vec<String> {
+        let mut names = Vec::with_capacity(tools.len());
+        for tool in tools {
             let name = tool_name(server, &tool.name);
             if self.routes.contains_key(&name) {
                 self.warnings.push(format!(
@@ -563,9 +751,29 @@ impl HubInner {
         names
     }
 
+    /// Adopt a new connection's tools: the server's stale routes go, and the
+    /// tools the new connection reports are the ones offered.
+    fn adopt_tools(&mut self, server: &str, tools: &[RemoteTool]) -> Vec<String> {
+        self.remove_server_tools(server);
+        // Find every route that belongs to this server and drop it. Done
+        // against `routes` rather than `server_tools` because the latter is
+        // empty after a disable or disconnect, while the former is what
+        // `add_tools` checks for collisions.
+        let stale: Vec<String> = self
+            .routes
+            .iter()
+            .filter(|(_, route)| route.server == server)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in stale {
+            self.routes.remove(&name);
+        }
+        self.add_tools(server, tools)
+    }
+
     /// Remove every tool of `server` from `offered` and `server_tools`. The
     /// `routes` table is left alone — a call to a tool whose server has
-    /// been disabled or disconnected should still reach the `call()` method
+    /// been disabled or disconnected should still reach the `prepare` method
     /// and get a state-aware error ("is disabled", "is disconnected")
     /// rather than a "no such tool" message that confuses the model about
     /// what changed.
@@ -576,71 +784,95 @@ impl HubInner {
             }
         }
     }
+}
 
-    /// Take a `Ready` connection out of its server entry, leaving the server
-    /// in `Failed("closing")` until the caller decides the next state. Pulls
-    /// the server's tools out of the offered set so a `Ready -> Ready` cycle
-    /// (e.g. through `reconnect`) does not temporarily advertise two copies
-    /// of the same tool.
-    fn take_ready_connection(&mut self, name: &str) -> Result<Connection, String> {
-        let entry = self
-            .servers
-            .get_mut(name)
-            .ok_or_else(|| format!("no MCP server named {name:?} is configured"))?;
-        match std::mem::replace(&mut entry.state, InternalState::Failed("closing".into())) {
-            InternalState::Ready { connection, .. } => Ok(connection),
-            other => {
-                let reason = match &other {
-                    InternalState::Failed(why) => format!("failed to start: {why}"),
-                    InternalState::Disabled => "is disabled".into(),
-                    InternalState::Disconnected => "is disconnected".into(),
-                    InternalState::Ready { .. } => unreachable!("we just matched it"),
+/// Start the task that owns one server's connection, and hand back the queue
+/// it takes its work from.
+fn spawn_server(
+    name: String,
+    connection: Option<Connection>,
+    actor: mpsc::UnboundedSender<Command>,
+) -> mpsc::UnboundedSender<ServerMsg> {
+    let (queue, rx) = mpsc::unbounded_channel();
+    tokio::spawn(server_task(name, connection, rx, actor));
+    queue
+}
+
+/// The task that owns one server's connection.
+///
+/// One message at a time, until `Stop`. A call is awaited where it is
+/// found, so the messages behind it wait: one connection is a
+/// request/response protocol and cannot be driven by two callers at once.
+/// The server's next safe point — where a retire, a reconnect or a shutdown
+/// lands — is therefore wherever this loop is between two messages.
+async fn server_task(
+    name: String,
+    mut connection: Option<Connection>,
+    mut rx: mpsc::UnboundedReceiver<ServerMsg>,
+    actor: mpsc::UnboundedSender<Command>,
+) {
+    while let Some(message) = rx.recv().await {
+        match message {
+            ServerMsg::Call(call) => {
+                let tool = call.tool.clone();
+                let answer = match connection.as_ref() {
+                    Some(connection) => match connection.call(&tool, call.arguments).await {
+                        Ok(text) => text,
+                        Err(why) => {
+                            format!("error: mcp server {name} could not run {tool}: {why}")
+                        }
+                    },
+                    None => format!("error: mcp server {name} is not connected"),
                 };
-                entry.state = other;
-                Err(format!("mcp server {name} {reason}"))
+                let _ = call.reply.send(answer);
+            }
+            ServerMsg::Adopt { op, config, reply } => {
+                // The old connection is retired here — at the next safe
+                // point, which is where this message is found.
+                if let Some(old) = connection.take() {
+                    old.shutdown().await;
+                }
+                let outcome = match Connection::open(&config).await {
+                    Ok(mut fresh) => {
+                        let adoption = Adoption {
+                            identity: fresh.identity.clone(),
+                            protocol: fresh.protocol.clone(),
+                            tools: std::mem::take(&mut fresh.tools),
+                            notes: std::mem::take(&mut fresh.notes),
+                        };
+                        connection = Some(fresh);
+                        Ok(adoption)
+                    }
+                    Err(why) => Err(why),
+                };
+                let _ = actor.send(Command::Adopted {
+                    server: name.clone(),
+                    op,
+                    outcome,
+                    reply,
+                });
+            }
+            ServerMsg::Retire => {
+                if let Some(old) = connection.take() {
+                    old.shutdown().await;
+                }
+            }
+            ServerMsg::Stop { done } => {
+                if let Some(old) = connection.take() {
+                    old.shutdown().await;
+                }
+                let _ = done.send(());
+                return;
             }
         }
-    }
-
-    /// Adopt `connection` as the server's new link: clear any routes the
-    /// server used to advertise (so a re-enabled server's tools do not
-    /// collide with the stale routes left behind from a `disable` or
-    /// `disconnect`), build fresh tool entries, then write the server's
-    /// entry in `Ready { connection, tools }`.
-    fn adopt_connection(&mut self, server: &str, connection: Connection) {
-        // Find every route that belongs to this server and drop it. Done
-        // against `routes` rather than `server_tools` because the latter is
-        // empty after a disable or disconnect, while the former is what
-        // `add_connection_tools` checks for collisions.
-        let stale: Vec<String> = self
-            .routes
-            .iter()
-            .filter(|(_, route)| route.server == server)
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in stale {
-            self.routes.remove(&name);
-        }
-        let names = self.add_connection_tools(server, &connection);
-        for note in &connection.notes {
-            self.warnings.push(format!("{server}: {note}"));
-        }
-        let entry = self
-            .servers
-            .get_mut(server)
-            .expect("server was present when the connection opened");
-        entry.state = InternalState::Ready {
-            connection,
-            tools: names,
-        };
     }
 }
 
 /// What the entry says it is, for the report: the command line it runs, or
 /// the url it calls. Quoted where the parts carry spaces, so that a reader
 /// can see where one ends and the next begins.
-fn how_to_reach(entry: &Entry) -> String {
-    let Ok(config) = &entry.config else {
+fn how_to_reach(config: &Result<config::ServerConfig, String>) -> String {
+    let Ok(config) = config else {
         return "nothing usable in the entry".to_string();
     };
     match (&config.command, &config.url) {
@@ -702,8 +934,8 @@ fn sanitize(text: &str) -> String {
 ///
 /// FNV-1a, written out rather than taken from a crate: the name it is part of
 /// is written into the session log, and a later process reading that log has
-/// to work out the same name from the same server — so the hash has to be the
-/// same on every machine, in every release, forever. A hash that could
+/// to work out the same name from the same server — so the hash has to be
+/// the same on every machine, in every release, forever. A hash that could
 /// change is a hash that would silently renumber the tools of a resumed
 /// session.
 fn short_hash(text: &str) -> String {

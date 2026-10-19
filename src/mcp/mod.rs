@@ -32,6 +32,39 @@
 //! actor's reply. Nothing on the outside ever holds a `&mut HubInner`, and
 //! the actor never shares `HubInner` with anyone — which is what keeps
 //! enable / disable / reconnect / disconnect safe to call from any thread.
+//!
+//! ## The actor routes; it does not run
+//!
+//! The actor holds the registry — the routes, the offered tool names, the
+//! warnings, the per-server tool lists — and the registry is cheap to read.
+//! A call is *routed*: the actor resolves the route, hands the request to
+//! the queue of the server that owns it, and goes straight back to its loop.
+//! The answer comes back later, on the caller's own channel.
+//!
+//! Each server's connection is owned by its own task, with its own queue.
+//! That task runs that server's calls one at a time — one connection is a
+//! request/response protocol and cannot be driven by two callers at once —
+//! while different servers run concurrently. So a slow server delays its own
+//! calls and nothing else: the tool list the agent asks for at the start of
+//! every turn, and every `/mcp` command, are answered while it is busy.
+//!
+//! ## What `/mcp` does while a call is live
+//!
+//! A server op applies to the registry at once, and to the server's
+//! connection at its next safe point. A call already in flight on that
+//! server completes; the op does not cancel it and does not wait for it.
+//!
+//! - `enable` / `disable`: the registry's view changes at once — so the tool
+//!   list changes at once, and the model stops seeing a disabled server's
+//!   tools on the next turn. A call already running on that server finishes.
+//! - `reconnect`: the old connection is retired at the next safe point and
+//!   the new one takes over. A call on the old connection finishes.
+//! - `disconnect`: as `reconnect`, and the server's tools leave the offered
+//!   list at once.
+//!
+//! The old behaviour — the op waited behind the in-flight call — was an
+//! accident of the actor's loop, not a contract, and it is not described as
+//! one.
 
 mod client;
 mod config;
@@ -93,6 +126,15 @@ enum Command {
         name: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// A server's task has opened a fresh connection and is telling the
+    /// registry what it found. The reply is the one the operation is
+    /// waiting for: it is answered here, once the registry has been told.
+    Adopted {
+        server: String,
+        op: ServerOp,
+        outcome: Result<inner::Adoption, String>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -118,7 +160,7 @@ enum ServerOp {
 /// lock, and no surprise about who owns what.
 #[derive(Clone)]
 pub struct Hub {
-    tx: mpsc::Sender<Command>,
+    tx: mpsc::UnboundedSender<Command>,
 }
 
 impl Hub {
@@ -135,7 +177,7 @@ impl Hub {
         dropped: impl FnOnce() -> R,
     ) -> R {
         let (reply, rx) = oneshot::channel();
-        if self.tx.send(build(reply)).await.is_err() {
+        if self.tx.send(build(reply)).is_err() {
             return shut();
         }
         rx.await.unwrap_or_else(|_| dropped())
@@ -165,7 +207,7 @@ impl Hub {
     /// plain frontends all start from a hub that has nothing configured.
     #[allow(dead_code)]
     pub fn empty() -> Self {
-        spawn_with(async { HubInner::empty() })
+        spawn_with(|_actor| async move { HubInner::empty() })
     }
 
     /// Read the workspace and the user-supplied mcpServers, then start an
@@ -180,9 +222,9 @@ impl Hub {
     pub fn spawn(workspace: &Path, user_settings: Option<&Value>) -> Self {
         let workspace = workspace.to_path_buf();
         let user_settings = user_settings.cloned();
-        spawn_with(
-            async move { HubInner::from_workspace(&workspace, user_settings.as_ref()).await },
-        )
+        spawn_with(move |actor| async move {
+            HubInner::from_workspace(&workspace, user_settings.as_ref(), actor).await
+        })
     }
 
     /// Build a hub over a list of entries the caller already has — the test
@@ -193,7 +235,9 @@ impl Hub {
     #[doc(hidden)]
     #[allow(dead_code)]
     pub async fn of_entries(entries: Vec<Entry>) -> Self {
-        spawn_with(async move { HubInner::from_entries(entries, Vec::new()).await })
+        spawn_with(move |actor| async move {
+            HubInner::from_entries(entries, Vec::new(), actor).await
+        })
     }
 
     /// One tool call, answered with the text the model reads. Never fails —
@@ -264,7 +308,7 @@ impl Hub {
     /// programs the session started do not outlive it.
     pub async fn shutdown(&self) {
         let (reply, rx) = oneshot::channel();
-        if self.tx.send(Command::Shutdown { reply }).await.is_ok() {
+        if self.tx.send(Command::Shutdown { reply }).is_ok() {
             let _ = rx.await;
         }
     }
@@ -311,19 +355,29 @@ impl ToolProvider for Hub {
 
 /// Start an actor task over `init`: a future that builds the initial
 /// `HubInner`. Returns a [`Hub`] the caller can send to.
-fn spawn_with<F>(init: F) -> Hub
+///
+/// The actor's own sender is handed to the init future, because the
+/// per-server tasks it starts report back through it: a task that opens a
+/// connection has to tell the registry what it found.
+///
+/// The mailbox is unbounded so that a server's task never waits for room in
+/// it. A bounded one would let a task block on its report while the actor
+/// waited for that task — a deadlock neither side could see.
+fn spawn_with<F, Fut>(init: F) -> Hub
 where
-    F: std::future::Future<Output = HubInner> + Send + 'static,
+    F: FnOnce(mpsc::UnboundedSender<Command>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = HubInner> + Send + 'static,
 {
-    let (tx, mut rx) = mpsc::channel::<Command>(64);
+    let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+    let actor = tx.clone();
     tokio::spawn(async move {
-        let mut inner = init.await;
+        let mut inner = init(actor).await;
         while let Some(cmd) = rx.recv().await {
             match cmd {
-                Command::Call { tool, args, reply } => {
-                    let result = inner.call(&tool, &args).await;
-                    let _ = reply.send(result);
-                }
+                // The actor routes; it does not run. The call is handed to
+                // the server that owns it, and the answer comes back on the
+                // caller's own channel — so nothing waits here.
+                Command::Call { tool, args, reply } => inner.route_call(&tool, &args, reply),
                 Command::Definitions { reply } => {
                     let _ = reply.send(inner.definitions());
                 }
@@ -336,14 +390,9 @@ where
                 Command::List { reply } => {
                     let _ = reply.send(inner.list());
                 }
-                Command::ServerOp { op, name, reply } => {
-                    let out = match op {
-                        ServerOp::Enable => inner.enable(&name).await,
-                        ServerOp::Disable => inner.disable(&name).await,
-                        ServerOp::Reconnect => inner.reconnect(&name).await,
-                        ServerOp::Disconnect => inner.disconnect(&name).await,
-                    };
-                    let _ = reply.send(out);
+                Command::ServerOp { op, name, reply } => inner.server_op(op, &name, reply),
+                Command::Adopted { server, op, outcome, reply } => {
+                    inner.finish_adopt(&server, op, outcome, reply);
                 }
                 Command::Shutdown { reply } => {
                     inner.shutdown_all().await;
@@ -742,6 +791,197 @@ mod tests {
             &CancelToken::new(),
         ).await;
         assert!(out.starts_with("error: no MCP tool named"), "got: {out}");
+        hub.shutdown().await;
+    }
+
+    // ---- the hub as a router -----------------------------------------------
+
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    /// A stub whose `gate` tool holds a call until the test opens the gate,
+    /// named as the test wants it.
+    fn gated_stub(name: &str) -> (Stub, Entry) {
+        let stub = Stub::new();
+        let gate = stub.gate().to_string_lossy().into_owned();
+        let mut entry = stub.entry(&[("STUB_TOOLS", "gate"), ("STUB_GATE", gate.as_str())]);
+        entry.name = name.to_string();
+        (stub, entry)
+    }
+
+    /// The names of the tools on offer, in the order they are offered.
+    fn offered(defs: Vec<Value>) -> Vec<String> {
+        defs.iter()
+            .filter_map(|v| v["name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// A slow server does not hold up a fast one. The hub routes each call
+    /// to the server that owns it, so one server's wait is that server's
+    /// cost and nobody else's.
+    #[tokio::test]
+    async fn a_slow_server_does_not_delay_a_fast_one() {
+        let (slow, slow_entry) = gated_stub("slow");
+        let fast = Stub::new();
+        let mut fast_entry = fast.entry(&[("STUB_TOOLS", "echo")]);
+        fast_entry.name = "fast".into();
+        let hub = Hub::of_entries(vec![slow_entry, fast_entry]).await;
+
+        // The slow call starts and is held at the gate.
+        let held = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.call("mcp__slow__gate", r#"{"text":"slow"}"#).await }
+        });
+        assert!(
+            slow.wait_for(r#""method":"tools/call""#).await,
+            "the slow call reached its server"
+        );
+
+        // The fast server answers while the slow one is still busy.
+        let answer = timeout(
+            Duration::from_secs(10),
+            hub.call("mcp__fast__echo", r#"{"text":"hi"}"#),
+        )
+        .await
+        .expect("the fast server is not held up by the slow one");
+        assert_eq!(answer, "called with {text:hi}");
+
+        // And the held call still finishes.
+        std::fs::write(slow.gate(), "open").unwrap();
+        assert_eq!(held.await.unwrap(), "called with {text:slow}");
+        hub.shutdown().await;
+    }
+
+    /// The tool list the agent asks for at the start of every turn is
+    /// answered while a call is in flight — the list is the registry's, and
+    /// the registry does not wait for a server.
+    #[tokio::test]
+    async fn definitions_are_not_delayed_by_a_call_in_flight() {
+        let (slow, slow_entry) = gated_stub("slow");
+        let fast = Stub::new();
+        let mut fast_entry = fast.entry(&[("STUB_TOOLS", "echo")]);
+        fast_entry.name = "fast".into();
+        let hub = Hub::of_entries(vec![slow_entry, fast_entry]).await;
+
+        let held = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.call("mcp__slow__gate", r#"{"text":"slow"}"#).await }
+        });
+        assert!(
+            slow.wait_for(r#""method":"tools/call""#).await,
+            "the slow call reached its server"
+        );
+
+        let defs = timeout(Duration::from_secs(10), hub.definitions())
+            .await
+            .expect("the tool list is not behind the call in flight");
+        assert_eq!(
+            offered(defs),
+            vec!["mcp__fast__echo", "mcp__slow__gate"],
+            "the list is the same one, in the same order"
+        );
+
+        std::fs::write(slow.gate(), "open").unwrap();
+        let _ = held.await.unwrap();
+        hub.shutdown().await;
+    }
+
+    /// Two calls to one server do not overlap: one connection is a
+    /// request/response protocol, so the second waits its turn — and each
+    /// answer comes back with its own arguments.
+    #[tokio::test]
+    async fn two_calls_to_one_server_do_not_overlap() {
+        let (stub, entry) = gated_stub("stub");
+        let hub = Hub::of_entries(vec![entry]).await;
+
+        let first = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.call("mcp__stub__gate", r#"{"text":"one"}"#).await }
+        });
+        assert!(
+            stub.wait_for(r#""method":"tools/call""#).await,
+            "the first call reached its server"
+        );
+
+        let second = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.call("mcp__stub__gate", r#"{"text":"two"}"#).await }
+        });
+        // Give the second call time to reach the server if it could.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            stub.count(r#""method":"tools/call""#),
+            1,
+            "the second call has not reached the server: one connection takes one call at a time"
+        );
+
+        std::fs::write(stub.gate(), "open").unwrap();
+        assert_eq!(first.await.unwrap(), "called with {text:one}");
+        assert_eq!(second.await.unwrap(), "called with {text:two}");
+        hub.shutdown().await;
+    }
+
+    /// An op on a server whose call is in flight is answered at once: the
+    /// registry changes at once, and the call that is already running is
+    /// allowed to finish.
+    #[tokio::test]
+    async fn a_server_op_is_answered_while_a_call_is_in_flight() {
+        let (stub, entry) = gated_stub("stub");
+        let hub = Hub::of_entries(vec![entry]).await;
+
+        let held = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.call("mcp__stub__gate", r#"{"text":"slow"}"#).await }
+        });
+        assert!(
+            stub.wait_for(r#""method":"tools/call""#).await,
+            "the call reached its server"
+        );
+
+        timeout(Duration::from_secs(10), hub.disable("stub"))
+            .await
+            .expect("the op is not behind the call in flight")
+            .expect("the op itself succeeds");
+
+        // The registry changed at once: the server's tools are off the list.
+        assert!(
+            hub.definitions().await.is_empty(),
+            "a disabled server offers nothing"
+        );
+
+        // And the call that was already running still finishes.
+        std::fs::write(stub.gate(), "open").unwrap();
+        assert_eq!(held.await.unwrap(), "called with {text:slow}");
+        hub.shutdown().await;
+    }
+
+    /// Disabling a server takes its tools off the list at once, and the
+    /// tools that are left keep the order they had: the list's byte order
+    /// is a cache contract and does not move because a server went away.
+    #[tokio::test]
+    async fn disabling_a_server_takes_its_tools_off_the_list_at_once() {
+        let mut stubs = Vec::new();
+        let mut entries = Vec::new();
+        for name in ["alpha", "beta", "gamma"] {
+            let stub = Stub::new();
+            let mut entry = stub.entry(&[("STUB_TOOLS", "echo")]);
+            entry.name = name.to_string();
+            entries.push(entry);
+            // The fixture owns the server's script: it has to outlive the
+            // loop, or the server has nothing to run.
+            stubs.push(stub);
+        }
+        let hub = Hub::of_entries(entries).await;
+        assert_eq!(
+            offered(hub.definitions().await),
+            vec!["mcp__alpha__echo", "mcp__beta__echo", "mcp__gamma__echo"]
+        );
+
+        hub.disable("beta").await.unwrap();
+        assert_eq!(
+            offered(hub.definitions().await),
+            vec!["mcp__alpha__echo", "mcp__gamma__echo"]
+        );
         hub.shutdown().await;
     }
 }
