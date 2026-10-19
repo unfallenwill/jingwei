@@ -64,6 +64,10 @@ fn msg(app: &mut App, m: Msg) -> Action {
             app.status.pane_floor = 0;
             app.cancel_sent = false;
             app.scroll = Scroll::Tail;
+            // a run boundary proves no request is in flight: a reading
+            // the last run left open (a request that never sent its
+            // `Done`) must not be folded by this run's first `Done`
+            app.status.pending = None;
             // a working task locks the editor — drop any open menu
             dismiss_completion(app);
             app.flush_partial();
@@ -86,10 +90,23 @@ fn msg(app: &mut App, m: Msg) -> Action {
             app.flush_partial();
             app.rows.push(Row::Note(sev, text));
         }
-        Msg::Usage(u) => app.status.turn = u,
-        Msg::OutTokens(n) => app.status.turn.output = n,
+        Msg::Usage(u) => {
+            app.status.turn = u;
+            // the reading this request's `Done` will close — the only
+            // place a fold may take its numbers from
+            app.status.pending = Some(u);
+        }
+        Msg::OutTokens(n) => {
+            app.status.turn.output = n;
+            // the live count refines the reading the `Usage` carried;
+            // the pending copy must carry it too, or the total
+            // under-counts the output of the request it belongs to
+            if let Some(p) = app.status.pending.as_mut() { p.output = n; }
+        }
         Msg::Done => {
-            app.status.total.add(&app.status.turn);
+            // the reading the request opened, folded exactly once; a
+            // `Done` that closes nothing folds nothing
+            if let Some(u) = app.status.pending.take() { app.status.total.add(&u); }
             app.flush_partial();
             app.fold_thought();
         }
@@ -796,6 +813,55 @@ mod tests {
         assert_eq!(a.status.turn.output, 9);
         drive(&mut a, vec![Ev::Msg(Msg::Done)]);
         assert_eq!((a.status.total.input, a.status.total.output), (10, 9));
+    }
+
+    #[test]
+    fn a_done_without_a_usage_adds_nothing() {
+        let mut a = App::new();
+        // the previous request's reading is still on the bar
+        a.status.turn = Usage { input: 10, output: 5, ..Usage::default() };
+        drive(&mut a, vec![Ev::Msg(Msg::Done)]);
+        assert_eq!(a.status.total, Usage::default(), "a stray Done folds nothing");
+        assert_eq!(a.status.turn.output, 5, "the live reading survives");
+    }
+
+    #[test]
+    fn a_usage_then_a_done_counts_once() {
+        let mut a = App::new();
+        let u = Usage { input: 10, output: 5, ..Usage::default() };
+        drive(&mut a, vec![Ev::Msg(Msg::Usage(u)), Ev::Msg(Msg::Done)]);
+        assert_eq!(a.status.total, u, "the reported usage is folded");
+        assert_eq!(a.status.turn, u, "the bar's context reading survives the fold");
+        assert_eq!(a.status.pending, None, "the reading was taken exactly once");
+    }
+
+    #[test]
+    fn two_dones_in_a_row_count_once() {
+        let mut a = App::new();
+        let u = Usage { input: 10, output: 5, ..Usage::default() };
+        drive(&mut a, vec![Ev::Msg(Msg::Usage(u)), Ev::Msg(Msg::Done), Ev::Msg(Msg::Done)]);
+        assert_eq!(a.status.total, u, "not twice");
+    }
+
+    #[test]
+    fn out_tokens_refines_the_pending_reading() {
+        let mut a = App::new();
+        let u = Usage { input: 10, output: 0, ..Usage::default() };
+        drive(&mut a, vec![Ev::Msg(Msg::Usage(u))]);
+        drive(&mut a, vec![Ev::Msg(Msg::OutTokens(9))]);
+        drive(&mut a, vec![Ev::Msg(Msg::Done)]);
+        assert_eq!(a.status.total.output, 9, "the total carries the refined count");
+        assert_eq!(a.status.turn.output, 9);
+    }
+
+    #[test]
+    fn a_new_run_drops_a_reading_the_last_one_left_open() {
+        let mut a = App::new();
+        // a request that reported usage and never sent its Done
+        drive(&mut a, vec![Ev::Msg(Msg::Usage(Usage { input: 10, output: 5, ..Usage::default() }))]);
+        drive(&mut a, vec![Ev::Msg(Msg::TaskBegin("next".into()))]);
+        drive(&mut a, vec![Ev::Msg(Msg::Done)]);
+        assert_eq!(a.status.total, Usage::default(), "the stale reading is not folded");
     }
 
     #[test]

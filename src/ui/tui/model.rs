@@ -126,6 +126,11 @@ pub struct Status {
     /// Usage accumulated across the session. Not a bar segment of its
     /// own — the cache hit rate is computed over it.
     pub total: Usage,
+    /// The usage of the request currently in flight, if there is one.
+    /// Folded into `total` exactly once, by the `Done` that ends it.
+    /// `None` means "no request is in flight" — a `Done` in that state
+    /// adds nothing.
+    pub pending: Option<Usage>,
     /// The pane's high-water mark this task: the most live rows (think
     /// tail, streaming partial) it has shown above the input block. The
     /// pane pads to it, so within a task the pane only ever grows — a
@@ -290,7 +295,13 @@ impl App {
             think_buf: String::new(),
             think_start: None,
             input: Input::default(),
-            status: Status { task: None, turn: Usage::default(), total: Usage::default(), pane_floor: 0 },
+            status: Status {
+                task: None,
+                turn: Usage::default(),
+                total: Usage::default(),
+                pending: None,
+                pane_floor: 0,
+            },
             info: Info::default(),
             cancel_sent: false,
             quit: false,

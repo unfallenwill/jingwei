@@ -998,6 +998,19 @@ mod tests {
     }
 
     #[test]
+    fn the_bar_still_shows_the_last_reading_after_a_done() {
+        let mut a = App::new();
+        informed(&mut a);
+        let u = Usage { input: 2000, cache_read: 43_000, ..Usage::default() };
+        update(&mut a, Ev::Msg(Msg::Usage(u)));
+        update(&mut a, Ev::Msg(Msg::Done));
+        // the fold is the request's closing; the gauge keeps reading the
+        // request it just finished — it must not blink
+        assert!(bar_text(&a, BAR_W).contains("ctx 45.0k/1.0M"), "{}", bar_text(&a, BAR_W));
+        assert_eq!(a.status.turn, u, "the live reading survives the fold");
+    }
+
+    #[test]
     fn pane_bar_is_the_ledger() {
         let mut a = seeded();
         informed(&mut a);
