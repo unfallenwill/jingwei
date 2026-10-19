@@ -75,13 +75,16 @@ use update::{update as step, Action, Ev};
 
 type Backend = CrosstermBackend<io::Stdout>;
 
-/// The running agent: its cancellation token and its coroutine.
-struct Agent {
+/// The run in flight: its cancellation token and its coroutine. This is
+/// the TUI's *handle* on a run, not the agent itself — the domain
+/// `Agent` lives in `crate::agent`, and this struct is only the
+/// frontend's handle on the task that drives it.
+struct RunHandle {
     token: Arc<crate::cancel::CancelToken>,
     job: tokio::task::JoinHandle<()>,
 }
 
-impl Agent {
+impl RunHandle {
     /// Reap the coroutine after it signalled `TaskEnd`. Its panic (dev
     /// builds; release aborts the process) becomes a visible error row
     /// instead of silence.
@@ -442,7 +445,7 @@ pub async fn run(cfg: Config, ctx: crate::core::context::Context, convo: Convo, 
     // lock for the length of a turn — that is what keeps two turns from
     // interleaving, and what keeps the transcript and the file in step.
     let session = Arc::new(AsyncMutex::new(SessionState { ctx, convo }));
-    let mut agent: Option<Agent> = None;
+    let mut run: Option<RunHandle> = None;
     // The MCP hub is shared with the spawned agent task (so MCP tool
     // calls have a hub to dispatch to) and with the slash dispatcher
     // (so /mcp can read & operate on the same servers). Cloning a Hub
@@ -592,12 +595,12 @@ pub async fn run(cfg: Config, ctx: crate::core::context::Context, convo: Convo, 
                             // crossed a slash-command boundary — sync the
                             // menu from scratch (cheap when nothing changes).
                             refresh_completion(&mut app, &hub).await;
-                            apply_outcome(handle(action, &cfg, &session, &mut agent, &sink, &hub, &router), &mut cfg, &mut app, &sink);
+                            apply_outcome(handle(action, &cfg, &session, &mut run, &sink, &hub, &router), &mut cfg, &mut app, &sink);
                         }
                         crossterm::event::Event::Paste(p) => {
                             let action = step(&mut app, Ev::Paste(p));
                             refresh_completion(&mut app, &hub).await;
-                            apply_outcome(handle(action, &cfg, &session, &mut agent, &sink, &hub, &router), &mut cfg, &mut app, &sink);
+                            apply_outcome(handle(action, &cfg, &session, &mut run, &sink, &hub, &router), &mut cfg, &mut app, &sink);
                         }
                         // a resize needs no arm of its own: the Input arm
                         // polls the size every frame and redraws the viewport
@@ -611,14 +614,14 @@ pub async fn run(cfg: Config, ctx: crate::core::context::Context, convo: Convo, 
                 }
             }
             maybe = rx.recv() => {
-                // every message goes through update; reaping the agent
+                // every message goes through update; reaping the run
                 // is an effect *after* the state transition, not a
                 // second interpretation path beside it
                 if let Some(m) = maybe {
                     let ended = matches!(m, Msg::TaskEnd);
                     step(&mut app, Ev::Msg(m));
                     if ended {
-                        if let Some(a) = agent.take() {
+                        if let Some(a) = run.take() {
                             a.reap(&sink).await;
                         }
                     }
@@ -636,7 +639,7 @@ pub async fn run(cfg: Config, ctx: crate::core::context::Context, convo: Convo, 
     // Restore the terminal no matter how we left the loop. The transcript
     // already lives in the scrollback; the pane's rows are erased and the
     // cursor parks on the first of them for the shell's prompt.
-    if let Some(a) = agent.take() {
+    if let Some(a) = run.take() {
         a.token.cancel(); // don't leave a coroutine carrying stones behind
         a.job.abort();
     }
@@ -749,14 +752,14 @@ struct SlashCmd<'a> {
 /// accretion — every new command adds a match arm and nothing else.
 /// Unknown commands surface in the transcript as a `Note` so the user
 /// sees the typo (no silent failure).
-fn dispatch_slash(cmd: SlashCmd<'_>, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>, agent: &Option<Agent>, sink: &ChannelSink, hub: &Hub) -> HandleOutcome {
+fn dispatch_slash(cmd: SlashCmd<'_>, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>, run: &Option<RunHandle>, sink: &ChannelSink, hub: &Hub) -> HandleOutcome {
     match cmd.name {
         "exit" | "quit" => {
             // the loop owns the quit flag; we just stop the current
-            // agent and let the loop see Cancel → drain → exit
+            // run and let the loop see Cancel → drain → exit
             HandleOutcome::Cancel
         }
-        "model" => match slash_model(cmd.args, cfg, session, agent) {
+        "model" => match slash_model(cmd.args, cfg, session, run) {
             Ok(o) => o,
             Err(e) => {
                 sink.show(Msg::Note { sev: Sev::Err, text: format!(" {e} ") });
@@ -796,7 +799,7 @@ fn dispatch_slash(cmd: SlashCmd<'_>, cfg: &Config, session: &Arc<AsyncMutex<Sess
 /// a new session is a new conversation, so the transcript starts empty.
 /// With no args we surface the current selection and the available
 /// profiles; with one arg we look it up under `<provider>/<model>`.
-fn slash_model(args: Vec<&str>, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>, agent: &Option<Agent>) -> Result<HandleOutcome, String> {
+fn slash_model(args: Vec<&str>, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>, run: &Option<RunHandle>) -> Result<HandleOutcome, String> {
     let settings = Settings::load().map_err(|e| e.to_string())?;
     let current_key = settings
         .active
@@ -863,7 +866,7 @@ fn slash_model(args: Vec<&str>, cfg: &Config, session: &Arc<AsyncMutex<SessionSt
     // A running turn refuses the switch outright: the turn owns the
     // session lock, and a switch that cleared the transcript under it
     // would leave the model answering a conversation it never saw.
-    if agent.is_some() {
+    if run.is_some() {
         return Err("cannot switch profile while an agent turn is running — wait for it to finish (or /exit)".into());
     }
     let mut st = match session.try_lock() {
@@ -927,11 +930,11 @@ fn protocol_of(name: &str) -> Option<crate::api::Protocol> {
 /// resolve here too: dispatching `/model` returns `Switch` with the
 /// newly-built Config.
 fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
-          agent: &mut Option<Agent>, sink: &ChannelSink, hub: &Hub, router: &Arc<ToolRouter>) -> HandleOutcome {
+          run: &mut Option<RunHandle>, sink: &ChannelSink, hub: &Hub, router: &Arc<ToolRouter>) -> HandleOutcome {
     match action {
         Action::None => HandleOutcome::None,
         Action::Cancel => {
-            if let Some(a) = agent {
+            if let Some(a) = run {
                 a.token.cancel();
             }
             HandleOutcome::Cancel
@@ -941,16 +944,16 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
             // they never reach the agent. Dispatch first, and only fall
             // through to a real submit when the line is just a task.
             if let Some(cmd) = parse_slash(&line) {
-                return dispatch_slash(cmd, cfg, session, agent, sink, hub);
+                return dispatch_slash(cmd, cfg, session, run, sink, hub);
             }
             // The narrow race: the agent's `Msg::TaskBegin` rides the
             // channel back to update `app.working()`; between sending
             // it and the loop reading it, the user could press Enter
-            // again — the agent Option already holds a live job, and
+            // again — the run slot already holds a live job, and
             // spawning a second one would orphan the first. Two
             // coroutines then race the session lock and both push into
             // the transcript; the file would be torn. Refuse instead.
-            if agent.is_some() {
+            if run.is_some() {
                 sink.show(Msg::Note {
                     sev: Sev::Warn,
                     text: " a task is already running — wait for it to finish or Ctrl-C to cancel ".into(),
@@ -988,7 +991,7 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
                 // run boundary: the file never ends mid-run
                 sink.show(Msg::TaskEnd);
             });
-            *agent = Some(Agent { token, job });
+            *run = Some(RunHandle { token, job });
             HandleOutcome::None
         }
     }
@@ -1736,36 +1739,36 @@ mod tests {
         Arc::new(AsyncMutex::new(SessionState { ctx, convo: Convo::ephemeral() }))
     }
 
-    /// A handle that lets a test inspect the agent that was spawned.
-    fn run_handle(action: Action) -> (ChannelSink, Option<Agent>) {
+    /// A handle that lets a test inspect the run that was spawned.
+    fn run_handle(action: Action) -> (ChannelSink, Option<RunHandle>) {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
         let cfg = tcfg("http://127.0.0.1:1");
         let session = session_state();
-        let mut agent: Option<Agent> = None;
+        let mut run: Option<RunHandle> = None;
         let hub = crate::mcp::Hub::empty();
         let router = router(&hub);
-        handle(action, &cfg, &session, &mut agent, &sink, &hub, &router);
-        (sink, agent)
+        handle(action, &cfg, &session, &mut run, &sink, &hub, &router);
+        (sink, run)
     }
 
     #[tokio::test]
     async fn handle_none_is_a_no_op() {
-        let (_sink, agent) = run_handle(Action::None);
-        assert!(agent.is_none(), "no agent spawned on None");
+        let (_sink, run) = run_handle(Action::None);
+        assert!(run.is_none(), "no run spawned on None");
     }
 
     #[tokio::test]
-    async fn handle_cancel_with_no_agent_does_not_panic() {
-        // the test of `if let Some(a) = agent` — absent agent is a silent
-        // no-op (the action runs against a now-empty agent slot)
-        let (_sink, agent) = run_handle(Action::Cancel);
-        assert!(agent.is_none());
+    async fn handle_cancel_with_no_run_does_not_panic() {
+        // the test of `if let Some(a) = run` — absent run is a silent
+        // no-op (the action runs against a now-empty run slot)
+        let (_sink, run) = run_handle(Action::Cancel);
+        assert!(run.is_none());
     }
 
     #[tokio::test]
-    async fn handle_submit_starts_an_agent_and_emits_task_begin() {
-        // a Submit lands a TaskBegin in the sink and fills `agent`. The
+    async fn handle_submit_starts_a_run_and_emits_task_begin() {
+        // a Submit lands a TaskBegin in the sink and fills `run`. The
         // spawned task races an unreachable host, so we cancel it before
         // returning — what we assert here is the *start* of the action,
         // not its end
@@ -1773,49 +1776,49 @@ mod tests {
         let sink = ChannelSink::new(tx);
         let cfg = tcfg("http://127.0.0.1:1");
         let session = session_state();
-        let mut agent: Option<Agent> = None;
+        let mut run: Option<RunHandle> = None;
         let hub = crate::mcp::Hub::empty();
         let router = router(&hub);
         // tokio::test gives us the runtime; handle does its own tokio::spawn.
-        handle(Action::Submit("hello world".into()), &cfg, &session, &mut agent, &sink, &hub, &router);
-        assert!(agent.is_some(), "submit sets the agent slot");
+        handle(Action::Submit("hello world".into()), &cfg, &session, &mut run, &sink, &hub, &router);
+        assert!(run.is_some(), "submit sets the run slot");
         // a task begin landed in the sink
         let got = rx.try_recv().expect("TaskBegin emitted by submit");
         assert!(matches!(got, Msg::TaskBegin(ref t) if t == "hello world"));
         // tidy up: cancel the running coroutine before the test ends
-        if let Some(a) = agent {
+        if let Some(a) = run {
             a.token.cancel();
             a.job.abort();
         }
     }
 
-    // ---- Agent::reap: panic becomes a visible note ------------------------
+    // ---- RunHandle::reap: panic becomes a visible note --------------------
 
     #[tokio::test]
-    async fn handle_submit_refuses_when_an_agent_is_already_running() {
-        // the narrow race window: a first Submit spawned an agent; a
+    async fn handle_submit_refuses_when_a_run_is_already_running() {
+        // the narrow race window: a first Submit spawned a run; a
         // second Submit arriving before the channel carries TaskBegin
         // back to the state must not orphan the first one. The first
-        // agent slot is preserved, the second Submit emits a warning
+        // run slot is preserved, the second Submit emits a warning
         // and returns None.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
         let cfg = tcfg("http://127.0.0.1:1");
         let session = session_state();
-        // a pre-existing agent slot, as if the first Submit had already
+        // a pre-existing run slot, as if the first Submit had already
         // run and the spawned coroutine were still in flight
-        let mut agent: Option<Agent>;
+        let mut run: Option<RunHandle>;
         let first_token = Arc::new(crate::cancel::CancelToken::new());
         let hub = crate::mcp::Hub::empty();
         let router = router(&hub);
-        // tokio::test wraps us in a runtime; spawn the pre-existing agent
+        // tokio::test wraps us in a runtime; spawn the pre-existing run
         // slot inside this scope so its JoinHandle has a home.
         let first_job = tokio::spawn(async {});
-        agent = Some(Agent { token: first_token.clone(), job: first_job });
-        handle(Action::Submit("second task".into()), &cfg, &session, &mut agent, &sink, &hub, &router);
-        // the original agent is still there — same token, not replaced
-        assert!(agent.is_some());
-        assert_eq!(Arc::as_ptr(&agent.as_ref().unwrap().token), Arc::as_ptr(&first_token));
+        run = Some(RunHandle { token: first_token.clone(), job: first_job });
+        handle(Action::Submit("second task".into()), &cfg, &session, &mut run, &sink, &hub, &router);
+        // the original run is still there — same token, not replaced
+        assert!(run.is_some());
+        assert_eq!(Arc::as_ptr(&run.as_ref().unwrap().token), Arc::as_ptr(&first_token));
         // and a warning landed in the sink, naming the cause
         let mut saw_warn = false;
         while let Ok(m) = rx.try_recv() {
@@ -1826,14 +1829,14 @@ mod tests {
         }
         assert!(saw_warn, "the refused submit must surface a warning");
         // tidy up
-        if let Some(a) = agent {
+        if let Some(a) = run {
             a.token.cancel();
             a.job.abort();
         }
     }
 
     #[test]
-    fn agent_reap_surfaces_a_panicking_join_as_an_error_note() {
+    fn run_handle_reap_surfaces_a_panicking_join_as_an_error_note() {
         // the test of the `if let Err(e) = self.job.await` arm: a spawned
         // task that panics comes back as JoinError, which reap turns into
         // an error note instead of letting the error fall silent
@@ -1842,7 +1845,7 @@ mod tests {
         let token = Arc::new(crate::cancel::CancelToken::new());
         crate::test_util::block_on(async move {
             let handle = tokio::spawn(async { panic!("intentional") });
-            let a = Agent { token, job: handle };
+            let a = RunHandle { token, job: handle };
             a.reap(&sink).await;
         });
         let got = rx.try_recv().expect("a note must be emitted on panic");
@@ -1850,13 +1853,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_reap_is_silent_on_a_clean_join() {
+    fn run_handle_reap_is_silent_on_a_clean_join() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
         let token = Arc::new(crate::cancel::CancelToken::new());
         crate::test_util::block_on(async move {
             let handle = tokio::spawn(async { /* fine */ });
-            let a = Agent { token, job: handle };
+            let a = RunHandle { token, job: handle };
             a.reap(&sink).await;
         });
         assert!(rx.try_recv().is_err(), "no note on a clean join");
