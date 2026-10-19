@@ -32,15 +32,24 @@ pub enum Sev {
 ///
 /// ```text
 /// TaskBegin(text)
-///   ( Think.. ThinkEnd | Text.. | Tool | Note | Usage | OutTokens )*   one run
-///   Done                                                               fold turn usage into totals
+///   ( Think.. ThinkEnd | Text.. | Tool | Note | Usage | OutTokens )*   one request
+///   Done                                                               close that request's reading
 /// TaskEnd
 /// ```
 ///
+/// `Usage` opens a request's usage reading; `Done` closes it, and the
+/// reading is folded into the session totals exactly once. A `Done` with
+/// no `Usage` since the last `Done` is not an error: it closes nothing,
+/// and the accounting leaves the numbers alone. A stream that reports no
+/// usage ends with exactly that — a `Done` and no reading to close.
+///
 /// `Usage` replaces the live turn's counters wholesale; `OutTokens` ticks
-/// the output count while text streams and is superseded by the next
-/// `Usage`. A run interrupted mid-flight still ends with `Done`/`TaskEnd`
-/// (whatever was reasoned is folded first), so frontends never dangle.
+/// the output count while text streams and refines the reading the
+/// `Usage` carried. A request cut short mid-stream still sends its
+/// `Done` — the stream ends and the pair closes either way — while one
+/// cut short before it reported anything closes nothing. A run
+/// interrupted mid-flight still ends with `TaskEnd` (whatever was
+/// reasoned is folded first), so frontends never dangle.
 #[derive(Clone, Debug)]
 pub enum Msg {
     /// A dim information line (the banner).
@@ -61,11 +70,14 @@ pub enum Msg {
     Tool { name: String, summary: String, output: String },
     /// A warning or error line.
     Note { sev: Sev, text: String },
-    /// The latest request's usage (replaces the live turn).
+    /// The latest request's usage (replaces the live turn, and opens the
+    /// reading this request's `Done` will close).
     Usage(Usage),
-    /// Streaming output-token count (ticks up while text flows).
+    /// Streaming output-token count (ticks up while text flows) — the
+    /// refinement of the reading the last `Usage` opened.
     OutTokens(u64),
-    /// The request finished: fold the turn into session totals.
+    /// The request finished: close its usage reading (fold it into the
+    /// session totals exactly once).
     Done,
 }
 
