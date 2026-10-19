@@ -375,7 +375,7 @@ impl Fleet {
                         state: state_word(d.agent.state()),
                         elapsed: d.elapsed,
                         tools: d.agent.tools_used.len(),
-                        report: if w.delivered { None } else { d.agent.report.clone() },
+                        report: if w.delivered { None } else { d.agent.report.clone().map(|r| cap_report(&r)) },
                         error: d.agent.lifecycle.error.clone(),
                         delivered: w.delivered,
                     },
@@ -989,6 +989,38 @@ mod tests {
         assert_eq!(out.chars().count(), REPORT_CAP + "… (truncated, 50 more chars)".chars().count());
         // a short report is left alone
         assert_eq!(cap_report("short"), "short");
+    }
+
+    #[test]
+    fn the_listing_caps_the_report_too() {
+        // The listing is the same report in another place — under the
+        // worker's row — and the model reads that listing too. A report
+        // that eats the main's context window is a report the main
+        // cannot use, whichever tool it came from.
+        let long = "x".repeat(REPORT_CAP + 50);
+        let body = json!({"content":[{"type":"text","text":long}], "usage":{"input_tokens":1,"output_tokens":1}}).to_string();
+        let (port, _reqs) = mock_seq(vec![(200, body)]);
+        block_on(async {
+            let h = Harness::new(port, AgentCfg { max_agents: 4, wait_ms: 2_000 });
+            let id = h.fleet.spawn("count the files", None).unwrap();
+            // wait for the worker to end, without taking its report
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if h.fleet.rows().iter().any(|r| r.id == id && r.state == "done") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let rows = h.fleet.rows();
+            let row = rows.iter().find(|r| r.id == id).expect("the worker is on the list");
+            let report = row.report.as_deref().expect("the report is under its row");
+            assert!(report.contains("truncated, 50 more chars"), "the report is capped: {report}");
+            assert!(
+                report.chars().count() <= REPORT_CAP + "… (truncated, 50 more chars)".chars().count(),
+                "and no longer: {}",
+                report.chars().count()
+            );
+        });
     }
 
     #[test]
