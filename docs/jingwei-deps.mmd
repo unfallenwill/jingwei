@@ -9,7 +9,7 @@ flowchart TD
     subgraph L5["L5 — composition"]
         bin["main.rs — the thin binary"]
         lib["lib.rs — run, Error, the composition root"]
-        loop_["core::agent — the agent loop"]
+        loop_["agent::runner — the turn loop"]
         plain["ui::plain — the log adapter"]
         tui["ui::tui — the terminal adapter"]
     end

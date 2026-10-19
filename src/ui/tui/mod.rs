@@ -45,7 +45,9 @@ use crate::mcp::Hub;
 use crate::core::ports::ToolRouter;
 use crate::core::session::Convo;
 use crate::config::settings::Settings;
-use crate::{agent_turn, user_message, Error};
+use crate::agent::runner::run_agent;
+use crate::agent::Agent;
+use crate::{user_message, Error};
 
 fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(std::path::PathBuf::from)
@@ -979,8 +981,8 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
                     sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
                 }
                 // the task is on disk before the first stone moves
-                let mut turn = crate::core::turn::Turn::new(0);
-                match agent_turn(&cfg, ctx, &mut turn, &tok, &router, &sink).await {
+                let mut agent = Agent::main(&line);
+                match run_agent(&mut agent, &cfg, ctx, &router, &tok, &sink).await {
                     Err(Error::Interrupted) => {}
                     Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
                     Ok(()) => {}

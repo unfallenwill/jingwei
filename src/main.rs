@@ -15,7 +15,7 @@ fn main() {
     // The agent runs as a coroutine on a single-threaded cooperative
     // scheduler: blocking work (HTTP, file tools) is farmed to the
     // blocking pool so every await is a real suspension point; Ctrl-C
-    // rides the same machinery (see `CancelToken` and `agent_turn`).
+    // rides the same machinery (see `CancelToken` and `agent::runner::run_agent`).
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

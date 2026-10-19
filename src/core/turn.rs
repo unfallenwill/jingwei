@@ -15,10 +15,10 @@
 //! Cartesian product — "ARCHIVED + IN_PROGRESS", "PURGED + QUEUED" —
 //! combinations that have no meaning and no use.
 //!
-//! This module today is **data + transfer rules + smoke tests**. Wiring
-//! `agent_loop` to drive transitions (and a future `TurnHandle` to expose
-//! them) is the next iteration; doing it here would make this file a
-//! rewrite of `main.rs` instead of an addition.
+//! This module today is **data + transfer rules + smoke tests**. The
+//! agent loop drives the transitions (see `crate::agent::runner`), and a
+//! future `TurnHandle` may expose them; doing more here would make this
+//! file a rewrite of `main.rs` instead of an addition.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -117,11 +117,14 @@ fn allowed_from(from: TurnState) -> &'static [TurnState] {
 /// which is `None` until the turn ends badly.
 #[derive(Debug, Clone)]
 pub struct Turn {
-    /// Sequential id within the owning session: 0 for the first turn, 1
-    /// for the next, and so on. Matches the line index of the user task
-    /// that opened it, so `--list` and resumes can say "turn #3" and mean
-    /// the third row of history.
-    pub id: u32,
+    /// The turn's ordinal within the owning session: 0 for the first
+    /// turn, 1 for the next, and so on. Matches the line index of the
+    /// user task that opened it, so `--list` and resumes can say "turn #3"
+    /// and mean the third row of history.
+    ///
+    /// This is *not* the agent's identity — an agent has an id of its own
+    /// (`crate::core::ids::AgentId`), and the two must not be confused.
+    pub seq: u32,
     /// Current state. Starts at `Queued` and walks the table.
     pub state: TurnState,
     /// Wall-clock seconds since the epoch, UTC. `started_at` is filled in
@@ -139,12 +142,12 @@ pub struct Turn {
 }
 
 impl Turn {
-    /// A fresh turn for a session: `id` set, everything else empty. The
+    /// A fresh turn for a session: `seq` set, everything else empty. The
     /// `Queued` initial state matches the table's only entry for a turn
     /// that has not yet been touched.
-    pub fn new(id: u32) -> Self {
+    pub fn new(seq: u32) -> Self {
         Self {
-            id,
+            seq,
             state: TurnState::Queued,
             started_at: None,
             ended_at: None,
@@ -165,7 +168,7 @@ impl Turn {
             return Err(TurnError::Illegal {
                 from: self.state,
                 to: next,
-                turn_id: self.id,
+                turn_seq: self.seq,
             });
         }
         let now = now_secs();
@@ -232,16 +235,16 @@ fn now_secs() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnError {
     /// The caller asked for a transition the table does not allow. The
-    /// `from` and `to` are the actual states involved; `turn_id` names the
+    /// `from` and `to` are the actual states involved; `turn_seq` names the
     /// turn so a log line can be unambiguous in a multi-turn session.
-    Illegal { from: TurnState, to: TurnState, turn_id: u32 },
+    Illegal { from: TurnState, to: TurnState, turn_seq: u32 },
 }
 
 impl std::fmt::Display for TurnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TurnError::Illegal { from, to, turn_id } => {
-                write!(f, "turn #{turn_id}: illegal transition {from:?} → {to:?}")
+            TurnError::Illegal { from, to, turn_seq } => {
+                write!(f, "turn #{turn_seq}: illegal transition {from:?} → {to:?}")
             }
         }
     }

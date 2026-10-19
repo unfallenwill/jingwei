@@ -1,21 +1,22 @@
 //! The agent loop: the coroutine that composes everything else. Each
-//! run is [`agent_turn`] — cancellation semantics wrapped around
+//! run is [`run_agent`] — cancellation semantics wrapped around
 //! [`agent_loop`], which drives [`run_turn`]: one model call, the tool
 //! batch it asked for, and around again, until the model answers in
 //! plain text or a bound (`--max-turns`, Ctrl-C, an error) stops it.
 //!
 //! The loop owns no resources: the config, context, cancel token, tool
 //! router, and output sink are all handed in by the caller
-//! (`crate::run_with_hub` or a frontend), which is exactly why every
+//! (`crate::workflow` or a frontend), which is exactly why every
 //! piece can be tested with mocks and why new frontends cost nothing.
 
+use crate::agent::Agent;
 use crate::api::call_api as api_call_api;
 use crate::cancel::CancelToken;
 use crate::config::Config;
 use crate::core::context::Context;
 use crate::core::ir::{Block, Message, ToolResult};
 use crate::core::ports::ToolRouter;
-use crate::core::turn::{Turn, TurnOutcome, TurnState};
+use crate::core::turn::{TurnOutcome, TurnState};
 use crate::ui::{Msg, Sev, Show};
 use crate::tools::print_tool_call;
 use crate::Error;
@@ -31,23 +32,23 @@ const MAX_TOOL_OUTPUT: usize = 50_000;
 /// place. A second Ctrl-C while it is unwinding exits immediately, for when
 /// even graceful is too slow.
 ///
-/// `turn` is the per-run state machine: the caller hands in a fresh
-/// `Turn` (in `Queued`) and the wrapper drives it through the table via
-/// [`agent_loop`]. The caller can inspect `turn` after the wrapper
-/// returns to read the terminal state — the wrapper owns the cancel
-/// select (`tokio::select!` against Ctrl-C) and the double-signal
-/// semantics, not to hide the turn from anyone.
-pub(crate) async fn agent_turn(cfg: &Config, ctx: &mut Context, turn: &mut Turn, token: &CancelToken, router: &ToolRouter, sink: &dyn Show) -> crate::Result<()> {
-    let agent = agent_loop(cfg, ctx, turn, token, router, sink);
-    tokio::pin!(agent);
+/// `agent` is the run's value: the caller hands in a fresh [`Agent`]
+/// (whose lifecycle is a `Turn` in `Queued`) and the wrapper drives it
+/// through the table via [`agent_loop`]. The caller can inspect the agent
+/// after the wrapper returns to read the terminal state — the wrapper owns
+/// the cancel select (`tokio::select!` against Ctrl-C) and the
+/// double-signal semantics, not to hide the lifecycle from anyone.
+pub(crate) async fn run_agent(agent: &mut Agent, cfg: &Config, ctx: &mut Context, router: &ToolRouter, token: &CancelToken, sink: &dyn Show) -> crate::Result<()> {
+    let run = agent_loop(agent, cfg, ctx, router, token, sink);
+    tokio::pin!(run);
     tokio::select! {
-        res = &mut agent => return res,
+        res = &mut run => return res,
         // The plain frontend has no key loop of its own, so Ctrl-C arrives
         // as a signal here; the TUI cancels through its key handler instead.
         _ = tokio::signal::ctrl_c() => token.cancel(),
     }
     let res = tokio::select! {
-        res = &mut agent => res,
+        res = &mut run => res,
         _ = tokio::signal::ctrl_c() => {
             sink.show(Msg::Note { sev: Sev::Err, text: " interrupted again — exiting ".into() });
             std::process::exit(130);
@@ -65,12 +66,12 @@ pub(crate) async fn agent_turn(cfg: &Config, ctx: &mut Context, turn: &mut Turn,
 /// history valid — interrupted tools get results, unfinished tool calls are
 /// dropped from the turn, and the REPL prompt simply returns.
 ///
-/// `turn` is the per-run state machine the wrapper owns; this function
-/// drives it through the table — `Queued → InProgress` at the entry,
-/// the terminal transition on the way out. The mechanics of "do API
-/// calls and run tools" live in [`run_turn`], kept separate so the
-/// mapping between [`Result`] and [`TurnState`] has exactly one home
-/// (caller translates to [`TurnOutcome`], [`Turn::finish`] maps that).
+/// The agent's own lifecycle is the one this function drives: it moves
+/// the agent through the table — `Queued → InProgress` at the entry, the
+/// terminal transition on the way out. The mechanics of "do API calls and
+/// run tools" live in [`run_turn`], kept separate so the mapping between
+/// [`Result`] and [`TurnState`] has exactly one home (caller translates
+/// to [`TurnOutcome`], `Turn::finish` maps that).
 ///
 /// `router` is the tool router — the seam every tool family plugs into.
 /// Asking it for the schemas is what puts the current tool list on the
@@ -83,15 +84,15 @@ pub(crate) async fn agent_turn(cfg: &Config, ctx: &mut Context, turn: &mut Turn,
 /// appends to the transcript and asks the router for the current
 /// schemas each turn, so the next request sees whatever the providers
 /// report.
-async fn agent_loop(cfg: &Config, ctx: &mut Context, turn: &mut Turn, token: &CancelToken, router: &ToolRouter, sink: &dyn Show) -> crate::Result<()> {
+async fn agent_loop(agent: &mut Agent, cfg: &Config, ctx: &mut Context, router: &ToolRouter, token: &CancelToken, sink: &dyn Show) -> crate::Result<()> {
     // The only legal first move. An Illegal here would mean the caller
     // handed us a non-fresh turn — a programming bug — and we surface it
     // as a regular error rather than a panic so a misconfigured caller
     // doesn't kill the agent mid-sentence.
-    turn.transition(TurnState::InProgress, None)
+    agent.lifecycle.transition(TurnState::InProgress, None)
         .map_err(|e| Error::Msg(e.to_string()))?;
 
-    let result = run_turn(cfg, ctx, token, router, sink).await;
+    let result = run_turn(cfg, ctx, router, token, sink).await;
     // The Result → TurnOutcome translation lives here because `core::turn`
     // deliberately keeps no dependency on the error vocabulary: the turn
     // carries a failure as a `String`, and turning the error type into
@@ -102,14 +103,14 @@ async fn agent_loop(cfg: &Config, ctx: &mut Context, turn: &mut Turn, token: &Ca
         Err(Error::Interrupted) => TurnOutcome::Interrupted,
         Err(e) => TurnOutcome::Failed(e.to_string()),
     };
-    turn.finish(outcome);
+    agent.lifecycle.finish(outcome);
     result
 }
 
 /// Drive one turn's worth of API calls and tool runs. Pure mechanics — the
-/// [`Turn`] state machine is owned by the caller. Returns whatever
-/// happened; the caller maps it onto a terminal state via [`Turn::finish`].
-async fn run_turn(cfg: &Config, ctx: &mut Context, token: &CancelToken, router: &ToolRouter, sink: &dyn Show) -> crate::Result<()> {
+/// agent's lifecycle is owned by the caller. Returns whatever happened;
+/// the caller maps it onto a terminal state via `Turn::finish`.
+async fn run_turn(cfg: &Config, ctx: &mut Context, router: &ToolRouter, token: &CancelToken, sink: &dyn Show) -> crate::Result<()> {
     for step in 0..cfg.max_turns {
         if token.is_cancelled() { return Err(Error::Interrupted); }
         // The tool list the model sees is whatever the providers say right
@@ -179,6 +180,7 @@ fn truncate(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{AgentRole, AgentId};
     use crate::cancel::CancelToken;
     use crate::mcp::Hub;
     use crate::test_util::{block_on, cfg, mock_seq, mock_stall, sink};
@@ -255,13 +257,13 @@ mod tests {
         let done = r#"{"content":[{"type":"text","text":"done"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
         let (port, reqs) = mock_seq(vec![(200, tool.into()), (200, done.into())]);
         let mut cx = ctx_with("run echo");
-        let mut turn = Turn::new(0);
+        let mut agent = Agent::main("run echo");
         block_on(async {
             // Hub::empty() spawns an actor task — the test needs a runtime
             // for the spawn to land, even though the hub itself has no work
             // to do in this test.
             let (router, hub) = router();
-            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut turn, &CancelToken::new(), &router, &sink()).await.unwrap();
+            agent_loop(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &CancelToken::new(), &sink()).await.unwrap();
             hub.shutdown().await;
         });
         assert_eq!(cx.history().len(), 4); // user + assistant(tool_use) + user(tool_result) + assistant(text)
@@ -276,8 +278,8 @@ mod tests {
         assert!(reqs[0].contains("input_schema"), "tool schemas must be sent");
         assert!(reqs[1].contains("\"type\":\"tool_result\""), "results must feed the next request");
         // the turn reached Completed — the natural exit on a final-text response
-        assert_eq!(turn.state, TurnState::Completed);
-        assert!(turn.started_at.is_some() && turn.ended_at.is_some());
+        assert_eq!(agent.state(), TurnState::Completed);
+        assert!(agent.started_at().is_some() && agent.ended_at().is_some());
     }
 
     #[test]
@@ -287,15 +289,15 @@ mod tests {
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
         c.max_turns = 1;
         let mut cx = ctx_with("go");
-        let mut turn = Turn::new(0);
+        let mut agent = Agent::main("go");
         block_on(async {
             let (router, hub) = router();
-            agent_loop(&c, &mut cx, &mut turn, &CancelToken::new(), &router, &sink()).await.unwrap(); // must return instead of spinning
+            agent_loop(&mut agent, &c, &mut cx, &router, &CancelToken::new(), &sink()).await.unwrap(); // must return instead of spinning
             hub.shutdown().await;
         });
         assert_eq!(cx.history().len(), 3); // user + assistant(tool_use) + user(tool_result)
         // hitting max_turns is a normal exit, not a failure — Completed, not Failed
-        assert_eq!(turn.state, TurnState::Completed);
+        assert_eq!(agent.state(), TurnState::Completed);
     }
 
     // ---- coroutine cancellation ----
@@ -320,7 +322,7 @@ mod tests {
             r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answ"}}"#, "\n\n");
         let (port, stalled_written) = mock_stall(tool, stalled);
         let mut cx = ctx_with("go");
-        let mut turn = Turn::new(0);
+        let mut agent = Agent::main("go");
         let err = block_on(async {
             let (router, hub) = router();
             let token = Arc::new(CancelToken::new());
@@ -338,7 +340,7 @@ mod tests {
                 }
                 t.cancel();
             });
-            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), true), &mut cx, &mut turn, &token, &router, &sink()).await;
+            let res = agent_loop(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), true), &mut cx, &router, &token, &sink()).await;
             hub.shutdown().await;
             res
         }).unwrap_err();
@@ -359,8 +361,8 @@ mod tests {
         // Ctrl-C mid-stream lands the turn on `Interrupted`, not `Failed` —
         // interruption is a stop, not an error, and the table keeps the two
         // separate so the banner can read "interrupted" without "error".
-        assert_eq!(turn.state, TurnState::Interrupted);
-        assert!(turn.error.is_none(), "interrupted is not a failure");
+        assert_eq!(agent.state(), TurnState::Interrupted);
+        assert!(agent.lifecycle.error.is_none(), "interrupted is not a failure");
     }
 
     #[test]
@@ -370,7 +372,7 @@ mod tests {
             r#"{{"content":[{{"type":"tool_use","id":"t1","name":"bash","input":{{"command":"{cmd}"}}}}],"usage":{{"input_tokens":1,"output_tokens":1}}}}"#);
         let (port, _) = mock_seq(vec![(200, tool)]);
         let mut cx = ctx_with("go");
-        let mut turn = Turn::new(0);
+        let mut agent = Agent::main("go");
         let err = block_on(async {
             let (router, hub) = router();
             let token = Arc::new(CancelToken::new());
@@ -379,7 +381,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 t.cancel();
             });
-            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut turn, &token, &router, &sink()).await;
+            let res = agent_loop(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &token, &sink()).await;
             hub.shutdown().await;
             res
         }).unwrap_err();
@@ -389,7 +391,7 @@ mod tests {
         assert!(result.contains("[interrupted by user]"), "got: {result}");
         assert_eq!(hist(cx.history())[2]["content"][0]["tool_use_id"], json!("t1"));
         // mid-tool cancel also lands on `Interrupted` — same state, same reason.
-        assert_eq!(turn.state, TurnState::Interrupted);
+        assert_eq!(agent.state(), TurnState::Interrupted);
     }
 
     /// A 500 from the wire is *not* `Failed`: the transport retries it
@@ -409,16 +411,16 @@ mod tests {
         }
         let (port, _) = mock_seq(responses);
         let mut cx = ctx_with("go");
-        let mut turn = Turn::new(0);
+        let mut agent = Agent::main("go");
         let err = block_on(async {
             let (router, _hub) = router();
-            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut turn, &CancelToken::new(), &router, &sink()).await
+            agent_loop(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &CancelToken::new(), &sink()).await
         }).unwrap_err();
         // the error reaches the caller — the same one we record on the turn
         assert!(matches!(err, Error::Api(500, _)), "got: {err}");
-        assert_eq!(turn.state, TurnState::Failed, "5xx after retries is Failed, not Interrupted");
-        assert!(turn.error.as_deref().unwrap_or("").contains("500"), "error carries the api status: got {:?}", turn.error);
-        assert!(turn.started_at.is_some() && turn.ended_at.is_some(), "timestamps stamp both ends");
+        assert_eq!(agent.state(), TurnState::Failed, "5xx after retries is Failed, not Interrupted");
+        assert!(agent.lifecycle.error.as_deref().unwrap_or("").contains("500"), "error carries the api status: got {:?}", agent.lifecycle.error);
+        assert!(agent.started_at().is_some() && agent.ended_at().is_some(), "timestamps stamp both ends");
     }
 
     // bash+grandchild test lives in tool_runtime::tests; see cmd/conn
@@ -426,29 +428,30 @@ mod tests {
 
     /// The wrapper owns the cancel select; the loop-level tests above
     /// exercise the mechanics without it. This one drives the wrapper
-    /// end-to-end and asserts on the same Turn the caller owns — so a
-    /// future change that forgets to plumb `&mut turn` through agent_turn,
-    /// or hands a non-fresh turn to agent_loop, fails here.
+    /// end-to-end and asserts on the same Agent the caller owns — so a
+    /// future change that forgets to plumb `&mut Agent` through
+    /// run_agent, or hands a non-fresh lifecycle to agent_loop, fails here.
     #[test]
-    fn agent_turn_drives_a_fresh_turn_through_to_completed() {
+    fn run_agent_drives_a_fresh_turn_through_to_completed() {
         let done = r#"{"content":[{"type":"text","text":"all done"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
         let (port, _) = mock_seq(vec![(200, done.into())]);
-        let mut turn = Turn::new(7);
+        let mut agent = Agent::new(AgentId::MAIN, "main".into(), AgentRole::Main, "say hi".into(), crate::core::turn::Turn::new(7));
         // a wrapper-level run starts in Queued — that's the caller's job
         // to construct, and the wrapper must not silently rewind it.
-        assert_eq!(turn.state, TurnState::Queued);
+        assert_eq!(agent.state(), TurnState::Queued);
         let mut cx = ctx_with("say hi");
         block_on(async {
             let (router, hub) = router();
-            agent_turn(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut turn, &CancelToken::new(), &router, &sink()).await.unwrap();
+            run_agent(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &CancelToken::new(), &sink()).await.unwrap();
             hub.shutdown().await;
         });
-        // the wrapper drove Queued → InProgress → Completed on the turn
-        // the caller handed in; the id survives, the timestamps stamp
-        // both ends, and the loop's mechanics ran at least once.
-        assert_eq!(turn.id, 7, "wrapper must not rewind turn id");
-        assert_eq!(turn.state, TurnState::Completed);
-        assert!(turn.started_at.is_some() && turn.ended_at.is_some());
+        // the wrapper drove Queued → InProgress → Completed on the agent
+        // the caller handed in; the turn's ordinal survives, the
+        // timestamps stamp both ends, and the loop's mechanics ran at
+        // least once.
+        assert_eq!(agent.lifecycle.seq, 7, "wrapper must not rewind the turn's seq");
+        assert_eq!(agent.state(), TurnState::Completed);
+        assert!(agent.started_at().is_some() && agent.ended_at().is_some());
         assert_eq!(hist(cx.history()).as_array().unwrap().last().unwrap()["role"], json!("assistant"));
     }
 }

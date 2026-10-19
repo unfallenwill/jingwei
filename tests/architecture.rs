@@ -4,7 +4,7 @@
 //
 // Layering (lower → higher, deps go downward only):
 //
-//   L0  ui (the port), core (mod, ir, session, turn, error), format
+//   L0  ui (the port), core (mod, ir, session, turn, error, ids), format
 //                                                  — pure data + state machines + the display port
 //   L1  cancel, file_io, core::agents_md, core::reminder
 //                                                  — infra primitives
@@ -13,7 +13,7 @@
 //   L3  config (+ settings/login), tools (+ edit/ledger/runtime), mcp + submodules
 //                                                  — the user's wishes and the tool tier
 //   L4  api (+ api::minimax/zai/deepseek)          — vendor + transport
-//   L5  lib, main, core::agent, ui::plain, ui::tui (+ model/update/view)
+//   L5  lib, main, agent (+ runner), ui::plain, ui::tui (+ model/update/view)
 //                                                  — composition root + the loop + the port's adapters
 //   T   test_util                                  — test-only helpers
 //
@@ -70,6 +70,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("core::session", Layer::L0),      // the JSON-lines transcript
     ("core::turn", Layer::L0),         // the per-run state machine
     ("core::error", Layer::L0),        // Error and Result's home
+    ("core::ids", Layer::L0),          // the agent identity: who is running
     ("format", Layer::L0),             // string measurement; it imports
                                         // nothing, and the display port (L0)
                                         // and the session (L0) both reach it
@@ -113,7 +114,8 @@ const LAYERS: &[(&str, Layer)] = &[
     // L5 — composition and the frontends.
     ("lib", Layer::L5),
     ("main", Layer::L5),
-    ("core::agent", Layer::L5),
+    ("agent", Layer::L5),               // the agent as a value
+    ("agent::runner", Layer::L5),       // the turn loop
     ("ui::plain", Layer::L5),
     ("ui::tui", Layer::L5),
     ("ui::tui::model", Layer::L5),
@@ -153,7 +155,7 @@ type Modules = BTreeMap<String, String>;
 ///
 /// The crate root's scope is the empty string: a `crate::…` path starts
 /// there, and the root's own items — `Error`, `Result`, and the private
-/// `use`s that make `crate::agent_turn` nameable — are its aliases.
+/// `use`s that make `crate::Error` nameable — are its aliases.
 type Aliases = HashMap<String, HashMap<String, String>>;
 
 /// The scope a module's own aliases live in: the root's aliases are the

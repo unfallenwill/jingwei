@@ -6,17 +6,17 @@
 //! what the model actually sees ([`context`]) — system text, the tool
 //! list, in-band [`reminder`]s, and the project conventions discovered
 //! by [`agents_md`]. And the loop that carries it all — model call,
-//! tool run, model call — is [`agent`].
+//! tool run, model call — lives above this cluster, in `crate::agent`.
 //!
 //! The rest of the crate serves this core from the outside: `api`
 //! speaks the wire, `tools` and `mcp` act on the world, `ui` shows it
 //! happening. Nothing in `core` imports those; the loop takes them as
 //! parameters.
 
-pub(crate) mod agent;
 pub(crate) mod agents_md;
 pub(crate) mod context;
 pub(crate) mod error;
+pub(crate) mod ids;
 pub(crate) mod ir;
 pub(crate) mod ports;
 pub(crate) mod reminder;

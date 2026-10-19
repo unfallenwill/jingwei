@@ -156,7 +156,6 @@ pub async fn plain_repl(
     hub: Hub,
     router: std::sync::Arc<crate::core::ports::ToolRouter>,
 ) -> crate::Result<()> {
-    use crate::{agent_turn};
     let sink = PlainSink::new();
     let tty = std::io::stdin().is_terminal();
     sink.show(Msg::Banner("jingwei — 精卫填海，一石一石 · type a task, /exit or Ctrl-D rests, Ctrl-C interrupts".into()));
@@ -216,10 +215,10 @@ pub async fn plain_repl(
             sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
         }
         // the task is on disk before the first stone moves
+        let mut agent = crate::agent::Agent::main(&line);
         sink.show(Msg::TaskBegin(line));
         let token = crate::cancel::CancelToken::new();
-        let mut turn = crate::core::turn::Turn::new(0);
-        match agent_turn(cfg, &mut ctx, &mut turn, &token, &router, &sink).await {
+        match crate::agent::runner::run_agent(&mut agent, cfg, &mut ctx, &router, &token, &sink).await {
             Err(crate::Error::Interrupted) => {}
             Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
             Ok(()) => {}

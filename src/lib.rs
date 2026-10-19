@@ -11,6 +11,7 @@
 //      settings — key, base URL, model, protocol, cache, thinking,
 //      effort, frontend choice — go through CLI flags)
 
+mod agent;
 mod api;
 mod cancel;
 mod config;
@@ -25,15 +26,15 @@ mod tools;
 pub mod ui;
 
 #[cfg(test)] mod test_util;
+use crate::agent::runner::run_agent;
+use crate::agent::Agent;
 use crate::cancel::CancelToken;
 use crate::config::{Args, Config, build_config};
-use crate::core::agent::agent_turn;
 use crate::core::agents_md::AgentsMdContext;
 use crate::core::context::Context;
 use crate::core::ir::{user_message, Message};
 use crate::core::ports::ToolRouter;
 use crate::core::session;
-use crate::core::turn::Turn;
 use crate::ui::{Msg, Sev, Show};
 use crate::mcp::Hub;
 use crate::tools::Builtins;
@@ -145,8 +146,8 @@ async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agent
         sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
     }
     let token = CancelToken::new();
-    let mut turn = Turn::new(0);
-    let res = agent_turn(&cfg, &mut ctx, &mut turn, &token, &router, &sink).await;
+    let mut agent = Agent::main(&prompt);
+    let res = run_agent(&mut agent, &cfg, &mut ctx, &router, &token, &sink).await;
     if let Err(e) = convo.persist(ctx.history()) {
         sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
     }
