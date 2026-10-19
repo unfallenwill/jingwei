@@ -90,7 +90,7 @@ pub async fn run() -> Result<()> {
     } else {
         AgentsMdContext::load(&workspace)
     };
-    let ctx = Context::new(&agents_ctx, cfg.context_size);
+    let mut ctx = Context::new(&agents_ctx, cfg.context_size);
     // MCP hub: external servers' tools, offered to the model as though
     // they were the agent's own. Spawned once per process and shared
     // across every turn (and every front-end). The user's servers are
@@ -108,7 +108,15 @@ pub async fn run() -> Result<()> {
     // The fleet is built before the router, because the agent tools are
     // a provider over it; the router reaches the fleet in turn, through
     // the run that opens it.
-    let fleet = Arc::new(Fleet::new(AgentCfg::from_config(&cfg)));
+    let agent_cfg = AgentCfg::from_config(&cfg);
+    let fleet = Arc::new(Fleet::new(agent_cfg));
+    // The fleet's own instruction rides with the main agent's context,
+    // and only when the fleet is on: the tool list is the mechanism,
+    // this is the reason to use it. With the cap at zero the model is
+    // not told about agents it could not start anyway.
+    if agent_cfg.enabled() {
+        ctx.reminders.push(AgentTools::reminder());
+    }
     let router = Arc::new(ToolRouter::new(vec![
         Box::new(Builtins),
         Box::new(hub.clone()),

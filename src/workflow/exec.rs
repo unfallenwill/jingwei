@@ -69,6 +69,13 @@ impl AgentCfg {
     pub(crate) fn from_config(cfg: &Config) -> Self {
         Self { max_agents: cfg.max_agents, wait_ms: cfg.agent_wait_ms }
     }
+
+    /// Is the fleet on? Zero agents disables *spawning* — the schemas
+    /// stay on the wire, so the cache stays warm — but a model told
+    /// about background agents it cannot start would only ask for them.
+    pub(crate) fn enabled(&self) -> bool {
+        self.max_agents > 0
+    }
 }
 
 impl Default for AgentCfg {
@@ -639,6 +646,15 @@ mod tests {
     const LATE: Duration = Duration::from_millis(300);
 
     // ---- the cap ---------------------------------------------------------
+
+    #[test]
+    fn the_fleet_is_off_when_the_cap_is_zero() {
+        // Zero agents disables spawning. The schemas stay on the wire —
+        // the cache stays warm — but the model is not told about
+        // background agents it could not start.
+        assert!(AgentCfg { max_agents: 1, wait_ms: 0 }.enabled());
+        assert!(!AgentCfg { max_agents: 0, wait_ms: 0 }.enabled());
+    }
 
     #[test]
     fn the_cap_is_enforced() {

@@ -79,7 +79,6 @@ pub(crate) enum ReminderId {
     /// background agents, and how to collect their reports. It rides
     /// with the fleet's tools, and a worker that was shown both would
     /// try to spawn agents of its own.
-    #[allow(dead_code)] // the fleet slice mints the reminder; until then only the tests do
     AgentTools,
 }
 

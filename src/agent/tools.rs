@@ -31,11 +31,22 @@ use serde_json::{json, Value};
 use crate::cancel::CancelToken;
 use crate::core::ids::AgentId;
 use crate::core::ports::{BoxFuture, ToolProvider};
+use crate::core::reminder::{ReminderId, SystemReminder};
 use crate::workflow::exec::Fleet;
 
 /// The four tool names, in the order they are offered.
 pub(crate) const AGENT_TOOL_NAMES: [&str; 4] =
     ["spawn_agent", "wait_agents", "stop_agent", "list_agents"];
+
+/// The reminder's text. The same bytes every request of a session, so
+/// it rides in the cached prefix like every other session-stable
+/// reminder.
+const AGENT_TOOLS_REMINDER: &str = "\n\n# Background agents\n\n\
+    You can start background agents to work on parts of a task at the same \
+    time. Use `spawn_agent` with a self-contained task, give each agent a \
+    disjoint set of files, and collect the results with `wait_agents` before \
+    you answer. A background agent's report is its final answer — read it \
+    before you summarize.";
 
 /// The agent tools, as a provider over the fleet.
 pub(crate) struct AgentTools {
@@ -47,6 +58,21 @@ impl AgentTools {
     /// The provider, over this session's fleet.
     pub(crate) fn new(fleet: Arc<Fleet>) -> Self {
         Self { fleet, schemas: schemas() }
+    }
+
+    /// The fleet's instruction, as a reminder.
+    ///
+    /// The tool list is the *mechanism*; this is the *reason to use it*.
+    /// A model that has never been told what a background agent is will
+    /// not reach for one on its own. It rides in the context's reminders
+    /// and never in `SYSTEM`: the system text is the stable identity the
+    /// model reads once per session, and this is only there when the
+    /// fleet is.
+    pub(crate) fn reminder() -> SystemReminder {
+        SystemReminder {
+            id: ReminderId::AgentTools,
+            text: AGENT_TOOLS_REMINDER.into(),
+        }
     }
 }
 
@@ -253,6 +279,25 @@ mod tests {
         assert_eq!(&names[..4], &["bash", "read_file", "write_file", "edit_file"]);
         assert_eq!(names[4], "server_tool", "the servers' tools sit in the middle: {names:?}");
         assert_eq!(&names[5..], &AGENT_TOOL_NAMES, "the fleet's schemas come last: {names:?}");
+    }
+
+    #[test]
+    fn the_fleet_reminder_says_how_to_use_the_fleet() {
+        // The tool list is the mechanism; the reminder is the reason to
+        // use it. Without it the model has no reason to reach for a
+        // background agent at all.
+        let r = AgentTools::reminder();
+        assert!(matches!(r.id, ReminderId::AgentTools), "got: {:?}", r.id);
+        assert!(r.text.contains("spawn_agent"), "it names the tool: {}", r.text);
+        assert!(r.text.contains("wait_agents"), "and the one that collects: {}", r.text);
+        assert!(
+            r.text.contains("collect the results with `wait_agents` before you answer"),
+            "and says to collect before answering: {}",
+            r.text
+        );
+        // the same bytes every request of a session, so it rides in the
+        // cached prefix
+        assert!(r.id.is_session_stable(), "the reminder never changes mid-session");
     }
 
     #[test]
