@@ -11,6 +11,7 @@
 
 use serde_json::Value;
 use std::env;
+use std::sync::Arc;
 use std::time::Duration;
 use std::io::{self, IsTerminal};
 use unicode_segmentation::UnicodeSegmentation;
@@ -18,6 +19,13 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub(crate) mod plain;
 pub(crate) mod tui;
+
+// The port names the agent's identity and the run's lifecycle, and both
+// live below it: `AgentId` in `core::ids`, `TurnState` in `core::turn`.
+// The port is public, so it re-exports them — a contract that hands a
+// consumer a type it cannot name is not a contract.
+pub use crate::core::ids::AgentId;
+pub use crate::core::turn::TurnState;
 
 /// Severity of a note row (warnings scroll with the transcript).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -50,6 +58,13 @@ pub enum Sev {
 /// cut short before it reported anything closes nothing. A run
 /// interrupted mid-flight still ends with `TaskEnd` (whatever was
 /// reasoned is folded first), so frontends never dangle.
+///
+/// > A background agent's events arrive **wrapped**: `FromAgent { id, event }`.
+/// > The wrapper carries the attribution and nothing else — the inner events
+/// > keep the same relative order they would have had unwrapped, and the
+/// > inner `Usage` / `Done` belong to *that* agent, never to the session's
+/// > totals. A worker's events never arrive unwrapped, and the main
+/// > conversation's events never arrive wrapped.
 #[derive(Clone, Debug)]
 pub enum Msg {
     /// A dim information line (the banner).
@@ -79,6 +94,36 @@ pub enum Msg {
     /// The request finished: close its usage reading (fold it into the
     /// session totals exactly once).
     Done,
+    /// A background agent's event. The wrapper is the attribution: the
+    /// inner event belongs to `id`, not to the main conversation.
+    FromAgent { id: AgentId, event: Box<AgentMsg> },
+}
+
+/// What a background agent can say.
+///
+/// A closed vocabulary, and deliberately narrower than [`Msg`]: a worker
+/// never brackets a run (`TaskBegin` / `TaskEnd`), never ends the human's
+/// turn (`Done`), and never reports session usage (`Usage` /
+/// `OutTokens`). Those belong to the main conversation. A worker's own
+/// tokens are its own business — the main session's totals do not grow by
+/// a worker's spending, and this vocabulary is what makes that structural
+/// rather than a rule somebody has to remember.
+#[derive(Clone, Debug)]
+pub enum AgentMsg {
+    /// The agent started, with the label the human sees.
+    Started { label: String },
+    /// A chunk of answer text.
+    Text(String),
+    /// A chunk of reasoning.
+    Think(String),
+    /// The reasoning block closed: fold it into a marker.
+    ThinkEnd,
+    /// A tool call completed: name, argument summary, full output.
+    Tool { name: String, summary: String, output: String },
+    /// A note — a warning, an error, the final report.
+    Note { sev: Sev, text: String },
+    /// The agent reached a terminal state, with its report.
+    Finished { state: TurnState, report: String },
 }
 
 /// Token usage of one API request — or session totals. Part of the [`Msg`]
@@ -182,6 +227,23 @@ pub fn thought_folded(n: usize, first: &str, more: usize) -> String {
     }
 }
 
+/// The one glyph per state, in the vocabulary the rest of the port
+/// already prints. Ambiguous-width like `▸`/`❯`, which the tree uses.
+///
+/// The state itself is `core::turn`'s — the port does not keep a second
+/// copy of "is this agent still running" — but the *glyph* is a display
+/// concern, so it lives here with the rest of the vocabulary.
+pub fn state_glyph(state: TurnState) -> &'static str {
+    match state {
+        TurnState::Queued => "○",
+        TurnState::InProgress => "▸",
+        TurnState::Completed => "✓",
+        TurnState::Failed => "✗",
+        TurnState::Interrupted => "⊘",
+        TurnState::Canceled => "◌",
+    }
+}
+
 /// Elapsed time, the way both the status bar and the fold markers read it:
 /// `3s`, then `1m03s`. A shared vocabulary word, not two spellings.
 pub fn elapsed_str(d: Duration) -> String {
@@ -268,6 +330,87 @@ impl ChannelSink {
 impl Show for ChannelSink {
     fn show(&self, m: Msg) {
         let _ = self.0.send(m);
+    }
+}
+
+/// A sink that attributes everything it carries to one background agent.
+///
+/// A worker gets one of these instead of the main sink, so its events
+/// reach the frontend already wrapped. The messages that mean nothing in
+/// a worker — the run bracketing, the session accounting, the banner —
+/// are dropped here, and that is the whole point of the drop list: a
+/// worker cannot end the human's turn or spend the session's tokens.
+///
+/// `Clone`, like the sink it wraps: the shared sink is shared, and the
+/// frontend may hold one copy while the worker holds another.
+#[derive(Clone)]
+pub struct AgentSink {
+    inner: Arc<dyn Show>,
+    id: AgentId,
+}
+
+impl AgentSink {
+    /// Wrap a sink so everything it carries belongs to `id`.
+    pub fn new(inner: impl Show + 'static, id: AgentId) -> Self {
+        Self { inner: Arc::new(inner), id }
+    }
+
+    /// The agent this sink speaks for.
+    pub fn id(&self) -> AgentId {
+        self.id
+    }
+
+    /// Announce that the agent started.
+    pub fn started(&self, label: String) {
+        self.inner.show(Msg::FromAgent {
+            id: self.id,
+            event: Box::new(AgentMsg::Started { label }),
+        });
+    }
+
+    /// Announce that the agent reached a terminal state.
+    pub fn finished(&self, state: TurnState, report: String) {
+        self.inner.show(Msg::FromAgent {
+            id: self.id,
+            event: Box::new(AgentMsg::Finished { state, report }),
+        });
+    }
+}
+
+impl Show for AgentSink {
+    /// The mapping — and the drop list.
+    ///
+    /// | `Msg` | becomes | why |
+    /// |---|---|---|
+    /// | `Text(t)` | `AgentMsg::Text(t)` | the worker's prose |
+    /// | `Think(t)` | `AgentMsg::Think(t)` | the worker's reasoning |
+    /// | `ThinkEnd` | `AgentMsg::ThinkEnd` | the block closed |
+    /// | `Tool { name, summary, output }` | `AgentMsg::Tool { … }` | the worker's tool call |
+    /// | `Note { sev, text }` | `AgentMsg::Note { sev, text }` | the worker's warning or error |
+    /// | `Banner(_)` | *dropped* | a banner is the conversation's announcement; a worker announces nothing |
+    /// | `TaskBegin(_)` | *dropped* | a worker does not begin the human's run |
+    /// | `TaskEnd` | *dropped* | a worker does not end it either |
+    /// | `Usage(_)` / `OutTokens(_)` | *dropped* | a worker's tokens are not the session's tokens |
+    /// | `Done` | *dropped* | `Done` closes the *main's* request; the worker's own accounting is its own |
+    /// | `FromAgent { .. }` | *dropped* | no nesting: a wrapped event belongs to another agent, not to this one |
+    ///
+    /// The drop list is the design, not an omission — a worker cannot
+    /// end the human's turn, spend the session's tokens, or open a run.
+    fn show(&self, m: Msg) {
+        let event = match m {
+            Msg::Text(t) => AgentMsg::Text(t),
+            Msg::Think(t) => AgentMsg::Think(t),
+            Msg::ThinkEnd => AgentMsg::ThinkEnd,
+            Msg::Tool { name, summary, output } => AgentMsg::Tool { name, summary, output },
+            Msg::Note { sev, text } => AgentMsg::Note { sev, text },
+            Msg::Banner(_) => return,
+            Msg::TaskBegin(_) => return,
+            Msg::TaskEnd => return,
+            Msg::Usage(_) | Msg::OutTokens(_) => return,
+            Msg::Done => return,
+            Msg::FromAgent { .. } => return,
+        };
+        self.inner.show(Msg::FromAgent { id: self.id, event: Box::new(event) });
     }
 }
 
@@ -403,5 +546,174 @@ mod tests {
         total.add(&u);
         total.add(&u);
         assert_eq!((total.input, total.output, total.cache_read, total.cache_write), (20, 6, 10, 4));
+    }
+
+    // ---- the attribution: a worker's events arrive wrapped ----------------
+
+    /// A worker id of its own — the main agent's id is spoken for.
+    fn worker_id() -> AgentId {
+        AgentId::next()
+    }
+
+    #[test]
+    fn a_workers_events_are_wrapped() {
+        let rec = crate::test_util::Recorder::default();
+        let sink = AgentSink::new(rec.clone(), worker_id());
+        sink.show(Msg::Text("the worker's prose".into()));
+        let msgs = rec.msgs();
+        assert_eq!(msgs.len(), 1, "one event, and it is the worker's: {msgs:?}");
+        match &msgs[0] {
+            Msg::FromAgent { id, event } => {
+                assert_eq!(*id, sink.id(), "the wrapper carries the attribution");
+                match event.as_ref() {
+                    AgentMsg::Text(t) => assert_eq!(t, "the worker's prose"),
+                    other => panic!("expected the worker's text, got {other:?}"),
+                }
+            }
+            other => panic!("a worker's event arrives wrapped, never bare: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_conversations_events_are_not_wrapped() {
+        // the same recorder, reached directly: the wrapper is the
+        // adapter's doing, and the main conversation is untouched by it
+        let rec = crate::test_util::Recorder::default();
+        let sink = AgentSink::new(rec.clone(), worker_id());
+        sink.show(Msg::Text("from the worker".into()));
+        rec.show(Msg::Text("from the conversation".into()));
+        let msgs = rec.msgs();
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert!(matches!(&msgs[0], Msg::FromAgent { .. }), "the worker's event is wrapped: {msgs:?}");
+        assert!(
+            matches!(&msgs[1], Msg::Text(ref t) if t == "from the conversation"),
+            "the conversation's event is not: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn a_worker_cannot_end_the_conversation() {
+        let rec = crate::test_util::Recorder::default();
+        let sink = AgentSink::new(rec.clone(), worker_id());
+        sink.show(Msg::TaskEnd);
+        sink.show(Msg::Done);
+        assert!(rec.msgs().is_empty(), "a worker ends nothing: {:?}", rec.msgs());
+    }
+
+    #[test]
+    fn a_worker_cannot_spend_the_sessions_tokens() {
+        let rec = crate::test_util::Recorder::default();
+        let sink = AgentSink::new(rec.clone(), worker_id());
+        sink.show(Msg::Usage(Usage { input: 10, output: 5, ..Usage::default() }));
+        sink.show(Msg::OutTokens(9));
+        assert!(rec.msgs().is_empty(), "a worker's tokens are its own: {:?}", rec.msgs());
+    }
+
+    #[test]
+    fn a_workers_lifecycle_is_announced() {
+        let rec = crate::test_util::Recorder::default();
+        let sink = AgentSink::new(rec.clone(), worker_id());
+        sink.started("scout".into());
+        sink.finished(TurnState::Completed, "found three files".into());
+        let msgs = rec.msgs();
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        match &msgs[0] {
+            Msg::FromAgent { id, event } => {
+                assert_eq!(*id, sink.id());
+                match event.as_ref() {
+                    AgentMsg::Started { label } => assert_eq!(label, "scout"),
+                    other => panic!("expected a start, got {other:?}"),
+                }
+            }
+            other => panic!("expected a wrapped start, got {other:?}"),
+        }
+        match &msgs[1] {
+            Msg::FromAgent { id, event } => {
+                assert_eq!(*id, sink.id());
+                match event.as_ref() {
+                    AgentMsg::Finished { state, report } => {
+                        assert_eq!(*state, TurnState::Completed);
+                        assert_eq!(report, "found three files");
+                    }
+                    other => panic!("expected a finish, got {other:?}"),
+                }
+            }
+            other => panic!("expected a wrapped finish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_workers_tool_call_keeps_its_three_parts() {
+        let rec = crate::test_util::Recorder::default();
+        let sink = AgentSink::new(rec.clone(), worker_id());
+        sink.show(Msg::Tool {
+            name: "read_file".into(),
+            summary: "Cargo.toml".into(),
+            output: "the file's contents".into(),
+        });
+        let msgs = rec.msgs();
+        match &msgs[0] {
+            Msg::FromAgent { event, .. } => match event.as_ref() {
+                AgentMsg::Tool { name, summary, output } => {
+                    assert_eq!(name, "read_file");
+                    assert_eq!(summary, "Cargo.toml");
+                    assert_eq!(output, "the file's contents");
+                }
+                other => panic!("expected a tool event, got {other:?}"),
+            },
+            other => panic!("expected a wrapped tool event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_workers_note_keeps_its_severity() {
+        let rec = crate::test_util::Recorder::default();
+        let sink = AgentSink::new(rec.clone(), worker_id());
+        sink.show(Msg::Note { sev: Sev::Warn, text: "watch out".into() });
+        let msgs = rec.msgs();
+        match &msgs[0] {
+            Msg::FromAgent { event, .. } => match event.as_ref() {
+                AgentMsg::Note { sev, text } => {
+                    assert_eq!(*sev, Sev::Warn, "the severity is not flattened away");
+                    assert_eq!(text, "watch out");
+                }
+                other => panic!("expected a note event, got {other:?}"),
+            },
+            other => panic!("expected a wrapped note, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_worker_cannot_open_a_run_or_announce_a_banner() {
+        let rec = crate::test_util::Recorder::default();
+        let sink = AgentSink::new(rec.clone(), worker_id());
+        sink.show(Msg::Banner("jingwei".into()));
+        sink.show(Msg::TaskBegin("the human's task".into()));
+        assert!(
+            rec.msgs().is_empty(),
+            "a worker brackets nothing and announces nothing: {:?}",
+            rec.msgs()
+        );
+    }
+
+    #[test]
+    fn a_state_glyph_for_every_state() {
+        let all = [
+            (TurnState::Queued, "○"),
+            (TurnState::InProgress, "▸"),
+            (TurnState::Completed, "✓"),
+            (TurnState::Failed, "✗"),
+            (TurnState::Interrupted, "⊘"),
+            (TurnState::Canceled, "◌"),
+        ];
+        for (state, glyph) in all {
+            assert_eq!(state_glyph(state), glyph, "{state:?}");
+        }
+        // one glyph per state: no two states wear the same face
+        let mut seen: Vec<&str> = all.iter().map(|(_, g)| *g).collect();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), before, "the six states wear six glyphs");
     }
 }

@@ -16,8 +16,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// The number underneath is the identity; the [`Display`](std::fmt::Display)
 /// form is only the tag a human reads.
+///
+/// The type is `pub` so the display port — which is public — can name it
+/// in its contract. The constructors stay inside the crate: only this
+/// process mints ids.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub(crate) struct AgentId(u64);
+pub struct AgentId(u64);
 
 impl AgentId {
     /// The main agent — the conversation the human is talking to.

@@ -110,6 +110,10 @@ fn msg(app: &mut App, m: Msg) -> Action {
             app.flush_partial();
             app.fold_thought();
         }
+        // A background agent's event. The frontends' agent rows land in the
+        // next slice; until then a worker's events are dropped rather than mixed
+        // into the main agent's stream.
+        Msg::FromAgent { .. } => {}
     }
     Action::None
 }
@@ -555,7 +559,7 @@ fn history(app: &mut App, d: i32) {
 mod tests {
     use super::*;
     use super::super::model::TICK;
-    use crate::ui::Usage;
+    use crate::ui::{AgentId, AgentMsg, Sev, Usage};
     use crossterm::event::KeyEventKind;
 
     fn key(code: KeyCode, mods: KeyModifiers) -> Ev {
@@ -862,6 +866,37 @@ mod tests {
         drive(&mut a, vec![Ev::Msg(Msg::TaskBegin("next".into()))]);
         drive(&mut a, vec![Ev::Msg(Msg::Done)]);
         assert_eq!(a.status.total, Usage::default(), "the stale reading is not folded");
+    }
+
+    #[test]
+    fn the_tui_drops_a_workers_events_without_touching_the_main_stream() {
+        // a worker's prose, tool call and note reach the TUI wrapped;
+        // until the frontends grow their agent rows, unwrapping them
+        // would mix two speakers into one transcript
+        let mut a = App::new();
+        drive(&mut a, vec![
+            Ev::Msg(Msg::TaskBegin("count files".into())),
+            Ev::Msg(Msg::Usage(Usage { input: 10, output: 5, ..Usage::default() })),
+            Ev::Msg(Msg::Text("the conversation's answer\n".into())),
+        ]);
+        let rows = a.rows.len();
+        let total = a.status.total;
+        let pending = a.status.pending;
+        let working = a.working();
+        let partial = a.partial.clone();
+        let id = AgentId::next();
+        drive(&mut a, vec![
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Text("a worker spoke".into())) }),
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Tool {
+                name: "bash".into(), summary: "$ ls".into(), output: "a\n".into() }) }),
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Note {
+                sev: Sev::Err, text: " it failed ".into() }) }),
+        ]);
+        assert_eq!(a.rows.len(), rows, "the worker's events add no rows: {:?}", a.rows);
+        assert_eq!(a.status.total, total, "the session totals do not move");
+        assert_eq!(a.status.pending, pending, "the pending reading is untouched");
+        assert_eq!(a.working(), working, "no task opened and none closed");
+        assert_eq!(a.partial, partial, "the worker's text never reaches the live row");
     }
 
     #[test]

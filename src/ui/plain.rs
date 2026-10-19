@@ -70,6 +70,10 @@ impl Plain {
             // usage lives in the TUI's status bar; the plain log has none
             Msg::Usage(_) | Msg::OutTokens(_) => {}
             Msg::Done => self.end_of_turn(&mut lines),
+            // A background agent's event. The frontends' agent rows land in the
+            // next slice; until then a worker's events are dropped rather than mixed
+            // into the main agent's stream.
+            Msg::FromAgent { .. } => {}
         }
         lines
     }
@@ -372,6 +376,30 @@ mod tests {
     fn notes_go_to_stderr() {
         let out = run(vec![Msg::Note { sev: Sev::Warn, text: " trimmed history ".into() }]);
         assert_eq!(out, vec![(Stream::Err, " trimmed history ".to_string())]);
+    }
+
+    #[test]
+    fn the_plain_log_drops_a_workers_events_without_touching_the_conversation() {
+        // the worker's prose, tool call and note print nothing at all —
+        // and the conversation's own line is exactly what it was
+        let id = ui::AgentId::next();
+        let out = run(vec![
+            Msg::TaskBegin("count files".into()),
+            Msg::FromAgent { id, event: Box::new(ui::AgentMsg::Text("a worker spoke".into())) },
+            Msg::FromAgent { id, event: Box::new(ui::AgentMsg::Tool {
+                name: "bash".into(), summary: "$ ls".into(), output: "a\n".into() }) },
+            Msg::FromAgent { id, event: Box::new(ui::AgentMsg::Note {
+                sev: Sev::Err, text: " it failed ".into() }) },
+            Msg::Text("the conversation's answer".into()),
+            Msg::Done,
+            Msg::TaskEnd,
+        ]);
+        let texts: Vec<String> = out.iter().map(|(_, l)| l.clone()).collect();
+        assert_eq!(texts, vec![
+            format!("{}{}count files", ui::PROMPT_HEAD, ui::PROMPT_GUTTER),
+            "the conversation's answer".to_string(),
+        ], "the worker's events print nothing, and the conversation's line is unchanged: {texts:?}");
+        assert!(out.iter().all(|(s, _)| *s == Stream::Out), "no stderr line appears: {out:?}");
     }
 
     #[test]
