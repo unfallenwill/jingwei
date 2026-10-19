@@ -19,9 +19,12 @@
 //
 // Rules:
 //   - L0..L5 may not import from any higher-numbered layer (no upward).
-//   - L5 may import anything.
+//   - L5 may import anything — except the test-only helper, below.
 //   - T is test-only: it may import anything (its symbols live behind
-//     `cfg(test)`), and nothing may import it in production.
+//     `cfg(test)`), and no production module may import it — at any
+//     layer, L5 included. `test_util` is declared `#[cfg(test)]`, so a
+//     production import of it compiles under `cargo check --tests` and
+//     `cargo test` — both gates — and breaks `cargo build`.
 //
 // The resolver: every `use` item is expanded (brace groups, nested
 // groups, `self`, renames, globs), every inline `crate::…` path counts
@@ -755,6 +758,15 @@ fn upward_edges(edges: &HashMap<String, Vec<String>>) -> Vec<(String, String, La
         let Some(lf) = layer_of(fr) else { continue };
         for to in deps {
             let Some(lt) = layer_of(to) else { continue };  // outside-project dep — skip
+            // The test-only helper is its own rule, and it has no
+            // exemption: no production module may import `test_util`, at
+            // any layer. `test_util` is declared `#[cfg(test)]`, so a
+            // production import of it compiles under `cargo check --tests`
+            // and `cargo test` — both gates — and breaks `cargo build`.
+            // (The general upward rule already catches L0..L4, because T's
+            // rank is 99; what it missed was L5, which the upward rule
+            // exempts.)
+            let into_test_only = lt == Layer::T && lf != Layer::T;
             // Upward = target strictly higher than source.
             // T → non-T is a different bug (test util leaking into production).
             // T (test_util) is `cfg(test)`-only — it may use any production
@@ -768,10 +780,11 @@ fn upward_edges(edges: &HashMap<String, Vec<String>>) -> Vec<(String, String, La
             // Nothing else in L3 may name anything in L4.
             let lf_n = lf.rank();
             let lt_n = lt.rank();
-            let upward = lt_n > lf_n
-                && lf != Layer::L5
-                && lf != Layer::T
-                && !(lf == Layer::L3 && lt == Layer::L4 && is_config_family(fr));
+            let upward = into_test_only
+                || (lt_n > lf_n
+                    && lf != Layer::L5
+                    && lf != Layer::T
+                    && !(lf == Layer::L3 && lt == Layer::L4 && is_config_family(fr)));
             if upward {
                 violations.push((fr.clone(), to.clone(), lf, lt));
             }
@@ -917,6 +930,50 @@ fn the_l3_to_l4_carve_out_covers_the_config_family_and_nothing_else() {
         violations.iter().any(|(fr, to, _, _)| fr == "tools::runtime" && to == "api"),
         "any other L3 module reaching L4 is a violation: {violations:?}"
     );
+}
+
+#[test]
+fn a_production_module_may_not_import_the_test_helper() {
+    // The rules block says no production module may import `test_util`,
+    // and L5 was exempt from the upward rule — so an L5 production import
+    // was never flagged. It compiles under `cargo check --tests` and
+    // `cargo test` (both gates) and breaks `cargo build`, which no gate
+    // runs. The rule has no exemption now.
+    let mut mods = Modules::new();
+    mods.insert("test_util".to_string(), "pub(crate) fn block_on() {}\n".to_string());
+    mods.insert("ui::plain".to_string(), "use crate::test_util::block_on;\n".to_string());
+    let known = known_modules(&mods);
+    let aliases = build_aliases(&mods, &known);
+    let edges = edges_of(&mods, &known, &aliases);
+    let violations = upward_edges(&edges);
+    assert!(
+        violations.iter().any(|(fr, to, _, _)| fr == "ui::plain" && to == "test_util"),
+        "an L5 module's production import of the test helper is a violation: {violations:?}"
+    );
+}
+
+#[test]
+fn a_test_only_import_of_the_helper_is_not_an_edge() {
+    // The other half of the rule: the check must ignore the *test* uses
+    // of `test_util`. The resolver strips `#[cfg(test)]` items, so an
+    // import inside a test module is not an edge at all — and a rule
+    // that flagged those would fire on every file in the tree.
+    let mut mods = Modules::new();
+    mods.insert("test_util".to_string(), "pub(crate) fn block_on() {}\n".to_string());
+    mods.insert(
+        "ui::plain".to_string(),
+        "#[cfg(test)]\nmod tests {\n    use crate::test_util::block_on;\n}\n".to_string(),
+    );
+    let known = known_modules(&mods);
+    let aliases = build_aliases(&mods, &known);
+    let edges = edges_of(&mods, &known, &aliases);
+    assert_eq!(
+        edges.get("ui::plain"),
+        Some(&vec![]),
+        "a test-only import is not an edge: {edges:?}"
+    );
+    let violations = upward_edges(&edges);
+    assert!(violations.is_empty(), "a test-only import is not a violation: {violations:?}");
 }
 
 #[test]
