@@ -17,6 +17,12 @@ use std::env;
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 131_072;
 pub(crate) const DEFAULT_CONTEXT_SIZE: u64 = 1_000_000;
 pub(crate) const DEFAULT_MAX_TURNS: u32 = 100;
+/// How many background agents may run at once. Zero disables spawning —
+/// the tool schemas stay on the wire, so the cache stays warm.
+pub(crate) const DEFAULT_MAX_AGENTS: u32 = 4;
+/// How long a `wait_agents` call waits before it answers with what it has
+/// and says which workers are still running.
+pub(crate) const DEFAULT_AGENT_WAIT_MS: u64 = 120_000;
 
 /// Version of the internal history payload as it lands in session files —
 /// owned here, beside the shape it versions; session.rs embeds it in the
@@ -37,6 +43,12 @@ pub(crate) struct Config {
     pub(crate) max_tokens: u32,
     pub(crate) context_size: u64,
     pub(crate) max_turns: u32,
+    /// How many background agents may run at once. Zero disables spawning.
+    #[allow(dead_code)] // the fleet slice reads the cap; until then only the tests do
+    pub(crate) max_agents: u32,
+    /// How long `wait_agents` waits before it reports what it has.
+    #[allow(dead_code)] // the fleet slice reads the timeout; until then only the tests do
+    pub(crate) agent_wait_ms: u64,
     pub(crate) streaming: bool,
 }
 
@@ -54,6 +66,8 @@ pub(crate) struct Args {
     pub(crate) max_tokens: Option<u32>,
     pub(crate) context_size: Option<u64>,
     pub(crate) max_turns: Option<u32>,
+    pub(crate) max_agents: Option<u32>,
+    pub(crate) agent_wait_ms: Option<u64>,
     pub(crate) streaming: bool,
     pub(crate) resume: Option<String>,
     pub(crate) cont: bool,
@@ -142,6 +156,8 @@ pub(crate) fn build_config(args: &Args) -> Result<Config> {
         max_tokens: args.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         context_size: args.context_size.unwrap_or(DEFAULT_CONTEXT_SIZE),
         max_turns,
+        max_agents: args.max_agents.unwrap_or(DEFAULT_MAX_AGENTS),
+        agent_wait_ms: args.agent_wait_ms.unwrap_or(DEFAULT_AGENT_WAIT_MS),
         streaming: args.streaming,
     })
 }
@@ -173,6 +189,10 @@ BEHAVIOR:
     --max-tokens <N>    max output tokens per turn (default 131072)
     --max-turns <N>     stop the agent loop after N turns (default 100)
     --context-size <N>  trim history when estimated tokens exceed N (default 1000000)
+    --max-agents <N>    how many background agents may run at once (default 4;
+                        0 disables spawning)
+    --agent-wait-ms <MS> how long wait_agents waits before reporting \"still running\"
+                        (default 120000)
     --cache <MODE>      auto (default, passive server cache) | active (cache_control
                         breakpoints on the Messages wire — minimax's own)
     --thinking <MODE>   preserve (default) | strip reasoning from sent history
@@ -262,6 +282,8 @@ struct Cli {
     #[arg(long)] max_tokens: Option<String>,
     #[arg(long)] context_size: Option<String>,
     #[arg(long)] max_turns: Option<String>,
+    #[arg(long)] max_agents: Option<String>,
+    #[arg(long)] agent_wait_ms: Option<String>,
     #[arg(short = 's', long)] stream: bool,
     #[arg(short = 'S', long)] no_stream: bool,
 
@@ -363,6 +385,8 @@ fn args_from_cli(c: Cli) -> Result<Args> {
             a.max_tokens = parse_num_flag("--max-tokens", c.max_tokens)?;
             a.context_size = parse_num_flag("--context-size", c.context_size)?;
             a.max_turns = parse_num_flag("--max-turns", c.max_turns)?;
+            a.max_agents = parse_num_flag("--max-agents", c.max_agents)?;
+            a.agent_wait_ms = parse_num_flag("--agent-wait-ms", c.agent_wait_ms)?;
             if c.no_stream { a.streaming = false; }
             if let Some(r) = c.resume {
                 resume_into(&mut a, r);
@@ -530,6 +554,7 @@ mod tests {
             api_key: "k".into(), base_url: "https://x".into(), model: "m".into(),
             protocol: Protocol::MINIMAX, cache: CacheMode::Auto, thinking: Thinking::Preserve,
             effort, max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+            max_agents: DEFAULT_MAX_AGENTS, agent_wait_ms: DEFAULT_AGENT_WAIT_MS,
         }
     }
 
@@ -572,7 +597,8 @@ mod tests {
     #[test]
     fn parse_flags_that_take_values_error_when_missing() {
         for flag in ["--api-key", "--base-url", "--model", "--protocol", "--cache",
-                     "--thinking", "--effort", "--max-tokens", "--context-size", "--max-turns"] {
+                     "--thinking", "--effort", "--max-tokens", "--context-size", "--max-turns",
+                     "--max-agents", "--agent-wait-ms"] {
             assert!(parse(&[flag]).is_err(), "{flag} without value should fail");
         }
         // numeric flag rejected for non-numeric input
@@ -580,6 +606,37 @@ mod tests {
         // and the message still names the flag, so the user can find it
         let e = parse(&["--max-tokens", "abc"]).unwrap_err().to_string();
         assert!(e.contains("--max-tokens"), "flag name leaks: {e}");
+    }
+
+    /// The fleet's two flags: they parse, and they default.
+    #[test]
+    fn the_fleet_flags_have_defaults() {
+        let cfg = build_config(&flags(&["--api-key", "k", "--base-url", "https://x", "-m", "m"]).unwrap()).unwrap();
+        assert_eq!(cfg.max_agents, DEFAULT_MAX_AGENTS);
+        assert_eq!(cfg.agent_wait_ms, DEFAULT_AGENT_WAIT_MS);
+    }
+
+    #[test]
+    fn the_fleet_flags_parse() {
+        let a = flags(&["--api-key", "k", "--base-url", "https://x", "-m", "m",
+            "--max-agents", "2", "--agent-wait-ms", "5000"]).unwrap();
+        assert_eq!(a.max_agents, Some(2));
+        assert_eq!(a.agent_wait_ms, Some(5000));
+        let cfg = build_config(&a).unwrap();
+        assert_eq!(cfg.max_agents, 2);
+        assert_eq!(cfg.agent_wait_ms, 5000);
+        // zero is a value, not a mistake: it disables spawning
+        let cfg = build_config(&flags(&["--api-key", "k", "--base-url", "https://x", "-m", "m",
+            "--max-agents", "0"]).unwrap()).unwrap();
+        assert_eq!(cfg.max_agents, 0);
+    }
+
+    #[test]
+    fn a_bad_fleet_flag_is_a_clear_error() {
+        let e = parse(&["--max-agents", "abc"]).unwrap_err().to_string();
+        assert!(e.contains("--max-agents"), "the message names the flag: {e}");
+        let e = parse(&["--agent-wait-ms", "soon"]).unwrap_err().to_string();
+        assert!(e.contains("--agent-wait-ms"), "the message names the flag: {e}");
     }
 
     /// An unknown flag spells what it did not recognize. clap's error

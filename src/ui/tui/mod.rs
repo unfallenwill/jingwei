@@ -1715,6 +1715,8 @@ mod tests {
             protocol: crate::api::Protocol::MINIMAX, cache: crate::api::CacheMode::Auto,
             thinking: crate::api::Thinking::Preserve, effort: None,
             max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+            max_agents: crate::config::DEFAULT_MAX_AGENTS,
+            agent_wait_ms: crate::config::DEFAULT_AGENT_WAIT_MS,
         }
     }
 

@@ -544,6 +544,8 @@ mod tests {
             protocol: Protocol::ZAI,
             cache: CacheMode::Auto, thinking: Thinking::Preserve, effort: None,
             max_tokens: 1024, context_size: 1_000_000, max_turns: 60, streaming: true,
+            max_agents: crate::config::DEFAULT_MAX_AGENTS,
+            agent_wait_ms: crate::config::DEFAULT_AGENT_WAIT_MS,
         };
         assert_eq!(chat_url(&cfg), "https://api.example.com/chat/completions");
         // no trailing slash
