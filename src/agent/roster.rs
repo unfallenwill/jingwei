@@ -1,10 +1,5 @@
 //! The registry of live agents.
 //!
-//! It holds state and it does not act: registering an agent is not
-//! starting it, and removing one is not stopping it. The executor
-//! (`workflow::exec`) does the acting; the roster is what it registers
-//! with, and what a stop request reaches through.
-//!
 //! The roster sits at L5 because it holds an agent's cancel scope and
 //! names it by its id, and because it sits beside the `Agent` value it
 //! registers: a roster that held `Agent` values would reach upward into
@@ -18,6 +13,11 @@ use crate::cancel::CancelScope;
 use crate::core::ids::AgentId;
 
 /// The registry of live agents.
+///
+/// It holds state and it does not act: registering an agent is not
+/// starting it, and removing one is not stopping it. The executor
+/// (`workflow::run_task`) does the acting; the roster is what it registers
+/// with, and what a stop request reaches through.
 ///
 /// Keyed by id in a `BTreeMap`, so the listing is in the order the ids
 /// were minted — the order the agents started.
