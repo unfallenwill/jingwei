@@ -142,9 +142,10 @@ async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agent
     }
     // The run boundary: the one-shot does not spell the sequence out —
     // it hands the task to the run and hands the result back, so the
-    // exit code stays the run's own.
+    // exit code stays the run's own. It says nothing about a failure
+    // itself: the error is the process's, and the binary paints it.
     let token = CancelToken::new();
-    let res = run_task(&prompt, &cfg, &mut ctx, &mut convo, &router, &token, &sink).await;
+    let res = run_task(&prompt, &cfg, &mut ctx, &mut convo, &router, &token, &sink, &|_| None).await;
     hub.shutdown().await;
     res
 }

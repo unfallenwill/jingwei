@@ -210,15 +210,12 @@ pub async fn plain_repl(
             handle_mcp_command(rest, &hub, &sink).await;
             continue;
         }
-        // The run boundary: the REPL hands the line to the run and maps
-        // the outcome — an interrupted run is silent, any other failure
-        // is a note, and the run itself ended the turn.
+        // The run boundary: the REPL hands the line to the run, which
+        // owns the begin, the saves, the end — and the note a failure
+        // earns, said inside the run's bracket so it belongs to the
+        // task it is about.
         let token = crate::cancel::CancelToken::new();
-        match crate::workflow::run_task(&line, cfg, &mut ctx, &mut convo, &router, &token, &sink).await {
-            Err(crate::Error::Interrupted) => {}
-            Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
-            Ok(()) => {}
-        }
+        let _ = crate::workflow::run_task(&line, cfg, &mut ctx, &mut convo, &router, &token, &sink, &ui::error_note).await;
     }
     Ok(())
 }

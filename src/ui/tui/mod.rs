@@ -40,7 +40,7 @@ pub mod view;
 
 use crate::api::VENDORS;
 use crate::config::Config;
-use crate::ui::{ChannelSink, Msg, Sev, Show as DisplayShow};
+use crate::ui::{error_note, ChannelSink, Msg, Sev, Show as DisplayShow};
 use crate::mcp::Hub;
 use crate::core::ports::ToolRouter;
 use crate::core::session::Convo;
@@ -975,12 +975,9 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
                 let SessionState { ctx, convo } = &mut *st;
                 // The run boundary: the job does not spell the sequence
                 // out — it hands the task to the run, which owns the
-                // begin, the saves, and the end.
-                match run_task(&line, &cfg, ctx, convo, &router, &tok, &sink).await {
-                    Err(Error::Interrupted) => {}
-                    Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
-                    Ok(()) => {}
-                }
+                // begin, the saves, the end, and the note a failure
+                // earns (inside the run's bracket, where it belongs).
+                let _ = run_task(&line, &cfg, ctx, convo, &router, &tok, &sink, &error_note).await;
             });
             *run = Some(RunHandle { token, job });
             HandleOutcome::None

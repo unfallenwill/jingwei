@@ -17,11 +17,15 @@
 //!   in memory either way, and the agent must not die because the disk
 //!   did.
 //!
-//! What it does *not* do is decide what an error looks like. `run_task`
-//! hands the run's `Result` back unchanged; the frontends map it (the
-//! plain log and the TUI show a note, the one-shot propagates it so the
-//! process exit code stays right). Presentation belongs to the
-//! frontend, and the boundary does not own it.
+//! What it does *not* do is decide what an error looks like. The
+//! frontend owns that: it hands the boundary a mapper — an error in,
+//! the message to say about it (or nothing at all) out — and the
+//! boundary calls it **inside** the run's bracket, so the note about a
+//! failed run belongs to the run it is about. The mapper's result is
+//! still the caller's to interpret: the plain log and the TUI show a
+//! note, the one-shot propagates the error so the process exit code
+//! stays right. Presentation belongs to the frontend, and the boundary
+//! only decides *when* it is said.
 
 use crate::agent::runner::run_agent;
 use crate::agent::Agent;
@@ -36,13 +40,17 @@ use crate::ui::{Msg, Sev, Show};
 /// Run one task, from the user's words to the end of the run.
 ///
 /// The order is the contract: show the task, put it in the transcript,
-/// put the transcript on disk, run the agent, put the transcript on disk
-/// again, end the run. The saves are best-effort — a failure warns and
-/// the run continues — and the run is bracketed by exactly one
-/// `TaskBegin` and one `TaskEnd` whatever happens in between.
+/// put the transcript on disk, run the agent, say what went wrong (if
+/// anything), put the transcript on disk again, end the run. The saves
+/// are best-effort — a failure warns and the run continues — and the
+/// run is bracketed by exactly one `TaskBegin` and one `TaskEnd`
+/// whatever happens in between.
 ///
-/// The `Result` is the run's own, unchanged: the caller decides what an
-/// error means.
+/// `on_error` is the frontend's own answer to "what does a failure
+/// look like": it takes the run's error and returns the message to say
+/// about it, or nothing to say. The boundary calls it before it closes
+/// the run, so the note lands inside the bracket. The `Result` is the
+/// run's own, unchanged: the caller still decides what an error means.
 pub(crate) async fn run_task(
     task: &str,
     cfg: &Config,
@@ -51,6 +59,7 @@ pub(crate) async fn run_task(
     router: &ToolRouter,
     token: &CancelToken,
     sink: &dyn Show,
+    on_error: &(dyn Fn(&crate::Error) -> Option<Msg> + Sync),
 ) -> crate::Result<()> {
     sink.show(Msg::TaskBegin(task.to_string()));
     ctx.push(user_message(task));
@@ -60,6 +69,13 @@ pub(crate) async fn run_task(
     }
     let mut agent = Agent::main(task);
     let res = run_agent(&mut agent, cfg, ctx, router, token, sink).await;
+    // the failure is said inside the run: a note after the run's end
+    // would belong to nothing
+    if let Err(e) = &res {
+        if let Some(m) = on_error(e) {
+            sink.show(m);
+        }
+    }
     if let Err(e) = convo.persist(ctx.history()) {
         sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
     }
@@ -99,6 +115,10 @@ mod tests {
     impl Show for Recorder {
         fn show(&self, m: Msg) { self.0.lock().unwrap().push(m); }
     }
+
+    /// A mapper that says nothing: how a failure looks is the frontend's
+    /// business, and these tests are about the run, not its face.
+    fn silent(_e: &crate::Error) -> Option<Msg> { None }
 
     /// The tool router a run uses: the four built-ins and an empty hub.
     /// The hub handle comes back so the test can shut its actor task down.
@@ -189,11 +209,12 @@ mod tests {
         ctx: &mut Context,
         convo: &mut Convo,
         sink: &dyn Show,
+        on_error: &(dyn Fn(&crate::Error) -> Option<Msg> + Sync),
     ) -> crate::Result<()> {
         block_on(async {
             let (router, hub) = router();
             let res = run_task(task, &cfg(format!("http://127.0.0.1:{port}"), false),
-                               ctx, convo, &router, &CancelToken::new(), sink).await;
+                               ctx, convo, &router, &CancelToken::new(), sink, on_error).await;
             hub.shutdown().await;
             res
         })
@@ -216,7 +237,7 @@ mod tests {
         );
         let sink = Recorder::default();
         let mut ctx = crate::test_util::ctx();
-        run(port, "count the files", &mut ctx, &mut convo, &sink).unwrap();
+        run(port, "count the files", &mut ctx, &mut convo, &sink, &silent).unwrap();
         let body = on_disk.lock().unwrap().clone();
         assert!(
             body.contains("count the files"),
@@ -237,7 +258,7 @@ mod tests {
         let (port, _reqs) = mock_seq(vec![(200, ANSWER.into())]);
         let sink = Recorder::default();
         let mut ctx = crate::test_util::ctx();
-        let res = run(port, "count the files", &mut ctx, &mut convo, &sink);
+        let res = run(port, "count the files", &mut ctx, &mut convo, &sink, &silent);
         assert!(res.is_ok(), "a failed save does not abort the run: {res:?}");
         let msgs = sink.msgs();
         assert!(
@@ -256,7 +277,7 @@ mod tests {
         let sink = Recorder::default();
         let mut ctx = crate::test_util::ctx();
         let mut convo = Convo::ephemeral();
-        run(port, "count the files", &mut ctx, &mut convo, &sink).unwrap();
+        run(port, "count the files", &mut ctx, &mut convo, &sink, &silent).unwrap();
         let msgs = sink.msgs();
         assert!(matches!(msgs.first(), Some(Msg::TaskBegin(t)) if t == "count the files"), "got: {msgs:?}");
         assert!(matches!(msgs.last(), Some(Msg::TaskEnd)), "got: {msgs:?}");
@@ -273,12 +294,35 @@ mod tests {
         let sink = Recorder::default();
         let mut ctx = crate::test_util::ctx();
         let mut convo = Convo::ephemeral();
-        let res = run(port, "count the files", &mut ctx, &mut convo, &sink);
+        let res = run(port, "count the files", &mut ctx, &mut convo, &sink, &silent);
         // the error is handed back, not swallowed
         assert!(matches!(res, Err(crate::Error::Api(400, _))), "got: {res:?}");
         let msgs = sink.msgs();
         assert!(matches!(msgs.first(), Some(Msg::TaskBegin(_))), "got: {msgs:?}");
         assert!(matches!(msgs.last(), Some(Msg::TaskEnd)), "the run ends even when it fails — got: {msgs:?}");
+    }
+
+    #[test]
+    fn a_failed_run_says_so_inside_the_bracket() {
+        // The note about a failed run belongs to the run it is about: it
+        // has to land between the begin and the end, not after them.
+        // Before the boundary owned the note, the frontend showed it
+        // *after* the run had ended, and the error read as a footnote
+        // to nothing.
+        let (port, _reqs) = mock_seq(vec![(400, REFUSED.into())]);
+        let sink = Recorder::default();
+        let mut ctx = crate::test_util::ctx();
+        let mut convo = Convo::ephemeral();
+        // the frontend's own mapper: the two interactive frontends say a
+        // failed run this way
+        let res = run(port, "count the files", &mut ctx, &mut convo, &sink, &crate::ui::error_note);
+        assert!(res.is_err(), "the run failed: {res:?}");
+        let msgs = sink.msgs();
+        let note = msgs.iter().position(|m| matches!(m, Msg::Note { sev: Sev::Err, .. }));
+        let end = msgs.iter().position(|m| matches!(m, Msg::TaskEnd));
+        assert!(note.is_some(), "the failure was said — got: {msgs:?}");
+        assert!(end.is_some(), "the run ended — got: {msgs:?}");
+        assert!(note < end, "the note lands inside the run's bracket — got: {msgs:?}");
     }
 
     // ---- the transcript --------------------------------------------------
@@ -289,7 +333,7 @@ mod tests {
         let sink = Recorder::default();
         let mut ctx = crate::test_util::ctx();
         let mut convo = Convo::ephemeral();
-        run(port, "count the files", &mut ctx, &mut convo, &sink).unwrap();
+        run(port, "count the files", &mut ctx, &mut convo, &sink, &silent).unwrap();
         let history = ctx.history();
         assert_eq!(history.len(), 2, "the task and the answer — got: {history:?}");
         assert!(matches!(&history[0], Message::User(t) if t == "count the files"), "got: {history:?}");

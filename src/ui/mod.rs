@@ -108,6 +108,22 @@ impl Usage {
 // same severity colors. The strings live here, once, so the log and the TUI
 // cannot drift apart.
 
+/// What a failed run looks like, in the two interactive frontends.
+///
+/// One error line — and silence for an interrupted run: the user asked
+/// for that one, so it is not a failure to report. The one-shot does
+/// not use this; it propagates the error instead, so the process exit
+/// code stays right and the binary paints the banner.
+///
+/// The run boundary calls this *inside* the run's bracket. A note that
+/// lands after the run has ended reads as a footnote to nothing.
+pub fn error_note(e: &crate::core::error::Error) -> Option<Msg> {
+    match e {
+        crate::core::error::Error::Interrupted => None,
+        e => Some(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
+    }
+}
+
 /// The prompt's gutter; [`prompt_w`] is derived, never restated.
 /// Just `❯` — no name prefix, the editor pane says where it is by where it sits.
 pub const PROMPT_HEAD: &str = "";
@@ -346,6 +362,22 @@ mod tests {
         });
         assert!(matches!(got[0], Msg::Text(ref t) if t == "hi"));
         assert!(matches!(got.last(), Some(Msg::Done)));
+    }
+
+    #[test]
+    fn error_note_says_nothing_about_an_interrupted_run() {
+        // the user asked for it: it is a stop, not a failure to report
+        assert!(error_note(&crate::core::error::Error::Interrupted).is_none());
+        // anything else is one error line
+        let note = error_note(&crate::core::error::Error::Api(429, "limited".into()))
+            .expect("a failed run says something");
+        match note {
+            Msg::Note { sev, text } => {
+                assert_eq!(sev, Sev::Err);
+                assert!(text.contains("api 429"), "{text}");
+            }
+            other => panic!("expected a note, got {other:?}"),
+        }
     }
 
     #[test]
