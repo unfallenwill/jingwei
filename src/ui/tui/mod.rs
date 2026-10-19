@@ -42,6 +42,7 @@ use crate::api::VENDORS;
 use crate::config::Config;
 use crate::ui::{ChannelSink, Msg, Sev, Show as DisplayShow};
 use crate::mcp::Hub;
+use crate::core::ports::ToolRouter;
 use crate::core::session::Convo;
 use crate::config::settings::Settings;
 use crate::{agent_turn, user_message, Error};
@@ -399,8 +400,9 @@ fn needs_paint(
 /// Open the TUI: terminal setup, the event loop, guaranteed restore.
 /// `convo` is the conversation to run on; `hub` is the MCP hub: a clone
 /// the TUI shares with the agent loop, and uses itself for `/mcp`
-/// slash commands while idle.
-pub async fn run(cfg: Config, mut ctx: crate::core::context::Context, convo: Convo, banners: Vec<String>, hub: Hub) -> crate::Result<()> {
+/// slash commands while idle. `router` is the tool router every tool
+/// call goes through.
+pub async fn run(cfg: Config, mut ctx: crate::core::context::Context, convo: Convo, banners: Vec<String>, hub: Hub, router: std::sync::Arc<ToolRouter>) -> crate::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sink = ChannelSink::new(tx);
     sink.show(Msg::Banner(format!(
@@ -581,12 +583,12 @@ pub async fn run(cfg: Config, mut ctx: crate::core::context::Context, convo: Con
                             // crossed a slash-command boundary — sync the
                             // menu from scratch (cheap when nothing changes).
                             refresh_completion(&mut app, &hub).await;
-                            apply_outcome(handle(action, &cfg, &mut ctx, &convo, &mut agent, &sink, &hub), &mut cfg, &mut convo, &mut app, &sink);
+                            apply_outcome(handle(action, &cfg, &mut ctx, &convo, &mut agent, &sink, &hub, &router), &mut cfg, &mut convo, &mut app, &sink);
                         }
                         crossterm::event::Event::Paste(p) => {
                             let action = step(&mut app, Ev::Paste(p));
                             refresh_completion(&mut app, &hub).await;
-                            apply_outcome(handle(action, &cfg, &mut ctx, &convo, &mut agent, &sink, &hub), &mut cfg, &mut convo, &mut app, &sink);
+                            apply_outcome(handle(action, &cfg, &mut ctx, &convo, &mut agent, &sink, &hub, &router), &mut cfg, &mut convo, &mut app, &sink);
                         }
                         // a resize needs no arm of its own: the Input arm
                         // polls the size every frame and redraws the viewport
@@ -897,7 +899,7 @@ fn protocol_of(name: &str) -> Option<crate::api::Protocol> {
 /// resolve here too: dispatching `/model` returns `Switch` with the
 /// newly-built Config and Convo.
 fn handle(action: Action, cfg: &Config, ctx: &mut crate::core::context::Context, convo: &Arc<AsyncMutex<Convo>>,
-          agent: &mut Option<Agent>, sink: &ChannelSink, hub: &Hub) -> HandleOutcome {
+          agent: &mut Option<Agent>, sink: &ChannelSink, hub: &Hub, router: &Arc<ToolRouter>) -> HandleOutcome {
     match action {
         Action::None => HandleOutcome::None,
         Action::Cancel => {
@@ -930,7 +932,7 @@ fn handle(action: Action, cfg: &Config, ctx: &mut crate::core::context::Context,
             let cfg = cfg.clone();
             let mut ctx = ctx.clone();
             let convo = convo.clone();
-            let hub = hub.clone();
+            let router = router.clone();
             let token = Arc::new(crate::cancel::CancelToken::new());
             let tok = token.clone();
             sink.show(Msg::TaskBegin(line.clone()));
@@ -943,7 +945,7 @@ fn handle(action: Action, cfg: &Config, ctx: &mut crate::core::context::Context,
                 }
                 // the task is on disk before the first stone moves
                 let mut turn = crate::core::turn::Turn::new(0);
-                match agent_turn(&cfg, &mut ctx, &mut c.history, &mut turn, &tok, &hub, &sink).await {
+                match agent_turn(&cfg, &mut ctx, &mut c.history, &mut turn, &tok, &router, &sink).await {
                     Err(Error::Interrupted) => {}
                     Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
                     Ok(()) => {}
@@ -1685,6 +1687,15 @@ mod tests {
         }
     }
 
+    /// The tool router the TUI hands to the agent: the four built-ins and
+    /// the hub's servers, in that order.
+    fn router(hub: &crate::mcp::Hub) -> Arc<ToolRouter> {
+        Arc::new(ToolRouter::new(vec![
+            Box::new(crate::tools::Builtins),
+            Box::new(hub.clone()),
+        ]))
+    }
+
     /// A handle that lets a test inspect the agent that was spawned.
     fn run_handle(action: Action) -> (ChannelSink, Option<Agent>) {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1695,8 +1706,9 @@ mod tests {
         let convo = Arc::new(AsyncMutex::new(convo));
         let mut agent: Option<Agent> = None;
         let hub = crate::mcp::Hub::empty();
+        let router = router(&hub);
         let mut ctx = crate::test_util::ctx();
-        handle(action, &cfg, &mut ctx, &convo, &mut agent, &sink, &hub);
+        handle(action, &cfg, &mut ctx, &convo, &mut agent, &sink, &hub, &router);
         (sink, agent)
     }
 
@@ -1728,9 +1740,10 @@ mod tests {
         let convo = Arc::new(AsyncMutex::new(convo));
         let mut agent: Option<Agent> = None;
         let hub = crate::mcp::Hub::empty();
+        let router = router(&hub);
         let mut cx = crate::core::context::Context::new(&crate::core::agents_md::AgentsMdContext::empty(&std::path::PathBuf::from(".")));
         // tokio::test gives us the runtime; handle does its own tokio::spawn.
-        handle(Action::Submit("hello world".into()), &cfg, &mut cx, &convo, &mut agent, &sink, &hub);
+        handle(Action::Submit("hello world".into()), &cfg, &mut cx, &convo, &mut agent, &sink, &hub, &router);
         assert!(agent.is_some(), "submit sets the agent slot");
         // a task begin landed in the sink
         let got = rx.try_recv().expect("TaskBegin emitted by submit");
@@ -1760,12 +1773,13 @@ mod tests {
         let mut agent: Option<Agent>;
         let first_token = Arc::new(crate::cancel::CancelToken::new());
         let hub = crate::mcp::Hub::empty();
+        let router = router(&hub);
         let mut cx = crate::core::context::Context::new(&crate::core::agents_md::AgentsMdContext::empty(&std::path::PathBuf::from(".")));
         // tokio::test wraps us in a runtime; spawn the pre-existing agent
         // slot inside this scope so its JoinHandle has a home.
         let first_job = tokio::spawn(async {});
         agent = Some(Agent { token: first_token.clone(), job: first_job });
-        handle(Action::Submit("second task".into()), &cfg, &mut cx, &convo, &mut agent, &sink, &hub);
+        handle(Action::Submit("second task".into()), &cfg, &mut cx, &convo, &mut agent, &sink, &hub, &router);
         // the original agent is still there — same token, not replaced
         assert!(agent.is_some());
         assert_eq!(Arc::as_ptr(&agent.as_ref().unwrap().token), Arc::as_ptr(&first_token));

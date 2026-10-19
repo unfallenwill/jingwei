@@ -31,14 +31,17 @@ use crate::core::agent::agent_turn;
 use crate::core::agents_md::AgentsMdContext;
 use crate::core::context::Context;
 use crate::core::ir::user_message;
+use crate::core::ports::ToolRouter;
 use crate::core::session;
 use crate::core::turn::Turn;
 use crate::ui::{Msg, Sev, Show};
 use crate::mcp::Hub;
+use crate::tools::Builtins;
 use crate::config::settings::Settings;
 use serde_json::Value;
 use std::env;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// The crate's one error type, and the `Result` that rides with it. They
 /// live in `core::error` (L0) — the root is the composition root, and a
@@ -93,7 +96,14 @@ pub async fn run() -> Result<()> {
     // hub starts empty and the session runs as it always did.
     let user_mcp = read_user_mcp();
     let hub = Hub::spawn(&workspace, user_mcp.as_ref());
-    run_with_hub(args, cfg, ctx, hub, agents_ctx).await
+    // The tool router: the built-ins first, the servers' tools after
+    // them. The order is a cache contract — the combined schema list is
+    // part of the cached prefix — and the router is where it is fixed.
+    let router = Arc::new(ToolRouter::new(vec![
+        Box::new(Builtins),
+        Box::new(hub.clone()),
+    ]));
+    run_with_hub(args, cfg, ctx, hub, agents_ctx, router).await
 }
 
 /// The rest of `run` after the hub is spawned. The TUI and plain REPL take
@@ -101,7 +111,7 @@ pub async fn run() -> Result<()> {
 /// `mpsc::Sender`); the one-shot path also takes a clone, then calls
 /// `shutdown` on its own copy at the end so the connections close in
 /// every exit path.
-async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agents_ctx: AgentsMdContext) -> Result<()> {
+async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agents_ctx: AgentsMdContext, router: Arc<ToolRouter>) -> Result<()> {
     let interactive = args.prompt.is_empty();
     let (mut convo, banners) = begin_session(&args, &cfg, interactive)?;
     // AGENTS.md gets a banner slot too, when one was loaded. Prepended
@@ -114,9 +124,9 @@ async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agent
     if interactive {
         // A terminal gets the TUI; pipes, tests, and one-shots get the log.
         return if ui::tui::wanted() {
-            ui::tui::run(cfg, ctx, convo, banners, hub).await
+            ui::tui::run(cfg, ctx, convo, banners, hub, router).await
         } else {
-            ui::plain::plain_repl(&cfg, ctx, convo, banners, hub).await
+            ui::plain::plain_repl(&cfg, ctx, convo, banners, hub, router).await
         };
     }
     // One-shot: always the plain frontend — its output must stay in the
@@ -133,7 +143,7 @@ async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agent
     }
     let token = CancelToken::new();
     let mut turn = Turn::new(0);
-    let res = agent_turn(&cfg, &mut ctx, &mut convo.history, &mut turn, &token, &hub, &sink).await;
+    let res = agent_turn(&cfg, &mut ctx, &mut convo.history, &mut turn, &token, &router, &sink).await;
     if let Err(e) = convo.persist() {
         sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
     }

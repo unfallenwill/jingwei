@@ -154,6 +154,7 @@ pub async fn plain_repl(
     mut convo: crate::core::session::Convo,
     banners: Vec<String>,
     hub: Hub,
+    router: std::sync::Arc<crate::core::ports::ToolRouter>,
 ) -> crate::Result<()> {
     use crate::{agent_turn};
     let sink = PlainSink::new();
@@ -218,7 +219,7 @@ pub async fn plain_repl(
         sink.show(Msg::TaskBegin(line));
         let token = crate::cancel::CancelToken::new();
         let mut turn = crate::core::turn::Turn::new(0);
-        match agent_turn(cfg, &mut ctx, &mut convo.history, &mut turn, &token, &hub, &sink).await {
+        match agent_turn(cfg, &mut ctx, &mut convo.history, &mut turn, &token, &router, &sink).await {
             Err(crate::Error::Interrupted) => {}
             Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
             Ok(()) => {}

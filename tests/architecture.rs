@@ -8,9 +8,9 @@
 //                                                  — pure data + state machines + the display port
 //   L1  cancel, file_io, core::agents_md, core::reminder
 //                                                  — infra primitives
-//   L2  core::ports, core::prompt
+//   L2  core::context, core::ports, core::prompt
 //                                                  — per-agent state + the ports
-//   L3  config (+ settings/login), core::context, tools (+ edit/ledger/runtime), mcp + submodules
+//   L3  config (+ settings/login), tools (+ edit/ledger/runtime), mcp + submodules
 //                                                  — the user's wishes and the tool tier
 //   L4  api (+ api::minimax/zai/deepseek)          — vendor + transport
 //   L5  lib, main, core::agent, ui::plain, ui::tui (+ model/update/view)
@@ -79,6 +79,10 @@ const LAYERS: &[(&str, Layer)] = &[
     ("core::agents_md", Layer::L1),    // walks the FS
     ("core::reminder", Layer::L1),
     // L2 — per-agent state and the ports.
+    ("core::context", Layer::L2),      // the per-turn model state. It takes
+                                        // the tool list from the router, so
+                                        // it no longer reaches into the
+                                        // tool tier
     ("core::ports", Layer::L2),        // the tool boundary
     ("core::prompt", Layer::L2),       // the prompt's own module
     // L3 — the tool/config tier. May reach into api (L4); see the
@@ -86,11 +90,6 @@ const LAYERS: &[(&str, Layer)] = &[
     ("config", Layer::L3),
     ("config::settings", Layer::L3),
     ("config::login", Layer::L3),
-    ("core::context", Layer::L3),      // the per-turn model state. It reaches
-                                        // into mcp and tools today, so it
-                                        // stays L3 until the ports slice
-                                        // gives it `core::ports` to talk to
-                                        // instead of the tool tier
     ("tools", Layer::L3),
     ("tools::edit", Layer::L3),
     ("tools::ledger", Layer::L3),

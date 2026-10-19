@@ -49,6 +49,8 @@ mod wire;
 
 use std::path::Path;
 
+use crate::cancel::CancelToken;
+use crate::core::ports::{BoxFuture, ToolProvider};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
@@ -265,6 +267,45 @@ impl Hub {
         if self.tx.send(Command::Shutdown { reply }).await.is_ok() {
             let _ = rx.await;
         }
+    }
+}
+
+/// The hub, as a tool provider.
+///
+/// The hub owns every `mcp__` name — the prefix is what keeps the
+/// servers' tools apart from the built-ins — offers the schemas the
+/// connected servers report, and runs a call through the actor task.
+/// The router asks it for both, and never learns what is behind them.
+impl ToolProvider for Hub {
+    fn owns(&self, name: &str) -> bool {
+        is_tool(name)
+    }
+
+    fn definitions<'a>(&'a self) -> BoxFuture<'a, Vec<Value>> {
+        // `Hub::definitions` is the inherent method; the trait method of
+        // the same name shadows it inside this impl, so the call is
+        // spelled out — `self.definitions()` would be this very
+        // function, forever.
+        Box::pin(async move { Hub::definitions(self).await })
+    }
+
+    fn call<'a>(
+        &'a self,
+        name: &'a str,
+        input: &'a Value,
+        token: &'a CancelToken,
+    ) -> BoxFuture<'a, String> {
+        Box::pin(async move {
+            // An MCP call is not cancellable mid-flight: the actor task
+            // owns the connection, and the call's own timeout is what
+            // bounds it. What a fired token cancels is the *wait* for
+            // the reply — the turn is over and the answer is no longer
+            // wanted.
+            if token.is_cancelled() {
+                return "[interrupted by user]".into();
+            }
+            Hub::call(self, name, &input.to_string()).await
+        })
     }
 }
 
@@ -619,4 +660,88 @@ mod tests {
         hub.shutdown().await;
     }
 
+    // ---- the hub as a tool provider ---------------------------------------
+
+    /// The provider owns exactly the names the `mcp__` prefix marks. The
+    /// built-ins are dispatched by name too, and the prefix is what keeps
+    /// the two sets apart.
+    #[tokio::test]
+    async fn the_hub_provider_owns_only_mcp_names() {
+        let hub = Hub::empty();
+        assert!(hub.owns("mcp__stub__echo"));
+        assert!(hub.owns("mcp__"));
+        assert!(!hub.owns("bash"));
+        assert!(!hub.owns("read_file"));
+        assert!(!hub.owns(""));
+        hub.shutdown().await;
+    }
+
+    /// The provider's schemas are the hub's own — the same list the
+    /// context used to compose for itself. (The trait method shares a
+    /// name with the inherent one, so the call is qualified: that also
+    /// pins that the shadowing inside the impl is spelled out rather
+    /// than recursing.)
+    #[tokio::test]
+    async fn the_hub_provider_offers_the_schemas_the_servers_report() {
+        let stub = Stub::new();
+        let hub = Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
+        let defs = ToolProvider::definitions(&hub).await;
+        let names: Vec<&str> = defs.iter().filter_map(|v| v["name"].as_str()).collect();
+        assert_eq!(names, vec!["mcp__stub__echo"], "got: {defs:?}");
+        hub.shutdown().await;
+    }
+
+    /// An empty hub offers nothing: the provider's schema list is empty
+    /// rather than an error.
+    #[tokio::test]
+    async fn the_hub_provider_offers_no_schemas_for_an_empty_hub() {
+        let hub = Hub::empty();
+        assert!(ToolProvider::definitions(&hub).await.is_empty());
+        hub.shutdown().await;
+    }
+
+    /// A call through the provider reaches the server and comes back with
+    /// the server's answer.
+    #[tokio::test]
+    async fn the_hub_provider_runs_a_call_through_the_actor() {
+        let stub = Stub::new();
+        let hub = Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
+        let out = ToolProvider::call(
+            &hub,
+            "mcp__stub__echo",
+            &serde_json::json!({"text": "hello"}),
+            &CancelToken::new(),
+        ).await;
+        assert_eq!(out, "called with {text:hello}", "got: {out}");
+        hub.shutdown().await;
+    }
+
+    /// A pre-cancelled token never reaches the hub — the run is over
+    /// before any of this matters. Same cancellation marker every other
+    /// tool uses.
+    #[tokio::test]
+    async fn the_hub_provider_short_circuits_a_pre_cancelled_call() {
+        let hub = Hub::empty();
+        let token = CancelToken::new();
+        token.cancel();
+        let out = ToolProvider::call(&hub, "mcp__anyone__anything", &serde_json::json!({}), &token).await;
+        assert_eq!(out, "[interrupted by user]");
+        hub.shutdown().await;
+    }
+
+    /// A name no server offers is answered with the hub's own message:
+    /// `error: no MCP tool named ...`. The model sees the same shape it
+    /// would see for any unknown tool.
+    #[tokio::test]
+    async fn the_hub_provider_answers_a_name_no_server_offers() {
+        let hub = Hub::empty();
+        let out = ToolProvider::call(
+            &hub,
+            "mcp__nobody__nothing",
+            &serde_json::json!({}),
+            &CancelToken::new(),
+        ).await;
+        assert!(out.starts_with("error: no MCP tool named"), "got: {out}");
+        hub.shutdown().await;
+    }
 }

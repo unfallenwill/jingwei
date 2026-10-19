@@ -11,15 +11,16 @@
 //! a clump of trim helpers in `main::run_turn` that read tool schemas and
 //! called `fit_context` inline. Three call sites, three implicit
 //! contracts, no name. Here the work has one home and one name
-//! (`Context`); vendors consume what `refresh` has already assembled
+//! (`Context`); vendors consume what the agent loop has already assembled
 //! and never reach into AGENTS.md or the tool registry themselves.
 //!
 //! ## Architectural room for v2
 //!
-//! - `refresh()` already accepts a `&Hub`; the next obvious additions are
-//!   an AGENTS.md reload (when a session detects a write to the loaded
-//!   file) and a history-summarization pass that hands context to an LLM
-//!   and rebuilds history in place. Both have an obvious home here.
+//! - The tool list arrives from the router (`core::ports`) and is set on
+//!   the context per turn; the next obvious additions are an AGENTS.md
+//!   reload (when a session detects a write to the loaded file) and a
+//!   history-summarization pass that hands context to an LLM and rebuilds
+//!   history in place. Both have an obvious home here.
 //! - `reminders` is currently `Vec<SystemReminder>` and adds to the wire
 //!   via the vendor render loop; a future multi-message form (nested
 //!   AGENTS.md index, runtime context) is just more `SystemReminder`s
@@ -30,10 +31,8 @@
 
 use crate::core::agents_md::AgentsMdContext;
 use crate::core::ir::{history_value, Block, Message};
-use crate::mcp::Hub;
 use crate::core::reminder::{ReminderId, SystemReminder};
-use crate::tools::tools;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// The static system prompt — the runtime contract with the model, shipped
 /// on every request. It lives here (not at the crate root) because context
@@ -71,18 +70,21 @@ pub(crate) struct Context {
     /// `is_session_stable()` predicate the vendor uses to decide whether
     /// to attach a cache marker.
     pub(crate) reminders: Vec<SystemReminder>,
-    /// Built-in tool schemas joined with whatever MCP servers reported at
-    /// the last `refresh()`. Vendors consume this list verbatim.
+    /// The tool schemas the model is shown: the built-in registry joined
+    /// with whatever the MCP servers reported, in that order. The list is
+    /// set by the agent loop from the router, one turn at a time — the
+    /// providers own it, and the context only carries it.
     pub(crate) tools: Vec<Value>,
 }
 
 impl Context {
     /// Build the per-session context. Compose the static system text
     /// from `SYSTEM` alone (AGENTS.md content rides in a
-    /// reminder, not in this string), enqueue AGENTS.md reminders when
-    /// the loader found files, and seed the tool list with the built-in
-    /// registry. MCP tools join in on the first `refresh()` — they
-    /// require a runtime, which this constructor deliberately doesn't see.
+    /// reminder, not in this string), and enqueue AGENTS.md reminders when
+    /// the loader found files. The tool list is *not* seeded here: the
+    /// schemas come from the tool providers, and the agent loop sets them
+    /// per turn — a context that has never seen a router must not show
+    /// the model a tool list of its own.
     pub fn new(agents_md: &AgentsMdContext) -> Self {
         let mut reminders = Vec::new();
         if let Some(path) = agents_md.found_path.as_ref() {
@@ -130,31 +132,18 @@ impl Context {
         Self {
             system_text: SYSTEM.to_string(),
             reminders,
-            tools: builtin_tools(),
+            tools: Vec::new(),
         }
     }
 
-    /// Refresh the parts of the context that change per turn. Today only
-    /// the tool list moves (MCP servers can come and go between turns);
-    /// `system_text` and `reminders` are stable for the session.
-    /// `refresh()` is async because `Hub::definitions()` is — vendoring
-    /// it as a plain sync call would force the rest of the agent loop to
-    /// drop await points that exist for cancellation, which we don't
-    /// want to give back.
-    pub async fn refresh(&mut self, hub: &Hub) {
-        let mut schemas = builtin_tools();
-        schemas.extend(hub.definitions().await);
-        self.tools = schemas;
+    /// Replace the tool schemas the model is shown. The agent loop calls
+    /// this each turn with what the router composed — the built-ins
+    /// first, the servers' tools after them. The order and the bytes are a
+    /// cache contract, so the list is taken as-is and never sorted,
+    /// deduplicated or reworded here.
+    pub(crate) fn set_tools(&mut self, tools: Vec<Value>) {
+        self.tools = tools;
     }
-}
-
-/// Tool schemas for the built-in registry: `bash`, `read_file`, `write_file`,
-/// `edit_file`. Pure over the static `tools()` table — MCP entries join in
-/// via `Context::refresh`.
-pub(crate) fn builtin_tools() -> Vec<Value> {
-    tools().iter()
-        .map(|t| json!({"name": t.name, "description": t.desc, "input_schema": t.schema}))
-        .collect()
 }
 
 // ---- history trim ----------------------------------------------------------
@@ -269,7 +258,7 @@ mod tests {
         }
     }
 
-    // ---- Context::new + builtin_tools --------------------------------------
+    // ---- Context::new ------------------------------------------------------
 
     #[test]
     fn context_new_reads_empty_when_no_file_loaded() {
@@ -417,20 +406,22 @@ mod tests {
     }
 
     #[test]
-    fn builtin_tools_lists_the_four_shipped_tools() {
-        let ts = builtin_tools();
-        let names: Vec<&str> = ts.iter()
-            .filter_map(|v| v["name"].as_str())
-            .collect();
-        assert_eq!(names, vec!["bash", "read_file", "write_file", "edit_file"]);
-        for t in &ts {
-            // the wire shape: { name, description, input_schema }
-            assert!(t["name"].is_string());
-            assert!(t["description"].is_string());
-            assert_eq!(t["input_schema"]["type"], "object");
-            assert!(t["input_schema"]["properties"].is_object());
-            assert!(t["input_schema"]["required"].is_array());
-        }
+    fn set_tools_takes_the_list_verbatim() {
+        // A fresh context carries no tool list of its own: the schemas
+        // belong to the providers, and the context only carries what the
+        // router composed. The list is taken as it comes — the order and
+        // the bytes are a cache contract, so nothing here sorts or
+        // rewrites it.
+        let mut ctx = Context::new(&AgentsMdContext::empty(&std::path::PathBuf::from(".")));
+        assert!(ctx.tools.is_empty(),
+            "a context that has never seen a router shows no tools");
+        ctx.set_tools(vec![json!({"name": "b"}), json!({"name": "a"})]);
+        let names: Vec<&str> = ctx.tools.iter().filter_map(|v| v["name"].as_str()).collect();
+        assert_eq!(names, vec!["b", "a"], "the order is the router's, untouched");
+        // and it is replaced, not merged.
+        ctx.set_tools(vec![json!({"name": "c"})]);
+        let names: Vec<&str> = ctx.tools.iter().filter_map(|v| v["name"].as_str()).collect();
+        assert_eq!(names, vec!["c"]);
     }
 
     // ---- est_tokens --------------------------------------------------------

@@ -15,6 +15,8 @@ mod ledger;
 pub(crate) mod runtime;
 
 use crate::ui::{Msg, Show};
+use crate::cancel::CancelToken;
+use crate::core::ports::{BoxFuture, ToolProvider};
 use crate::file_io::write_atomic;
 use crate::tools::edit::edit_tool;
 use crate::tools::ledger::{ledger_note, stale};
@@ -177,6 +179,69 @@ pub(crate) fn dispatch(name: &str, input: &Value) -> String {
         .unwrap_or_else(|| format!("error: unknown tool '{name}'"))
 }
 
+// ---- the built-in provider --------------------------------------------------
+
+/// Tool schemas for the built-in registry: `bash`, `read_file`,
+/// `write_file`, `edit_file`. Pure over the static `tools()` table, and
+/// the exact expression the model's cached prefix is built from — the
+/// bytes and the order are a cache contract, so this body is not free to
+/// be reworded.
+pub(crate) fn builtin_schemas() -> Vec<Value> {
+    tools().iter()
+        .map(|t| json!({"name": t.name, "description": t.desc, "input_schema": t.schema}))
+        .collect()
+}
+
+/// The four shipped tools, as a tool provider.
+///
+/// The provider is the seam the router talks to; the registry below it is
+/// unchanged. `owns` is "one of the four", `definitions` is the four
+/// schemas in the registry's order, and `call` runs the same bodies the
+/// tool runtime ran before the provider existed.
+///
+/// Cancellation formats are deliberately different — the model can tell
+/// what happened from the prefix alone: bash preserves whatever output
+/// had already arrived (so the marker sits *after* the bytes, and reads
+/// like a note the tool appended) while the file tools had no partial
+/// output to keep (so the whole tool result is a single line saying so).
+pub(crate) struct Builtins;
+
+impl ToolProvider for Builtins {
+    fn owns(&self, name: &str) -> bool {
+        matches!(name, "bash" | "read_file" | "write_file" | "edit_file")
+    }
+
+    fn definitions<'a>(&'a self) -> BoxFuture<'a, Vec<Value>> {
+        // the built-ins are synchronous: a ready future is the honest
+        // shape for them, and it keeps the trait dyn-compatible.
+        Box::pin(std::future::ready(builtin_schemas()))
+    }
+
+    fn call<'a>(
+        &'a self,
+        name: &'a str,
+        input: &'a Value,
+        token: &'a CancelToken,
+    ) -> BoxFuture<'a, String> {
+        Box::pin(async move {
+            if name == "bash" {
+                // bash owns its own child process: it is the one tool
+                // whose execution has to be cancellable, so it takes the
+                // coroutine path, not the registry's synchronous one.
+                return crate::tools::runtime::run_bash(
+                    input["command"].as_str().unwrap_or(""), token).await;
+            }
+            let name = name.to_string();
+            let input = input.clone();
+            let job = tokio::task::spawn_blocking(move || dispatch(&name, &input));
+            tokio::select! {
+                out = job => out.unwrap_or_else(|e| format!("error: {e}")),
+                _ = token.cancelled() => "[interrupted by user]".into(),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +291,143 @@ mod tests {
         assert!(dispatch("read_file", &json!({"path": dir.join("nope").to_str().unwrap()})).starts_with("error:"));
         // unknown tool
         assert!(dispatch("nope", &json!({})).starts_with("error: unknown tool"));
+    }
+
+    // ---- the built-in provider: the four shipped tools --------------------
+
+    /// The composed list the model saw before the router existed: the four
+    /// built-in schemas, byte for byte. The cached prefix is system + tools,
+    /// so a byte here is a byte that invalidates the whole prefix — this
+    /// literal is the proof that the move changed nothing. Captured from the
+    /// tree *before* the provider existed.
+    const GOLDEN_BUILTIN_SCHEMAS: &str = r#"[{"description":"Run a shell command (`sh -c` on Unix, `cmd /C` on Windows). Output shape is `exit=N\\n<stdout><optional stderr>` (N is the child's status; `-1` means the process was terminated by a signal with no normal exit code). Output longer than 50,000 bytes is truncated with a `…[truncated, N bytes total]` marker — tail the file or pipe through `head` / `tail` / `sed` if you need more. The shell inherits the agent's current working directory; relative paths resolve there, not against the user's shell. Use `cd <dir> && <cmd>` to change directory within a single call. Long-running commands are killed on Ctrl-C; partial output still reaches the model with an `[interrupted by user]` marker.","input_schema":{"properties":{"command":{"description":"Shell command string; passed to `sh -c` on Unix or `cmd /C` on Windows. Multi-line commands use `;` or `&&`.","type":"string"}},"required":["command"],"type":"object"},"name":"bash"},{"description":"Read the full contents of a file. Use this — not `cat` via bash — before any edit. A read also loads the file into the agent's ledger: edit_file and write_file then refuse to touch the file if it changed on disk, so re-read after any external edit (rustfmt, git pull, sed, …).","input_schema":{"properties":{"path":{"description":"Absolute or relative path; resolves against the agent's current working directory.","type":"string"}},"required":["path"],"type":"object"},"name":"read_file"},{"description":"Write content to a file, creating parent dirs as needed. Overwrites existing files. Prefer edit_file for small or targeted changes — this is the blunt tool and will silently replace uncommitted work. The write is atomic (temp+rename): a crash mid-call cannot leave a truncated file. Refuses to overwrite if the file changed since jingwei last read or wrote it; re-read first, then write.","input_schema":{"properties":{"content":{"description":"Full file contents — the tool always overwrites. For a small or targeted change, use edit_file instead.","type":"string"},"path":{"description":"Absolute or relative path; resolves against the agent's current working directory. Parent dirs are created if they do not exist.","type":"string"}},"required":["path","content"],"type":"object"},"name":"write_file"},{"description":"Edit a file: replace `old` with `new`, or apply several pairs as `edits` in one all-or-nothing call (in order — each sees what the ones before it wrote). Matching is exact first; failing that, whole lines are aligned ignoring indentation (and `new` is shifted to where they sit). If `old` matches more than one place the error names the line numbers — widen `old` with a line of context around the one you mean, or set replace_all:true to replace every occurrence. The result carries the affected line numbers and a diff. Refuses to write over a file that changed on disk since jingwei last read it: re-read it, then redo the edit. Passing an empty `old` is refused — use write_file to create or replace a file wholesale.","input_schema":{"properties":{"edits":{"description":"several `old`/`new` pairs applied in one call, in order, all or nothing. Omitting `new` in an item is a deletion, mirroring the outer `old`/`new` shape.","items":{"properties":{"new":{"description":"what goes in its place; omit to delete (matches the outer `old`/`new` shape)","type":"string"},"old":{"description":"the text to find","type":"string"}},"required":["old"],"type":"object"},"type":"array"},"new":{"description":"what goes in its place; omit to delete","type":"string"},"old":{"description":"the text to find","type":"string"},"path":{"description":"Absolute or relative path; resolves against the agent's current working directory.","type":"string"},"replace_all":{"description":"replace every occurrence, instead of refusing when `old` is not unique","type":"boolean"}},"required":["path"],"type":"object"},"name":"edit_file"}]"#;
+
+    #[test]
+    fn the_built_in_schemas_are_byte_identical_to_the_pre_move_list() {
+        assert_eq!(
+            serde_json::to_string(&builtin_schemas()).unwrap(),
+            GOLDEN_BUILTIN_SCHEMAS,
+            "the built-in schema list is a cache contract: its bytes and its order must not move",
+        );
+    }
+
+    #[test]
+    fn the_built_in_provider_offers_the_four_schemas_in_todays_order() {
+        let ts = builtin_schemas();
+        let names: Vec<&str> = ts.iter()
+            .filter_map(|v| v["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["bash", "read_file", "write_file", "edit_file"]);
+        for t in &ts {
+            // the wire shape: { name, description, input_schema }
+            assert!(t["name"].is_string());
+            assert!(t["description"].is_string());
+            assert_eq!(t["input_schema"]["type"], "object");
+            assert!(t["input_schema"]["properties"].is_object());
+            assert!(t["input_schema"]["required"].is_array());
+        }
+    }
+
+    #[test]
+    fn the_built_in_provider_owns_only_the_four_names() {
+        let b = Builtins;
+        for name in ["bash", "read_file", "write_file", "edit_file"] {
+            assert!(b.owns(name), "{name} is one of the four");
+        }
+        for name in ["mcp__x__y", "nope", "", "BASH"] {
+            assert!(!b.owns(name), "{name:?} is not a built-in");
+        }
+    }
+
+    #[test]
+    fn the_built_in_provider_runs_a_tool() {
+        let dir = temp_dir("builtin_provider");
+        let p = dir.join("f.txt");
+        std::fs::write(&p, "hello").unwrap();
+        let out = crate::test_util::block_on(
+            Builtins.call("read_file", &json!({"path": p.to_str().unwrap()}),
+                          &crate::cancel::CancelToken::new()),
+        );
+        assert_eq!(out, "hello", "got: {out}");
+    }
+
+    /// bash takes the coroutine path, not the registry's synchronous one:
+    /// it owns its child process so a runaway shell can be killed.
+    #[test]
+    fn the_built_in_provider_runs_bash_through_the_cancellable_path() {
+        let out = crate::test_util::block_on(
+            Builtins.call("bash", &json!({"command": "echo hi"}),
+                          &crate::cancel::CancelToken::new()),
+        );
+        assert!(out.starts_with("exit=0"), "got: {out}");
+        assert!(out.contains("hi"), "got: {out}");
+    }
+
+    /// A long-running bash with a token that fires mid-call: the child is
+    /// killed and the tool answers with the interruption marker.
+    #[test]
+    fn the_built_in_provider_is_interrupted_when_the_token_fires() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let token = Arc::new(crate::cancel::CancelToken::new());
+        let t = token.clone();
+        let out = crate::test_util::block_on(async move {
+            tokio::task::spawn_blocking(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                t.cancel();
+            });
+            Builtins.call("bash", &json!({"command": "sleep 30"}), &token).await
+        });
+        assert!(out.contains("[interrupted by user]"), "got: {out}");
+    }
+
+    /// The non-bash path's select races the blocking pool against the
+    /// cancel — a pre-cancelled token always wins. The marker is the same
+    /// word bash uses, so the model sees one shape for "this turn did not
+    /// finish" no matter which tool ran.
+    #[test]
+    fn the_built_in_provider_answers_a_pre_cancelled_call_with_the_marker() {
+        let dir = temp_dir("builtin_cancel");
+        let token = crate::cancel::CancelToken::new();
+        token.cancel();
+        let out = crate::test_util::block_on(
+            Builtins.call("write_file",
+                          &json!({"path": dir.join("f.txt").to_str().unwrap(), "content": "x"}),
+                          &token),
+        );
+        assert_eq!(out, "[interrupted by user]",
+            "non-bash cancellation uses the bash marker: {out}");
+    }
+
+    /// The order of the composed list is a cache contract: the built-ins
+    /// come first, then the MCP tools, exactly as the context's own refresh
+    /// used to produce them. The router reproduces that order.
+    #[test]
+    fn the_router_composes_the_built_ins_before_the_mcp_tools() {
+        /// A stand-in for the MCP provider: it owns an `mcp__` name and
+        /// offers one schema.
+        struct FakeMcp;
+        impl crate::core::ports::ToolProvider for FakeMcp {
+            fn owns(&self, name: &str) -> bool { name.starts_with("mcp__") }
+            fn definitions<'a>(&'a self) -> crate::core::ports::BoxFuture<'a, Vec<Value>> {
+                Box::pin(std::future::ready(vec![json!({"name": "mcp__fake__tool"})]))
+            }
+            fn call<'a>(&'a self, name: &'a str, _input: &'a Value,
+                        _token: &'a crate::cancel::CancelToken)
+                -> crate::core::ports::BoxFuture<'a, String> {
+                Box::pin(std::future::ready(format!("mcp:{name}")))
+            }
+        }
+        let router = crate::core::ports::ToolRouter::new(vec![
+            Box::new(Builtins),
+            Box::new(FakeMcp),
+        ]);
+        let defs = crate::test_util::block_on(router.definitions());
+        let names: Vec<&str> = defs.iter().filter_map(|v| v["name"].as_str()).collect();
+        assert_eq!(names, vec!["bash", "read_file", "write_file", "edit_file", "mcp__fake__tool"]);
+        // and the built-in half is still the golden bytes
+        let builtins = serde_json::to_string(&defs[..4]).unwrap();
+        assert_eq!(builtins, GOLDEN_BUILTIN_SCHEMAS);
     }
 
     // ---- tool_summary: the one-line echo the frontends show ---------------

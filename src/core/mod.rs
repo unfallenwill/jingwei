@@ -18,6 +18,7 @@ pub(crate) mod agents_md;
 pub(crate) mod context;
 pub(crate) mod error;
 pub(crate) mod ir;
+pub(crate) mod ports;
 pub(crate) mod reminder;
 pub(crate) mod session;
 pub(crate) mod turn;
