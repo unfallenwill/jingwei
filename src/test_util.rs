@@ -123,6 +123,19 @@ pub(crate) fn mock(response: &str, status: u16, sse: bool) -> u16 {
 /// records the raw bytes of every request it received.
 #[cfg(test)]
 pub(crate) fn mock_seq(responses: Vec<(u16, String)>) -> (u16, Arc<Mutex<Vec<String>>>) {
+    mock_seq_with(responses, || {})
+}
+
+/// Like [`mock_seq`], but with a hook: it fires after a request has been
+/// read and *before* that request's response goes out. A test that wants
+/// to look at the world at the exact moment the model is called — the
+/// file on disk, the transcript in memory — uses it to look, instead of
+/// guessing what the timing would have been.
+#[cfg(test)]
+pub(crate) fn mock_seq_with<F: Fn() + Send + 'static>(
+    responses: Vec<(u16, String)>,
+    on_request: F,
+) -> (u16, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -141,6 +154,7 @@ pub(crate) fn mock_seq(responses: Vec<(u16, String)>) -> (u16, Arc<Mutex<Vec<Str
                 req.extend_from_slice(&buf[..n]);
             }
             log.lock().unwrap().push(String::from_utf8_lossy(&req).into_owned());
+            on_request();
             let resp = format!("HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             let _ = s.write_all(resp.as_bytes());
             let _ = s.flush();

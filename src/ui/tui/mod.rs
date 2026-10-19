@@ -45,9 +45,8 @@ use crate::mcp::Hub;
 use crate::core::ports::ToolRouter;
 use crate::core::session::Convo;
 use crate::config::settings::Settings;
-use crate::agent::runner::run_agent;
-use crate::agent::Agent;
-use crate::{user_message, Error};
+use crate::workflow::run_task;
+use crate::Error;
 
 fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(std::path::PathBuf::from)
@@ -948,13 +947,12 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
             if let Some(cmd) = parse_slash(&line) {
                 return dispatch_slash(cmd, cfg, session, run, sink, hub);
             }
-            // The narrow race: the agent's `Msg::TaskBegin` rides the
-            // channel back to update `app.working()`; between sending
-            // it and the loop reading it, the user could press Enter
-            // again — the run slot already holds a live job, and
-            // spawning a second one would orphan the first. Two
-            // coroutines then race the session lock and both push into
-            // the transcript; the file would be torn. Refuse instead.
+            // A second Submit must not orphan the first run: the run
+            // slot is filled here, synchronously, before the job is
+            // spawned — so a Submit that arrives while the first is in
+            // flight finds the slot occupied and refuses. Two
+            // coroutines racing the session lock would push into the
+            // same transcript and tear the file.
             if run.is_some() {
                 sink.show(Msg::Note {
                     sev: Sev::Warn,
@@ -967,7 +965,6 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
             let router = router.clone();
             let token = Arc::new(crate::cancel::CancelToken::new());
             let tok = token.clone();
-            sink.show(Msg::TaskBegin(line.clone()));
             let sink = sink.clone(); // one for the spawned task, one for the shell
             let job = tokio::spawn(async move {
                 // The session lock is held for the whole turn: the
@@ -976,22 +973,14 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
                 // this one.
                 let mut st = session.lock().await;
                 let SessionState { ctx, convo } = &mut *st;
-                ctx.push(user_message(&line));
-                if let Err(e) = convo.persist(ctx.history()) {
-                    sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
-                }
-                // the task is on disk before the first stone moves
-                let mut agent = Agent::main(&line);
-                match run_agent(&mut agent, &cfg, ctx, &router, &tok, &sink).await {
+                // The run boundary: the job does not spell the sequence
+                // out — it hands the task to the run, which owns the
+                // begin, the saves, and the end.
+                match run_task(&line, &cfg, ctx, convo, &router, &tok, &sink).await {
                     Err(Error::Interrupted) => {}
                     Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
                     Ok(()) => {}
                 }
-                if let Err(e) = convo.persist(ctx.history()) {
-                    sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
-                }
-                // run boundary: the file never ends mid-run
-                sink.show(Msg::TaskEnd);
             });
             *run = Some(RunHandle { token, job });
             HandleOutcome::None
@@ -1770,10 +1759,10 @@ mod tests {
 
     #[tokio::test]
     async fn handle_submit_starts_a_run_and_emits_task_begin() {
-        // a Submit lands a TaskBegin in the sink and fills `run`. The
-        // spawned task races an unreachable host, so we cancel it before
-        // returning — what we assert here is the *start* of the action,
-        // not its end
+        // a Submit fills the run slot and, once the job gets going, lands
+        // a TaskBegin in the sink. The spawned task races an unreachable
+        // host, so we cancel it before returning — what we assert here is
+        // the *start* of the action, not its end
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
         let cfg = tcfg("http://127.0.0.1:1");
@@ -1784,8 +1773,13 @@ mod tests {
         // tokio::test gives us the runtime; handle does its own tokio::spawn.
         handle(Action::Submit("hello world".into()), &cfg, &session, &mut run, &sink, &hub, &router);
         assert!(run.is_some(), "submit sets the run slot");
-        // a task begin landed in the sink
-        let got = rx.try_recv().expect("TaskBegin emitted by submit");
+        // a task begin landed in the sink. The begin comes from the run
+        // the job spawned, so we wait for it rather than assume it is
+        // already there.
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("TaskBegin emitted by submit")
+            .expect("the sink is alive");
         assert!(matches!(got, Msg::TaskBegin(ref t) if t == "hello world"));
         // tidy up: cancel the running coroutine before the test ends
         if let Some(a) = run {
@@ -1799,7 +1793,7 @@ mod tests {
     #[tokio::test]
     async fn handle_submit_refuses_when_a_run_is_already_running() {
         // the narrow race window: a first Submit spawned a run; a
-        // second Submit arriving before the channel carries TaskBegin
+        // second Submit arriving before the first run's TaskBegin comes
         // back to the state must not orphan the first one. The first
         // run slot is preserved, the second Submit emits a warning
         // and returns None.
@@ -1872,6 +1866,11 @@ mod tests {
     /// Point home_dir() at a temp dir for the lifetime of the test. The
     /// loader and saver both consult home_dir(); the override has to
     /// land before either is called. The guard removes the dir on drop.
+    ///
+    /// The override moves a process-global variable, so the test that
+    /// takes it also takes the env lock: without it, a sibling test
+    /// that moves the same variable at the same time would see the
+    /// wrong home.
     struct HomeOverride(std::path::PathBuf);
     impl Drop for HomeOverride {
         fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
@@ -1894,6 +1893,7 @@ mod tests {
 
     #[test]
     fn load_history_returns_empty_when_no_file_exists() {
+        let _lock = crate::test_util::env_lock();
         let prev = if cfg!(windows) { std::env::var_os("USERPROFILE") } else { std::env::var_os("HOME") };
         let (_g, _p) = override_home("missing");
         assert!(load_history().is_empty());
@@ -1902,6 +1902,7 @@ mod tests {
 
     #[test]
     fn save_then_load_history_round_trips() {
+        let _lock = crate::test_util::env_lock();
         let prev = if cfg!(windows) { std::env::var_os("USERPROFILE") } else { std::env::var_os("HOME") };
         let (_g, dir) = override_home("round");
         let entries = vec!["first task".to_string(), "second\nmultiline".into(), "with \\ backslash".into()];
@@ -1916,6 +1917,7 @@ mod tests {
 
     #[test]
     fn load_history_skips_blank_and_whitespace_only_lines() {
+        let _lock = crate::test_util::env_lock();
         let prev = if cfg!(windows) { std::env::var_os("USERPROFILE") } else { std::env::var_os("HOME") };
         let (_g, dir) = override_home("blank");
         let mut body = String::new();
@@ -1933,6 +1935,7 @@ mod tests {
 
     #[test]
     fn home_dir_returns_none_when_unset() {
+        let _lock = crate::test_util::env_lock();
         let _prev = if cfg!(windows) { std::env::var_os("USERPROFILE") } else { std::env::var_os("HOME") };
         let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
         std::env::remove_var(var);
@@ -1942,6 +1945,7 @@ mod tests {
 
     #[test]
     fn home_dir_reads_the_platform_specific_variable() {
+        let _lock = crate::test_util::env_lock();
         let _prev = if cfg!(windows) { std::env::var_os("USERPROFILE") } else { std::env::var_os("HOME") };
         let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
         std::env::set_var(var, "/tmp/some-test-home");

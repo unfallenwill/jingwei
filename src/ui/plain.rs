@@ -210,24 +210,15 @@ pub async fn plain_repl(
             handle_mcp_command(rest, &hub, &sink).await;
             continue;
         }
-        ctx.push(crate::core::ir::user_message(&line));
-        if let Err(e) = convo.persist(ctx.history()) {
-            sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
-        }
-        // the task is on disk before the first stone moves
-        let mut agent = crate::agent::Agent::main(&line);
-        sink.show(Msg::TaskBegin(line));
+        // The run boundary: the REPL hands the line to the run and maps
+        // the outcome — an interrupted run is silent, any other failure
+        // is a note, and the run itself ended the turn.
         let token = crate::cancel::CancelToken::new();
-        match crate::agent::runner::run_agent(&mut agent, cfg, &mut ctx, &router, &token, &sink).await {
+        match crate::workflow::run_task(&line, cfg, &mut ctx, &mut convo, &router, &token, &sink).await {
             Err(crate::Error::Interrupted) => {}
             Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
             Ok(()) => {}
         }
-        if let Err(e) = convo.persist(ctx.history()) {
-            sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
-        }
-        // run boundary: the file never ends mid-run
-        sink.show(Msg::TaskEnd);
     }
     Ok(())
 }

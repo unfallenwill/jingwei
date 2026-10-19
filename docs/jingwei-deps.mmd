@@ -9,6 +9,7 @@ flowchart TD
     subgraph L5["L5 — composition"]
         bin["main.rs — the thin binary"]
         lib["lib.rs — run, Error, the composition root"]
+        workflow["workflow — the run boundary"]
         loop_["agent::runner — the turn loop"]
         plain["ui::plain — the log adapter"]
         tui["ui::tui — the terminal adapter"]
@@ -41,11 +42,14 @@ flowchart TD
     end
 
     bin --> lib
-    lib --> loop_
-    lib --> plain
-    lib --> tui
+    lib --> workflow
     lib --> config
     lib --> mcp
+    plain --> workflow
+    tui --> workflow
+
+    workflow --> loop_
+    workflow --> session
 
     loop_ --> api
     loop_ --> tools

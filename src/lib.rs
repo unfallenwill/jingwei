@@ -20,25 +20,25 @@ mod file_io;
 mod format;
 mod mcp;
 mod tools;
+mod workflow;
 /// The ui port (this module's `mod.rs`) plus the two frontends that
 /// implement it. `pub` because the thin binary renders its final error
 /// banner through the same vocabulary the frontends share.
 pub mod ui;
 
 #[cfg(test)] mod test_util;
-use crate::agent::runner::run_agent;
-use crate::agent::Agent;
 use crate::cancel::CancelToken;
 use crate::config::{Args, Config, build_config};
 use crate::core::agents_md::AgentsMdContext;
 use crate::core::context::Context;
-use crate::core::ir::{user_message, Message};
+use crate::core::ir::Message;
 use crate::core::ports::ToolRouter;
 use crate::core::session;
-use crate::ui::{Msg, Sev, Show};
+use crate::ui::{Msg, Show};
 use crate::mcp::Hub;
 use crate::tools::Builtins;
 use crate::config::settings::Settings;
+use crate::workflow::run_task;
 use serde_json::Value;
 use std::env;
 use std::path::PathBuf;
@@ -140,18 +140,11 @@ async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agent
     for b in &banners {
         sink.show(Msg::Banner(b.clone()));
     }
-    sink.show(Msg::TaskBegin(prompt.clone()));
-    ctx.push(user_message(&prompt));
-    if let Err(e) = convo.persist(ctx.history()) {
-        sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
-    }
+    // The run boundary: the one-shot does not spell the sequence out —
+    // it hands the task to the run and hands the result back, so the
+    // exit code stays the run's own.
     let token = CancelToken::new();
-    let mut agent = Agent::main(&prompt);
-    let res = run_agent(&mut agent, &cfg, &mut ctx, &router, &token, &sink).await;
-    if let Err(e) = convo.persist(ctx.history()) {
-        sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
-    }
-    sink.show(Msg::TaskEnd);
+    let res = run_task(&prompt, &cfg, &mut ctx, &mut convo, &router, &token, &sink).await;
     hub.shutdown().await;
     res
 }
