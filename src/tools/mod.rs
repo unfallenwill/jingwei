@@ -132,18 +132,23 @@ pub(crate) fn tools() -> Vec<Tool> {
                 let p = i["path"].as_str().unwrap_or("");
                 let c = i["content"].as_str().unwrap_or("");
                 // The blunt tool gets the guard too — overwriting a file that
-                // moved under us is the most expensive thing this agent can do.
-                if let Some(e) = with_ledger(|led| led.stale(agent, p)) { return e; }
-                if let Some(dir) = std::path::Path::new(p).parent().filter(|d| !d.as_os_str().is_empty()) {
-                    let _ = fs::create_dir_all(dir);
-                }
-                match write_atomic(p, c) {
-                    Ok(()) => {
-                        with_ledger(|led| led.note(agent, p, c.as_bytes()));
-                        format!("ok: wrote {} bytes to {p}", c.len())
+                // moved under us is the most expensive thing this agent can
+                // do. The check and the write are one critical section: the
+                // lock is what stops two agents from both passing the check
+                // and then both writing.
+                with_ledger(|led| {
+                    if let Some(e) = led.stale(agent, p) { return e; }
+                    if let Some(dir) = std::path::Path::new(p).parent().filter(|d| !d.as_os_str().is_empty()) {
+                        let _ = fs::create_dir_all(dir);
                     }
-                    Err(e) => format!("error: {e}"),
-                }
+                    match write_atomic(p, c) {
+                        Ok(()) => {
+                            led.note(agent, p, c.as_bytes());
+                            format!("ok: wrote {} bytes to {p}", c.len())
+                        }
+                        Err(e) => format!("error: {e}"),
+                    }
+                })
             },
         },
         Tool {

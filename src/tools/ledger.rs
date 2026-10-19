@@ -90,10 +90,10 @@ fn ledger() -> MutexGuard<'static, Ledger> {
 
 /// Run `f` with the ledger locked.
 ///
-/// The lock is the ledger's whole discipline: a check that compares the
-/// disk against a view has to read the disk at a moment when nobody else
-/// can be writing, so the check and the write that follows it belong under
-/// this one lock.
+/// The check and the write that follows it belong in **one** call to this:
+/// that is what stops two agents from both passing the check and then both
+/// writing. The lock is not reentrant — never call `with_ledger` from inside
+/// `with_ledger`.
 pub(crate) fn with_ledger<R>(f: impl FnOnce(&mut Ledger) -> R) -> R {
     let mut led = ledger();
     f(&mut led)
@@ -305,6 +305,46 @@ mod tests {
         let out = crate::tools::dispatch("write_file", &serde_json::json!({"path": p, "content": "v2"}), a);
         assert!(out.starts_with("ok:"), "an agent's own write does not stale it: {out}");
         assert_eq!(std::fs::read_to_string(p).unwrap(), "v2");
+    }
+
+    /// Two agents, released at the same moment, writing the same file:
+    /// exactly one wins. The critical section is what makes that true —
+    /// without it both could pass the check and then both write.
+    ///
+    /// The barrier releases both threads at the same instant; nothing
+    /// sleeps. The assertion is deterministic under the fix, because the
+    /// lock serializes the two writes, and it fails without the fix,
+    /// because then both checks can land before either write.
+    #[test]
+    fn two_agents_writing_at_once_leave_exactly_one_winner() {
+        let _g = ledger_lock();
+        let dir = temp_dir("one_winner");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "original").unwrap();
+        let p = path.to_str().unwrap();
+        let a = AgentId::next();
+        let b = AgentId::next();
+        crate::tools::dispatch("read_file", &serde_json::json!({"path": p}), a);
+        crate::tools::dispatch("read_file", &serde_json::json!({"path": p}), b);
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [(a, "A"), (b, "B")]
+            .into_iter()
+            .map(|(agent, content)| {
+                let gate = gate.clone();
+                let p = p.to_string();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    crate::tools::dispatch("write_file", &serde_json::json!({"path": p, "content": content}), agent)
+                })
+            })
+            .collect();
+        let results: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.starts_with("ok:")).count(), 1,
+            "exactly one write lands: {results:?}");
+        assert_eq!(results.iter().filter(|r| r.contains("changed on disk")).count(), 1,
+            "the other is refused, not ignored: {results:?}");
+        let on_disk = std::fs::read_to_string(p).unwrap();
+        assert!(on_disk == "A" || on_disk == "B", "the file holds one of the two: {on_disk:?}");
     }
 
     /// The limit, pinned deliberately: an agent that has never touched a

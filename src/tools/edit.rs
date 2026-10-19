@@ -82,44 +82,52 @@ pub(crate) fn edit_tool(i: &Value, agent: AgentId) -> String {
 /// seeing what the ones before it wrote), write once. All or nothing — a batch
 /// that fails at pair 3 writes nothing at all and says which pair failed and
 /// why, so the model re-plans instead of discovering a half-applied file.
+///
+/// The read stays outside the lock — a read is an observation, and a note
+/// that lands after somebody else's write is the safe direction. Everything
+/// after it is one critical section: the check, the resolution, the write and
+/// the note. The check has to come first, so a file that moved beats an
+/// ambiguous `old` in the message the model sees.
 fn apply_edits(p: &str, edits: &[(String, String)], replace_all: bool, agent: AgentId) -> String {
     let content = match std::fs::read_to_string(p) {
         Ok(c) => c,
         Err(e) => return format!("error: {e} (in {p})"),
     };
-    // The bytes just read are the ones the edit is written against — if they
-    // are not the bytes we last saw, this file moved under us and the edit is
-    // not ours to make.
-    if let Some(e) = with_ledger(|led| led.stale(agent, p)) { return e; }
-    let mut buffer = content;
-    let mut marks: Vec<(usize, usize)> = Vec::new();
-    let mut body = String::new();
-    let mut shown = 0;
-    for (n, (old, new)) in edits.iter().enumerate() {
-        let n = n + 1;
-        let resolved = match resolve(&buffer, old, new, replace_all) {
-            Ok(r) => r,
-            Err(e) => return format!("error: edit {n}/{}: {e} (in {p}; nothing was written)",
-                edits.len()),
-        };
-        let spans: Vec<Span> = resolved.units.iter().map(|(s, e, text)| Span {
-            start: *s, end: *e, line: line_at(&buffer, *s), text: text.clone(),
-        }).collect();
-        let updated = splice(&buffer, &resolved.units);
-        if resolved.fuzzy {
-            body.push_str("\n  (matched line by line, ignoring indentation — `new` was re-indented to \
-                           where those lines sit; nothing else about their whitespace changed)");
+    with_ledger(|led| {
+        // The bytes just read are the ones the edit is written against — if they
+        // are not the bytes we last saw, this file moved under us and the edit is
+        // not ours to make.
+        if let Some(e) = led.stale(agent, p) { return e; }
+        let mut buffer = content;
+        let mut marks: Vec<(usize, usize)> = Vec::new();
+        let mut body = String::new();
+        let mut shown = 0;
+        for (n, (old, new)) in edits.iter().enumerate() {
+            let n = n + 1;
+            let resolved = match resolve(&buffer, old, new, replace_all) {
+                Ok(r) => r,
+                Err(e) => return format!("error: edit {n}/{}: {e} (in {p}; nothing was written)",
+                    edits.len()),
+            };
+            let spans: Vec<Span> = resolved.units.iter().map(|(s, e, text)| Span {
+                start: *s, end: *e, line: line_at(&buffer, *s), text: text.clone(),
+            }).collect();
+            let updated = splice(&buffer, &resolved.units);
+            if resolved.fuzzy {
+                body.push_str("\n  (matched line by line, ignoring indentation — `new` was re-indented to \
+                               where those lines sit; nothing else about their whitespace changed)");
+            }
+            let prefix = if edits.len() > 1 { format!("edit {n} ") } else { String::new() };
+            body.push_str(&edit_diff(&buffer, &updated, &spans, &prefix, &mut shown));
+            for s in &spans { marks.push((n, s.line)); }
+            buffer = updated;
         }
-        let prefix = if edits.len() > 1 { format!("edit {n} ") } else { String::new() };
-        body.push_str(&edit_diff(&buffer, &updated, &spans, &prefix, &mut shown));
-        for s in &spans { marks.push((n, s.line)); }
-        buffer = updated;
-    }
-    if let Err(e) = crate::file_io::write_atomic(p, &buffer) { return format!("error: {e} (in {p})"); }
-    with_ledger(|led| led.note(agent, p, buffer.as_bytes()));
-    let mut out = edit_header(p, &marks, edits.len());
-    out.push_str(&body);
-    out
+        if let Err(e) = crate::file_io::write_atomic(p, &buffer) { return format!("error: {e} (in {p})"); }
+        led.note(agent, p, buffer.as_bytes());
+        let mut out = edit_header(p, &marks, edits.len());
+        out.push_str(&body);
+        out
+    })
 }
 
 /// The resolution ladder for one pair: an exact match wins; failing that whole
