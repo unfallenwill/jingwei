@@ -4,14 +4,14 @@
 //! batch it asked for, and around again, until the model answers in
 //! plain text or a bound (`--max-turns`, Ctrl-C, an error) stops it.
 //!
-//! The loop owns no resources: the config, context, cancel token, tool
+//! The loop owns no resources: the config, context, cancel scope, tool
 //! router, and output sink are all handed in by the caller
 //! (`crate::workflow` or a frontend), which is exactly why every
 //! piece can be tested with mocks and why new frontends cost nothing.
 
 use crate::agent::Agent;
 use crate::api::call_api as api_call_api;
-use crate::cancel::CancelToken;
+use crate::cancel::{CancelScope, CancelToken};
 use crate::config::Config;
 use crate::core::context::Context;
 use crate::core::ir::{Block, Message, ToolResult};
@@ -25,12 +25,17 @@ const MAX_TOOL_OUTPUT: usize = 50_000;
 
 /// Drive one agent run as an interruptible coroutine.
 ///
-/// The first Ctrl-C cancels the token: the agent coroutine notices at its
+/// The first Ctrl-C cancels the scope: the agent coroutine notices at its
 /// next suspension point (a streamed line, a tool poll, a turn boundary),
 /// tidies the history so every tool call stays paired, and unwinds — the
 /// REPL prompt comes back with everything the agent already carried still in
 /// place. A second Ctrl-C while it is unwinding exits immediately, for when
 /// even graceful is too slow.
+///
+/// The run holds the *scope*, not a bare token: the run mints its own leaf
+/// from the scope, so a cancel of the scope reaches the run and everything
+/// under it — and a run that starts under an already-cancelled scope mints a
+/// leaf that is born cancelled and does no work at all.
 ///
 /// `agent` is the run's value: the caller hands in a fresh [`Agent`]
 /// (whose lifecycle is a `Turn` in `Queued`) and the wrapper drives it
@@ -38,14 +43,16 @@ const MAX_TOOL_OUTPUT: usize = 50_000;
 /// after the wrapper returns to read the terminal state — the wrapper owns
 /// the cancel select (`tokio::select!` against Ctrl-C) and the
 /// double-signal semantics, not to hide the lifecycle from anyone.
-pub(crate) async fn run_agent(agent: &mut Agent, cfg: &Config, ctx: &mut Context, router: &ToolRouter, token: &CancelToken, sink: &dyn Show) -> crate::Result<()> {
-    let run = agent_loop(agent, cfg, ctx, router, token, sink);
+pub(crate) async fn run_agent(agent: &mut Agent, cfg: &Config, ctx: &mut Context, router: &ToolRouter, scope: &CancelScope, sink: &dyn Show) -> crate::Result<()> {
+    // The run's own leaf, under the scope the caller handed in.
+    let token = scope.token();
+    let run = agent_loop(agent, cfg, ctx, router, &token, sink);
     tokio::pin!(run);
     tokio::select! {
         res = &mut run => return res,
         // The plain frontend has no key loop of its own, so Ctrl-C arrives
         // as a signal here; the TUI cancels through its key handler instead.
-        _ = tokio::signal::ctrl_c() => token.cancel(),
+        _ = tokio::signal::ctrl_c() => scope.cancel(),
     }
     let res = tokio::select! {
         res = &mut run => res,
@@ -181,7 +188,7 @@ fn truncate(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::agent::{AgentRole, AgentId};
-    use crate::cancel::CancelToken;
+    use crate::cancel::{CancelScope, CancelToken};
     use crate::mcp::Hub;
     use crate::test_util::{block_on, cfg, mock_seq, mock_stall, sink};
     use serde_json::json;
@@ -442,7 +449,7 @@ mod tests {
         let mut cx = ctx_with("say hi");
         block_on(async {
             let (router, hub) = router();
-            run_agent(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &CancelToken::new(), &sink()).await.unwrap();
+            run_agent(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &CancelScope::new(), &sink()).await.unwrap();
             hub.shutdown().await;
         });
         // the wrapper drove Queued → InProgress → Completed on the agent
@@ -453,5 +460,30 @@ mod tests {
         assert_eq!(agent.state(), TurnState::Completed);
         assert!(agent.started_at().is_some() && agent.ended_at().is_some());
         assert_eq!(hist(cx.history()).as_array().unwrap().last().unwrap()["role"], json!("assistant"));
+    }
+
+    /// A run under a scope that was cancelled before it started does no
+    /// work: the leaf it mints is born cancelled, so the turn stops
+    /// before the first request goes out. The run *does* start — the
+    /// lifecycle still moves — but nothing reaches the wire.
+    #[test]
+    fn a_run_whose_scope_was_cancelled_before_it_started_does_no_work() {
+        let done = r#"{"content":[{"type":"text","text":"all done"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let (port, reqs) = mock_seq(vec![(200, done.into())]);
+        let mut agent = Agent::new(AgentId::MAIN, "main".into(), AgentRole::Main, "say hi".into(), crate::core::turn::Turn::new(7));
+        let mut cx = ctx_with("say hi");
+        let scope = CancelScope::new();
+        scope.cancel();
+        let err = block_on(async {
+            let (router, hub) = router();
+            let res = run_agent(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &scope, &sink()).await;
+            hub.shutdown().await;
+            res
+        }).unwrap_err();
+        assert!(matches!(err, Error::Interrupted), "got: {err}");
+        // no request went out — the turn stopped at its first checkpoint
+        let reqs = reqs.lock().unwrap();
+        assert!(reqs.is_empty(), "a run under a dead scope sends no request: {reqs:?}");
+        assert_eq!(agent.state(), TurnState::Interrupted);
     }
 }

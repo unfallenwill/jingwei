@@ -29,7 +29,7 @@
 
 use crate::agent::runner::run_agent;
 use crate::agent::Agent;
-use crate::cancel::CancelToken;
+use crate::cancel::CancelScope;
 use crate::config::Config;
 use crate::core::context::Context;
 use crate::core::ir::user_message;
@@ -51,13 +51,17 @@ use crate::ui::{Msg, Sev, Show};
 /// about it, or nothing to say. The boundary calls it before it closes
 /// the run, so the note lands inside the bracket. The `Result` is the
 /// run's own, unchanged: the caller still decides what an error means.
+///
+/// `scope` is the run's cancel scope: the run mints its leaf from it, so
+/// a cancel of the scope stops the run and everything under it — and a run
+/// that starts under an already-cancelled scope does no work.
 pub(crate) async fn run_task(
     task: &str,
     cfg: &Config,
     ctx: &mut Context,
     convo: &mut Convo,
     router: &ToolRouter,
-    token: &CancelToken,
+    scope: &CancelScope,
     sink: &dyn Show,
     on_error: &(dyn Fn(&crate::Error) -> Option<Msg> + Sync),
 ) -> crate::Result<()> {
@@ -68,7 +72,7 @@ pub(crate) async fn run_task(
         sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
     }
     let mut agent = Agent::main(task);
-    let res = run_agent(&mut agent, cfg, ctx, router, token, sink).await;
+    let res = run_agent(&mut agent, cfg, ctx, router, scope, sink).await;
     // the failure is said inside the run: a note after the run's end
     // would belong to nothing
     if let Err(e) = &res {
@@ -202,7 +206,7 @@ mod tests {
         block_on(async {
             let (router, hub) = router();
             let res = run_task(task, &cfg(format!("http://127.0.0.1:{port}"), false),
-                               ctx, convo, &router, &CancelToken::new(), sink, on_error).await;
+                               ctx, convo, &router, &CancelScope::new(), sink, on_error).await;
             hub.shutdown().await;
             res
         })

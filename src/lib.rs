@@ -27,7 +27,7 @@ mod workflow;
 pub mod ui;
 
 #[cfg(test)] mod test_util;
-use crate::cancel::CancelToken;
+use crate::cancel::CancelScope;
 use crate::config::{Args, Config, build_config};
 use crate::core::agents_md::AgentsMdContext;
 use crate::core::context::Context;
@@ -144,8 +144,8 @@ async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agent
     // it hands the task to the run and hands the result back, so the
     // exit code stays the run's own. It says nothing about a failure
     // itself: the error is the process's, and the binary paints it.
-    let token = CancelToken::new();
-    let res = run_task(&prompt, &cfg, &mut ctx, &mut convo, &router, &token, &sink, &|_| None).await;
+    let scope = CancelScope::new();
+    let res = run_task(&prompt, &cfg, &mut ctx, &mut convo, &router, &scope, &sink, &|_| None).await;
     hub.shutdown().await;
     res
 }

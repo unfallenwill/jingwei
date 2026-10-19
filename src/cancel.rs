@@ -108,7 +108,6 @@ impl CancelScope {
     /// missed nor let the leaf through. A `check the flag; … then push`
     /// that let go of the lock in between is the bug this shape exists
     /// to prevent.
-    #[allow(dead_code)] // the run mints its leaf from the scope; that lands with the scope
     pub(crate) fn token(&self) -> CancelToken {
         let token = CancelToken::new();
         let mut children = self.inner.children.lock().unwrap();

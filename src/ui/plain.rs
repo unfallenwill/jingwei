@@ -214,8 +214,8 @@ pub async fn plain_repl(
         // owns the begin, the saves, the end — and the note a failure
         // earns, said inside the run's bracket so it belongs to the
         // task it is about.
-        let token = crate::cancel::CancelToken::new();
-        let _ = crate::workflow::run_task(&line, cfg, &mut ctx, &mut convo, &router, &token, &sink, &ui::error_note).await;
+        let scope = crate::cancel::CancelScope::new();
+        let _ = crate::workflow::run_task(&line, cfg, &mut ctx, &mut convo, &router, &scope, &sink, &ui::error_note).await;
     }
     Ok(())
 }

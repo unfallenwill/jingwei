@@ -76,12 +76,16 @@ use update::{update as step, Action, Ev};
 
 type Backend = CrosstermBackend<io::Stdout>;
 
-/// The run in flight: its cancellation token and its coroutine. This is
+/// The run in flight: its cancel scope and its coroutine. This is
 /// the TUI's *handle* on a run, not the agent itself — the domain
 /// `Agent` lives in `crate::agent`, and this struct is only the
 /// frontend's handle on the task that drives it.
+///
+/// The handle holds the *scope*, not a bare token: the scope is the tree
+/// the run mints its leaf from, so the cancel key stops the run and
+/// everything under it.
 struct RunHandle {
-    token: Arc<crate::cancel::CancelToken>,
+    scope: crate::cancel::CancelScope,
     job: tokio::task::JoinHandle<()>,
 }
 
@@ -641,7 +645,7 @@ pub async fn run(cfg: Config, ctx: crate::core::context::Context, convo: Convo, 
     // already lives in the scrollback; the pane's rows are erased and the
     // cursor parks on the first of them for the shell's prompt.
     if let Some(a) = run.take() {
-        a.token.cancel(); // don't leave a coroutine carrying stones behind
+        a.scope.cancel(); // don't leave a coroutine carrying stones behind
         a.job.abort();
     }
     if overlay.take().is_some() {
@@ -936,7 +940,7 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
         Action::None => HandleOutcome::None,
         Action::Cancel => {
             if let Some(a) = run {
-                a.token.cancel();
+                a.scope.cancel();
             }
             HandleOutcome::Cancel
         }
@@ -964,8 +968,8 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
             let cfg = cfg.clone();
             let session = session.clone();
             let router = router.clone();
-            let token = Arc::new(crate::cancel::CancelToken::new());
-            let tok = token.clone();
+            let scope = crate::cancel::CancelScope::new();
+            let run_scope = scope.clone();
             let sink = sink.clone(); // one for the spawned task, one for the shell
             let job = tokio::spawn(async move {
                 // The session lock is held for the whole turn: the
@@ -978,9 +982,9 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
                 // out — it hands the task to the run, which owns the
                 // begin, the saves, the end, and the note a failure
                 // earns (inside the run's bracket, where it belongs).
-                let _ = run_task(&line, &cfg, ctx, convo, &router, &tok, &sink, &error_note).await;
+                let _ = run_task(&line, &cfg, ctx, convo, &router, &run_scope, &sink, &error_note).await;
             });
-            *run = Some(RunHandle { token, job });
+            *run = Some(RunHandle { scope, job });
             HandleOutcome::None
         }
     }
@@ -1781,7 +1785,7 @@ mod tests {
         assert!(matches!(got, Msg::TaskBegin(ref t) if t == "hello world"));
         // tidy up: cancel the running coroutine before the test ends
         if let Some(a) = run {
-            a.token.cancel();
+            a.scope.cancel();
             a.job.abort();
         }
     }
@@ -1802,17 +1806,20 @@ mod tests {
         // a pre-existing run slot, as if the first Submit had already
         // run and the spawned coroutine were still in flight
         let mut run: Option<RunHandle>;
-        let first_token = Arc::new(crate::cancel::CancelToken::new());
+        let first_scope = crate::cancel::CancelScope::new();
         let hub = crate::mcp::Hub::empty();
         let router = router(&hub);
         // tokio::test wraps us in a runtime; spawn the pre-existing run
         // slot inside this scope so its JoinHandle has a home.
         let first_job = tokio::spawn(async {});
-        run = Some(RunHandle { token: first_token.clone(), job: first_job });
+        run = Some(RunHandle { scope: first_scope.clone(), job: first_job });
         handle(Action::Submit("second task".into()), &cfg, &session, &mut run, &sink, &hub, &router);
-        // the original run is still there — same token, not replaced
+        // the original run is still there — the same scope, not replaced.
+        // The scope is the tree, and the tree has no pointer to compare:
+        // cancel through the run's own scope and ask the first one.
         assert!(run.is_some());
-        assert_eq!(Arc::as_ptr(&run.as_ref().unwrap().token), Arc::as_ptr(&first_token));
+        run.as_ref().unwrap().scope.cancel();
+        assert!(first_scope.is_cancelled(), "the run slot still holds the first scope");
         // and a warning landed in the sink, naming the cause
         let mut saw_warn = false;
         while let Ok(m) = rx.try_recv() {
@@ -1824,7 +1831,7 @@ mod tests {
         assert!(saw_warn, "the refused submit must surface a warning");
         // tidy up
         if let Some(a) = run {
-            a.token.cancel();
+            a.scope.cancel();
             a.job.abort();
         }
     }
@@ -1836,10 +1843,10 @@ mod tests {
         // an error note instead of letting the error fall silent
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
-        let token = Arc::new(crate::cancel::CancelToken::new());
+        let scope = crate::cancel::CancelScope::new();
         crate::test_util::block_on(async move {
             let handle = tokio::spawn(async { panic!("intentional") });
-            let a = RunHandle { token, job: handle };
+            let a = RunHandle { scope, job: handle };
             a.reap(&sink).await;
         });
         let got = rx.try_recv().expect("a note must be emitted on panic");
@@ -1850,10 +1857,10 @@ mod tests {
     fn run_handle_reap_is_silent_on_a_clean_join() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
-        let token = Arc::new(crate::cancel::CancelToken::new());
+        let scope = crate::cancel::CancelScope::new();
         crate::test_util::block_on(async move {
             let handle = tokio::spawn(async { /* fine */ });
-            let a = RunHandle { token, job: handle };
+            let a = RunHandle { scope, job: handle };
             a.reap(&sink).await;
         });
         assert!(rx.try_recv().is_err(), "no note on a clean join");
