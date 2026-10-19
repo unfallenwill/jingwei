@@ -14,6 +14,10 @@
 // the same value, so the fallback never fires and the ledger behaves
 // exactly as it always has.
 //
+// The check and the write are one critical section, and the bytes the check
+// compares are the bytes the write applies to: an edit approved against one
+// moment of a file is not applied to another. See `with_ledger`.
+//
 // It is deliberately *not* a read-before-edit gate. opencode removed theirs,
 // and the reasons hold here too: the gate burned a turn on every workflow
 // that read a file through bash, and it protected nothing — the edit still
@@ -52,40 +56,47 @@ impl Ledger {
         self.any.insert(key, fp);
     }
 
-    /// Has the file moved since *this agent* last saw it? `None` — never
-    /// seen, or not readable, so not ours to judge; `Some(error)` — the
-    /// bytes are not the bytes we read, and the message says what to do
-    /// about it.
+    /// The fingerprint a write is checked against: the agent's own view of
+    /// the file, or the process's, for an agent that has never touched it.
+    fn view(&self, agent: AgentId, key: &PathBuf) -> Option<u64> {
+        self.seen.get(&(agent, key.clone())).or_else(|| self.any.get(key)).copied()
+    }
+
+    /// Are these the bytes *this agent* last saw? `None` — never seen, so
+    /// not ours to judge; `Some(error)` — they are not the bytes we saw,
+    /// and the message says what to do about it.
     ///
-    /// The agent's own view wins. The process's view is the fallback, for
-    /// the writer that has never touched the file at all.
-    ///
-    /// The read happens here, and this method is called with the ledger
-    /// locked: the check compares the disk against a view, so the disk has
-    /// to be read at a moment when nobody else can be writing. A file read
-    /// of a few KB under a mutex is cheap; the alternative is a check that
-    /// is not a check.
+    /// The bytes are the ones the caller is about to write, so the check
+    /// approves exactly what the write applies to. The agent's own view
+    /// wins. The process's view is the fallback, for the writer that has
+    /// never touched the file at all.
+    pub(crate) fn stale_bytes(&self, agent: AgentId, p: &str, bytes: &[u8]) -> Option<String> {
+        let key = ledger_key(p);
+        let seen = self.view(agent, &key)?;
+        (fingerprint(bytes) != seen).then(|| refusal(p))
+    }
+
+    /// `stale_bytes`, against what is on the disk right now: the check for
+    /// a write of *new* content, where there is no buffer to compare. The
+    /// read happens under the lock, with the write that follows it.
     pub(crate) fn stale(&self, agent: AgentId, p: &str) -> Option<String> {
         let key = ledger_key(p);
-        let seen = self
-            .seen
-            .get(&(agent, key.clone()))
-            .or_else(|| self.any.get(&key))
-            .copied()?;
+        let seen = self.view(agent, &key)?;
         let now = fs::read(p).ok()?;
-        (fingerprint(&now) != seen).then(|| format!(
-            "error: {p} changed on disk since jingwei last read or wrote it — re-read it, then make \
-             the change again against what it actually says (writing over content you have not seen \
-             is how someone's uncommitted work disappears)"))
+        (fingerprint(&now) != seen).then(|| refusal(p))
     }
 }
 
-/// The ledger, locked.
-///
-/// The lock is the ledger's whole discipline: a check that compares the disk
-/// against a view has to read the disk at a moment when nobody else can be
-/// writing, so the check and the write that follows it belong in **one**
-/// critical section.
+/// The refusal, byte for byte. It is model-visible text, so it is written
+/// once here and pinned by a test: one shape, one message. It does not say
+/// "another agent" — the mover may be the user's editor.
+fn refusal(p: &str) -> String {
+    format!("error: {p} changed on disk since jingwei last read or wrote it — re-read it, then make \
+             the change again against what it actually says (writing over content you have not seen \
+             is how someone's uncommitted work disappears)")
+}
+
+/// The ledger, locked. The lock is the discipline; see [`with_ledger`].
 fn ledger() -> MutexGuard<'static, Ledger> {
     static LEDGER: OnceLock<Mutex<Ledger>> = OnceLock::new();
     LEDGER
@@ -96,9 +107,18 @@ fn ledger() -> MutexGuard<'static, Ledger> {
 
 /// Run `f` with the ledger locked.
 ///
-/// The check and the write that follows it belong in **one** call to this:
-/// that is what stops two agents from both passing the check and then both
-/// writing. The lock is not reentrant — never call `with_ledger` from inside
+/// The lock is the ledger's whole discipline, and it says one thing: **the
+/// check and the write that follows it belong in one call to this.** A check
+/// compares a file against a view of it; a write puts bytes on disk. Between
+/// the two there is a window, and a file that moves in that window is written
+/// over without anybody finding out. Holding the lock across both closes it:
+/// two agents cannot both pass the check and then both write.
+///
+/// The read belongs inside too, for the same reason — the bytes the check
+/// compares must be the bytes the write applies to. A file read of a few KB
+/// under a mutex is cheap; the alternative is a check that is not a check.
+///
+/// The lock is not reentrant — never call `with_ledger` from inside
 /// `with_ledger`.
 pub(crate) fn with_ledger<R>(f: impl FnOnce(&mut Ledger) -> R) -> R {
     let mut led = ledger();
@@ -387,5 +407,25 @@ mod tests {
         std::fs::write(&path, "second").unwrap();
         let expected = format!("error: {p} changed on disk since jingwei last read or wrote it — re-read it, then make the change again against what it actually says (writing over content you have not seen is how someone's uncommitted work disappears)");
         assert_eq!(with_ledger(|led| led.stale(a, p)), Some(expected));
+    }
+
+    /// The check is a comparison against the agent's view, and the bytes it
+    /// compares are the ones the caller is about to write. That is what
+    /// makes the edit path safe: the bytes the check approves are the bytes
+    /// the edit is applied to, not a second read of the same file.
+    #[test]
+    fn the_check_compares_the_bytes_the_write_applies_to() {
+        let _g = ledger_lock();
+        let dir = temp_dir("stale_bytes");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "first").unwrap();
+        let p = path.to_str().unwrap();
+        with_ledger(|led| led.note(AgentId::MAIN, p, b"first"));
+        with_ledger(|led| {
+            assert!(led.stale_bytes(AgentId::MAIN, p, b"first").is_none(),
+                "the bytes we saw are the bytes we write: the check approves them");
+            let msg = led.stale_bytes(AgentId::MAIN, p, b"second").unwrap();
+            assert!(msg.contains("changed on disk"), "other bytes are refused: {msg}");
+        });
     }
 }

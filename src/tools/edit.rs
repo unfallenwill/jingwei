@@ -83,21 +83,22 @@ pub(crate) fn edit_tool(i: &Value, agent: AgentId) -> String {
 /// that fails at pair 3 writes nothing at all and says which pair failed and
 /// why, so the model re-plans instead of discovering a half-applied file.
 ///
-/// The read stays outside the lock — a read is an observation, and a note
-/// that lands after somebody else's write is the safe direction. Everything
-/// after it is one critical section: the check, the resolution, the write and
-/// the note. The check has to come first, so a file that moved beats an
-/// ambiguous `old` in the message the model sees.
+/// The read is inside the critical section, because here the read is not an
+/// observation — it is the write's input. The bytes the check compares are
+/// the bytes the edit is applied to: read outside the lock and the two would
+/// be different moments of the same file, and an edit approved against one
+/// of them would be applied to the other. The check has to come first, so a
+/// file that moved beats an ambiguous `old` in the message the model sees.
 fn apply_edits(p: &str, edits: &[(String, String)], replace_all: bool, agent: AgentId) -> String {
-    let content = match std::fs::read_to_string(p) {
-        Ok(c) => c,
-        Err(e) => return format!("error: {e} (in {p})"),
-    };
     with_ledger(|led| {
+        let content = match std::fs::read_to_string(p) {
+            Ok(c) => c,
+            Err(e) => return format!("error: {e} (in {p})"),
+        };
         // The bytes just read are the ones the edit is written against — if they
         // are not the bytes we last saw, this file moved under us and the edit is
         // not ours to make.
-        if let Some(e) = led.stale(agent, p) { return e; }
+        if let Some(e) = led.stale_bytes(agent, p, content.as_bytes()) { return e; }
         let mut buffer = content;
         let mut marks: Vec<(usize, usize)> = Vec::new();
         let mut body = String::new();
