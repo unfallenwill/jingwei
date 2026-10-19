@@ -5,7 +5,7 @@
 //! unit-tested without a terminal.
 
 use super::model::{App, Completion, CompletionItem, CompletionKind, Mode, Row, Scroll, Task};
-use crate::ui::Msg;
+use crate::ui::{agent_tag, AgentId, AgentMsg, Msg, TurnState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::Duration;
 
@@ -50,6 +50,13 @@ pub fn update(app: &mut App, ev: Ev) -> Action {
 fn tick(app: &mut App, dt: Duration) -> Action {
     if let Some(t) = &mut app.status.task {
         t.elapsed += dt;
+    }
+    // every live agent keeps its own clock, on the same measured deltas
+    // the main's task clock runs on
+    for buf in app.agents.values_mut() {
+        if !buf.state.is_terminal() {
+            buf.elapsed += dt;
+        }
     }
     Action::None
 }
@@ -110,12 +117,40 @@ fn msg(app: &mut App, m: Msg) -> Action {
             app.flush_partial();
             app.fold_thought();
         }
-        // A background agent's event. The frontends' agent rows land in the
-        // next slice; until then a worker's events are dropped rather than mixed
-        // into the main agent's stream.
-        Msg::FromAgent { .. } => {}
+        // A background agent's event: it lands in the transcript, tagged
+        // with the agent's id.
+        Msg::FromAgent { id, event } => agent_event(app, id, *event),
     }
     Action::None
+}
+
+/// A background agent's event.
+///
+/// The main agent's stream is the live pane; a worker's is folded into
+/// the transcript with the agent's tag on every line. A worker's tool
+/// call is a complete event, so it lands the moment it arrives; its
+/// prose is buffered and lands when the agent ends, so two speakers'
+/// prose never interleaves in the transcript.
+fn agent_event(app: &mut App, id: AgentId, ev: AgentMsg) {
+    match ev {
+        // the start names the agent and nothing else: the label is for
+        // the completion line and the bar's chip
+        AgentMsg::Started { label } => {
+            let buf = app.agents.entry(id).or_default();
+            buf.label = label;
+            buf.state = TurnState::InProgress;
+        }
+        AgentMsg::Text(t) => app.push_agent_text(id, &t),
+        AgentMsg::Think(t) => app.push_agent_think(id, &t),
+        AgentMsg::ThinkEnd => app.fold_agent_thought(id),
+        AgentMsg::Tool { name, summary, output } => app.fold_agent_tool(id, &name, summary, output),
+        // the tag in front of the note; the note's own spacing is its own
+        AgentMsg::Note { sev, text } => {
+            let tag = agent_tag(id);
+            app.rows.push(Row::Note(sev, format!("{tag}{text}")));
+        }
+        AgentMsg::Finished { state, report } => app.finish_agent(id, state, report),
+    }
 }
 
 fn key(app: &mut App, k: KeyEvent) -> Action {
@@ -559,7 +594,7 @@ fn history(app: &mut App, d: i32) {
 mod tests {
     use super::*;
     use super::super::model::TICK;
-    use crate::ui::{AgentId, AgentMsg, Sev, Usage};
+    use crate::ui::{AgentId, AgentMsg, Sev, TurnState, Usage};
     use crossterm::event::KeyEventKind;
 
     fn key(code: KeyCode, mods: KeyModifiers) -> Ev {
@@ -869,17 +904,16 @@ mod tests {
     }
 
     #[test]
-    fn the_tui_drops_a_workers_events_without_touching_the_main_stream() {
-        // a worker's prose, tool call and note reach the TUI wrapped;
-        // until the frontends grow their agent rows, unwrapping them
-        // would mix two speakers into one transcript
+    fn a_workers_events_never_touch_the_main_stream() {
+        // a worker's prose, tool call and note reach the TUI wrapped. They
+        // land in the transcript, tagged — but they never touch the main
+        // agent's own stream, and never the session's accounting.
         let mut a = App::new();
         drive(&mut a, vec![
             Ev::Msg(Msg::TaskBegin("count files".into())),
             Ev::Msg(Msg::Usage(Usage { input: 10, output: 5, ..Usage::default() })),
             Ev::Msg(Msg::Text("the conversation's answer\n".into())),
         ]);
-        let rows = a.rows.len();
         let total = a.status.total;
         let pending = a.status.pending;
         let working = a.working();
@@ -891,12 +925,156 @@ mod tests {
                 name: "bash".into(), summary: "$ ls".into(), output: "a\n".into() }) }),
             Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Note {
                 sev: Sev::Err, text: " it failed ".into() }) }),
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Think("reasoning".into())) }),
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::ThinkEnd) }),
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Finished {
+                state: TurnState::Completed, report: "all done".into() }) }),
         ]);
-        assert_eq!(a.rows.len(), rows, "the worker's events add no rows: {:?}", a.rows);
         assert_eq!(a.status.total, total, "the session totals do not move");
         assert_eq!(a.status.pending, pending, "the pending reading is untouched");
         assert_eq!(a.working(), working, "no task opened and none closed");
         assert_eq!(a.partial, partial, "the worker's text never reaches the live row");
+        assert!(
+            a.rows.iter().any(|r| matches!(r, Row::Line(l) if l == &format!("[{id}] a worker spoke"))),
+            "the worker's prose lands tagged, when the agent ends: {:?}", a.rows
+        );
+    }
+
+    // ---- the background agents --------------------------------------------
+
+    #[test]
+    fn a_workers_tool_call_lands_with_its_tag() {
+        let mut a = App::new();
+        let id = AgentId::next();
+        drive(&mut a, vec![Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Tool {
+            name: "bash".into(), summary: "$ ls".into(), output: "a\nb\n".into(),
+        }) })]);
+        match a.rows.last() {
+            Some(Row::Tool { head, fold }) => {
+                assert_eq!(head, &format!("[{id}] [bash] $ ls"), "the head carries the tag");
+                assert_eq!(fold.body, "a\nb\n", "the tail is the tool's output, unchanged");
+            }
+            r => panic!("the tool call landed a row: {r:?}"),
+        }
+    }
+
+    #[test]
+    fn a_workers_text_lands_when_the_agent_ends() {
+        let mut a = App::new();
+        let id = AgentId::next();
+        drive(&mut a, vec![Ev::Msg(Msg::FromAgent {
+            id, event: Box::new(AgentMsg::Text("the worker's prose\n".into())),
+        })]);
+        assert!(a.rows.is_empty(), "no row while the text streams: {:?}", a.rows);
+        drive(&mut a, vec![Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Finished {
+            state: TurnState::Completed, report: String::new(),
+        }) })]);
+        assert!(
+            a.rows.iter().any(|r| matches!(r, Row::Line(l) if l == &format!("[{id}] the worker's prose"))),
+            "the prose lands tagged, when the agent ends: {:?}", a.rows
+        );
+    }
+
+    #[test]
+    fn a_workers_reasoning_folds_into_a_marker() {
+        let mut a = App::new();
+        let id = AgentId::next();
+        drive(&mut a, vec![
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Started { label: "build".into() }) }),
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Think("step one\nstep two".into())) }),
+            Ev::Tick(TICK * 3),
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::ThinkEnd) }),
+        ]);
+        match a.rows.last() {
+            Some(Row::Thought(f)) => {
+                assert_eq!(f.duration, Some(TICK * 3), "the worker's own clock measures it");
+                assert_eq!(f.tag, Some(format!("[{id}] ")), "the marker carries the tag");
+                assert_eq!(f.n, 1, "and the transcript's number");
+            }
+            r => panic!("the reasoning folded: {r:?}"),
+        }
+    }
+
+    #[test]
+    fn a_workers_note_lands_with_its_tag() {
+        let mut a = App::new();
+        let id = AgentId::next();
+        drive(&mut a, vec![Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Note {
+            sev: Sev::Warn, text: " watch out ".into(),
+        }) })]);
+        match a.rows.last() {
+            Some(Row::Note(Sev::Warn, text)) => {
+                assert_eq!(text, &format!("[{id}]  watch out "), "the tag in front of the note");
+            }
+            r => panic!("the note landed a row: {r:?}"),
+        }
+    }
+
+    #[test]
+    fn a_finished_worker_leaves_its_summary_and_its_report() {
+        let mut a = App::new();
+        let id = AgentId::next();
+        drive(&mut a, vec![
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Started { label: "build".into() }) }),
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Tool {
+                name: "bash".into(), summary: "$ ls".into(), output: "a\n".into(),
+            }) }),
+            Ev::Tick(TICK * 400), // 48s of the worker's own clock
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Finished {
+                state: TurnState::Completed, report: "found three files".into(),
+            }) }),
+        ]);
+        let lines: Vec<String> = a.rows.iter().filter_map(|r| match r {
+            Row::Line(l) => Some(l.clone()),
+            _ => None,
+        }).collect();
+        assert!(
+            lines.contains(&format!("[{id}] ✓ build · 48s · 1 tool")),
+            "the summary carries the label, the elapsed and the tool count: {lines:?}"
+        );
+        assert!(
+            lines.contains(&format!("[{id}] found three files")),
+            "the report's lines follow, tagged: {lines:?}"
+        );
+        assert!(
+            !a.rows.iter().any(|r| matches!(r, Row::Note(..))),
+            "the summary is a line of the transcript, not a note: {:?}", a.rows
+        );
+    }
+
+    #[test]
+    fn a_workers_folds_do_not_renumber_the_mains() {
+        let mut a = App::new();
+        let id = AgentId::next();
+        drive(&mut a, vec![
+            Ev::Msg(Msg::Think("the main's first thought".into())),
+            Ev::Msg(Msg::ThinkEnd),
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Think("the worker's thought".into())) }),
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::ThinkEnd) }),
+            Ev::Msg(Msg::Think("the main's second thought".into())),
+            Ev::Msg(Msg::ThinkEnd),
+        ]);
+        let nums: Vec<usize> = a.rows.iter().filter_map(|r| match r {
+            Row::Thought(f) => Some(f.n),
+            _ => None,
+        }).collect();
+        assert_eq!(nums, vec![1, 2, 3], "one shared sequence: {nums:?}");
+    }
+
+    #[test]
+    fn the_main_agent_is_not_in_the_agent_map() {
+        let mut a = App::new();
+        drive(&mut a, vec![
+            Ev::Msg(Msg::TaskBegin("count files".into())),
+            Ev::Msg(Msg::Text("the answer\n".into())),
+            Ev::Msg(Msg::Think("reasoning".into())),
+            Ev::Msg(Msg::ThinkEnd),
+            Ev::Msg(Msg::Tool { name: "bash".into(), summary: "$ ls".into(), output: "a\n".into() }),
+            Ev::Msg(Msg::Note { sev: Sev::Warn, text: " careful ".into() }),
+            Ev::Msg(Msg::Done),
+            Ev::Msg(Msg::TaskEnd),
+        ]);
+        assert!(a.agents.is_empty(), "the map holds workers only: {:?}", a.agents);
     }
 
     #[test]

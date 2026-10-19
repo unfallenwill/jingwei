@@ -4,7 +4,10 @@
 //! that a test can pin.
 
 use crate::agent::roster::Roster;
-use crate::ui::{Sev, Usage};
+use crate::core::ids::AgentId;
+use crate::core::turn::TurnState;
+use crate::ui::{agent_summary, agent_tag, Sev, Usage};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// The one heartbeat cadence; the task clock accumulates the *measured*
@@ -64,6 +67,10 @@ pub struct Fold {
     /// ticks that elapsed between the first delta and the fold. `None`
     /// when no task was running to keep time.
     pub duration: Option<Duration>,
+    /// The speaker's tag, when the block came from a background agent
+    /// (`[a1] `). `None` for the main agent's folds, and for a tool
+    /// fold — whose *head* carries the tag instead.
+    pub tag: Option<String>,
 }
 
 impl Fold {
@@ -206,6 +213,40 @@ impl Scroll {
     }
 }
 
+/// One background agent's live state, as the TUI sees it.
+///
+/// The main agent's own stream is the *live pane*: its buffers live in
+/// [`App::partial`] and [`App::think_buf`], where they have always
+/// lived. A worker's stream is not a pane — it is folded into the
+/// transcript as rows — so it gets a buffer of its own. Two different
+/// jobs, two different buffers; "why is the main not in the map?" is a
+/// fair question and this is the answer.
+#[derive(Clone, Debug, Default)]
+pub struct AgentBuf {
+    /// The label the fleet gave it ("build", "test").
+    pub label: String,
+    /// The task it was given.
+    ///
+    /// The port's `Started` event carries a label only, so nothing can
+    /// fill this yet — the fleet slice brings the task along with it.
+    #[allow(dead_code)]
+    pub task: String,
+    /// Where it stands.
+    pub state: TurnState,
+    /// Streamed text, not yet a row. It lands when the agent ends.
+    pub partial: String,
+    /// Reasoning arriving now, folded away when the block closes.
+    pub think: String,
+    /// The clock the open reasoning block is measured against.
+    pub think_start: Option<Duration>,
+    /// How many tools it has called.
+    pub tools: usize,
+    /// How long it has been running.
+    pub elapsed: Duration,
+    /// Its report, once it is done.
+    pub report: String,
+}
+
 /// The application state — the single source of truth the view renders.
 #[derive(Clone, Debug)]
 pub struct App {
@@ -238,6 +279,12 @@ pub struct App {
     /// spawned task, so the agent a run starts is registered while it
     /// runs and gone when it ends.
     pub roster: Roster,
+    /// The background agents this session has heard from, by id.
+    ///
+    /// The main agent is **not** in it: its own stream is the live
+    /// pane, and a worker's stream is folded into the transcript (see
+    /// [`AgentBuf`]).
+    pub agents: BTreeMap<AgentId, AgentBuf>,
 }
 
 /// One row in the slash-command menu. `insert` is what Tab writes into
@@ -313,6 +360,7 @@ impl App {
             scroll: Scroll::Tail,
             completion: None,
             roster: Roster::new(),
+            agents: BTreeMap::new(),
         }
     }
 
@@ -402,7 +450,7 @@ impl App {
             (Some(start), Some(t)) if t.elapsed >= start => Some(t.elapsed - start),
             _ => None,
         };
-        self.rows.push(Row::Thought(Fold { n, body, expanded: false, duration }));
+        self.rows.push(Row::Thought(Fold { n, body, expanded: false, duration, tag: None }));
     }
 
     /// Fold a tool call's output into a header row plus a tail.
@@ -410,7 +458,103 @@ impl App {
         self.flush_partial();
         self.fold_thought();
         let n = self.next_tool_n();
-        self.rows.push(Row::Tool { head, fold: Fold { n, body: output, expanded: false, duration: None } });
+        self.rows.push(Row::Tool {
+            head,
+            fold: Fold { n, body: output, expanded: false, duration: None, tag: None },
+        });
+    }
+
+    // ---- the background agents --------------------------------------------
+    //
+    // A worker's stream is folded into the transcript, not streamed into
+    // the live pane — so these five helpers are the worker's
+    // counterparts of `push_text` / `push_think` / `fold_thought` /
+    // `fold_tool`. The main's own fold machinery is untouched: the
+    // main's half-typed line stays the main's business.
+
+    /// A worker's text: buffered, and landed when the agent ends.
+    pub fn push_agent_text(&mut self, id: AgentId, t: &str) {
+        self.agents.entry(id).or_default().partial.push_str(t);
+    }
+
+    /// A worker's reasoning delta. The first delta of a block anchors
+    /// the *worker's* own clock — not the main's task clock: the two
+    /// are different lengths and the number has to mean something.
+    pub fn push_agent_think(&mut self, id: AgentId, t: &str) {
+        let buf = self.agents.entry(id).or_default();
+        if buf.think.is_empty() {
+            buf.think_start = Some(buf.elapsed);
+        }
+        buf.think.push_str(t);
+    }
+
+    /// A worker's reasoning block closed: fold it into a marker row.
+    pub fn fold_agent_thought(&mut self, id: AgentId) {
+        let folded = {
+            let Some(buf) = self.agents.get_mut(&id) else { return };
+            if buf.think.is_empty() {
+                return;
+            }
+            let body = std::mem::take(&mut buf.think);
+            let start = buf.think_start.take();
+            let duration = match (start, buf.elapsed) {
+                (Some(s), e) if e >= s => Some(e - s),
+                _ => None,
+            };
+            (body, duration)
+        };
+        // The numbering is the transcript's, not the agent's: a worker's
+        // fold takes its place in the one shared sequence, so no two
+        // rows of a transcript can both say "thought #1".
+        let n = self.next_thought_n();
+        let tag = agent_tag(id);
+        self.rows.push(Row::Thought(Fold {
+            n,
+            body: folded.0,
+            expanded: false,
+            duration: folded.1,
+            tag: Some(tag),
+        }));
+    }
+
+    /// A worker's tool call: a tagged head and the tool's tail.
+    pub fn fold_agent_tool(&mut self, id: AgentId, name: &str, summary: String, output: String) {
+        // the worker's open reasoning block closes before its tool row,
+        // exactly as the main's open block closes before the main's
+        self.fold_agent_thought(id);
+        self.agents.entry(id).or_default().tools += 1;
+        let n = self.next_tool_n();
+        let tag = agent_tag(id);
+        self.rows.push(Row::Tool {
+            head: format!("{tag}[{name}] {summary}"),
+            fold: Fold { n, body: output, expanded: false, duration: None, tag: None },
+        });
+    }
+
+    /// A worker ended: land its text, fold its reasoning, note it.
+    pub fn finish_agent(&mut self, id: AgentId, state: TurnState, report: String) {
+        let tag = agent_tag(id);
+        let (partial, label, tools, elapsed) = {
+            let buf = self.agents.entry(id).or_default();
+            buf.state = state;
+            buf.report = report;
+            (std::mem::take(&mut buf.partial), buf.label.clone(), buf.tools, buf.elapsed)
+        };
+        // the prose lands, one tagged row per line
+        for line in partial.lines() {
+            self.rows.push(Row::Line(format!("{tag}{line}")));
+        }
+        // the open reasoning block folds
+        self.fold_agent_thought(id);
+        // the completion line — a line of the transcript, like the main
+        // agent's own last line, and not a note
+        self.rows.push(Row::Line(agent_summary(id, state, &label, Some(elapsed), tools)));
+        // the report's lines, read back from the buffer
+        if let Some(buf) = self.agents.get(&id) {
+            for line in buf.report.lines() {
+                self.rows.push(Row::Line(format!("{tag}{line}")));
+            }
+        }
     }
 
     /// Ctrl-O's ratchet: open every fold that is still closed.

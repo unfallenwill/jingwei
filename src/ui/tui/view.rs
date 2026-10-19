@@ -20,7 +20,7 @@
 //! structure renders without color, exactly like the plain frontend.
 
 use super::model::{App, Completion, Fold, Mode, Row, THINK_TAIL_SHOWN};
-use crate::ui::{color_on, disp_width, elapsed_str, prompt_w, thought_folded, truncate_cols, wrap_cols, Usage, ERR_BG, FOLD_GUTTER, PROMPT_GUTTER, PROMPT_HEAD, WARN_BG};
+use crate::ui::{color_on, disp_width, elapsed_str, prompt_w, state_glyph, thought_folded, truncate_cols, wrap_cols, Usage, ERR_BG, FOLD_GUTTER, PROMPT_GUTTER, PROMPT_HEAD, WARN_BG};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -28,6 +28,10 @@ use ratatui::text::{Line, Span};
 /// Small on purpose: the folded REPL shows a preview, Ctrl-O (or the plain
 /// log's 20-line echo) exists to see the rest.
 pub const TOOL_TAIL_SHOWN: usize = 3;
+
+/// How many agent chips the bar shows before the rest collapse into a
+/// count. Small on purpose: the bar is a ledger, not an agent table.
+pub const AGENT_CHIPS: usize = 4;
 
 // ---- the status bar's text (moved out of main.rs: view vocabulary, all of it)
 
@@ -95,10 +99,39 @@ fn bar_segs(app: &App) -> Vec<Seg> {
     if i.context_limit > 0 && st.turn.context_in() > 0 {
         right.push(Seg { content: format!("ctx {}/{}", humanize(st.turn.context_in()), humanize(i.context_limit)), pinned: false });
     }
+    // The live agents, after the ledger's readings and before the pinned
+    // hint. The bar sheds from the left, so a segment at the end
+    // survives the longest: "is my worker still running?" outlasts the
+    // model name, which the banner already said.
+    let chips = agent_chips(app);
+    if !chips.is_empty() {
+        right.push(Seg { content: chips, pinned: false });
+    }
     if app.mode == Mode::Browse {
         right.push(Seg { content: "browse: ↑↓ PgUp/PgDn g/G · Ctrl-O returns".into(), pinned: true });
     }
     right
+}
+
+/// The live agents' chips: one per agent that has not finished — the id
+/// and the state glyph, `a1▸ a2▸`. A finished agent leaves the bar (its
+/// report is in the transcript), and past [`AGENT_CHIPS`] chips the rest
+/// collapse into a count, so the bar cannot grow without bound.
+fn agent_chips(app: &App) -> String {
+    let live: Vec<String> = app
+        .agents
+        .iter()
+        .filter(|(_, buf)| !buf.state.is_terminal())
+        .map(|(id, buf)| format!("{id}{}", state_glyph(buf.state)))
+        .collect();
+    if live.is_empty() {
+        return String::new();
+    }
+    if live.len() <= AGENT_CHIPS {
+        live.join(" ")
+    } else {
+        format!("{} +{}", live[..AGENT_CHIPS].join(" "), live.len() - AGENT_CHIPS)
+    }
 }
 
 /// The inline pane: the only part of the primary screen jingwei draws.
@@ -453,6 +486,9 @@ fn task_spans(first: bool) -> (Span<'static>, Span<'static>) {
 /// body hangs from the shared fold gutter and leans italic: reasoning is
 /// the model's asides, not the answer.
 fn thought_lines(f: &Fold, w: usize, lay: Lay, out: &mut Vec<Line<'static>>) {
+    // a background agent's fold carries its tag; the main's carries none,
+    // and its marker is byte-for-byte what it always was
+    let tag = f.tag.as_deref().unwrap_or("");
     if f.expanded {
         let n = f.lines();
         let meta = format!(" · {n} line{}", if n == 1 { "" } else { "s" });
@@ -460,9 +496,10 @@ fn thought_lines(f: &Fold, w: usize, lay: Lay, out: &mut Vec<Line<'static>>) {
             Some(d) => format!("{meta} · {}", elapsed_str(d)),
             None => meta,
         };
-        let title_w = disp_width(&format!("▾ thought #{}", f.n));
+        let title = format!("{tag}▾ thought #{}", f.n);
+        let title_w = disp_width(&title);
         out.push(Line::from(vec![
-            Span::styled(truncate_cols(&format!("▾ thought #{}", f.n), w), head_style()),
+            Span::styled(truncate_cols(&title, w), head_style()),
             Span::styled(truncate_cols(&meta, w.saturating_sub(title_w)), dim()),
         ]));
         for l in f.body.lines() {
@@ -472,7 +509,7 @@ fn thought_lines(f: &Fold, w: usize, lay: Lay, out: &mut Vec<Line<'static>>) {
         let mut all = f.body.lines();
         let first = all.next().unwrap_or("");
         let marker = thought_folded(f.n, first, all.count());
-        out.push(Line::from(Span::styled(truncate_cols(&marker, w), dim())));
+        out.push(Line::from(Span::styled(truncate_cols(&format!("{tag}{marker}"), w), dim())));
     }
 }
 
@@ -618,7 +655,7 @@ fn note_style(bg: (u8, u8, u8), err: bool) -> Style {
 #[cfg(test)]
 mod tests {
     use super::super::model::{App, CompletionItem, CompletionKind};
-    use crate::ui::Usage;
+    use crate::ui::{AgentId, AgentMsg, TurnState, Usage};
     use super::super::update::{set_completion, dismiss_completion, update, Ev, Action};
     use super::*;
     use crate::ui::Msg;
@@ -785,6 +822,66 @@ mod tests {
         // pinned: it survives widths that shed the whole ledger before it
         let narrow = bar_text(&a, 48);
         assert!(narrow.contains("Ctrl-O returns"), "{narrow}");
+    }
+
+    // ---- the live agents on the bar ----
+
+    /// A worker that has started and is still running.
+    fn started(id: AgentId) -> Ev {
+        Ev::Msg(Msg::FromAgent {
+            id,
+            event: Box::new(AgentMsg::Started { label: "build".into() }),
+        })
+    }
+
+    #[test]
+    fn the_bar_shows_the_live_agents() {
+        let mut a = App::new();
+        let id = AgentId::next();
+        update(&mut a, started(id));
+        let bar = bar_text(&a, BAR_W);
+        assert!(bar.contains(&format!("{id}▸")), "the chip carries the id and the state glyph: {bar}");
+        // a finished agent leaves the bar — its report is in the transcript
+        update(&mut a, Ev::Msg(Msg::FromAgent {
+            id,
+            event: Box::new(AgentMsg::Finished {
+                state: TurnState::Completed,
+                report: "done".into(),
+            }),
+        }));
+        let bar = bar_text(&a, BAR_W);
+        assert!(!bar.contains(&id.to_string()), "a finished agent leaves the bar: {bar}");
+    }
+
+    #[test]
+    fn the_bar_collapses_many_agents() {
+        let mut a = App::new();
+        let ids: Vec<AgentId> = (0..5).map(|_| AgentId::next()).collect();
+        for id in &ids {
+            update(&mut a, started(*id));
+        }
+        let bar = bar_text(&a, BAR_W);
+        let chips: Vec<String> = ids.iter().map(|i| format!("{i}▸")).collect();
+        assert!(
+            bar.contains(&format!("{} +1", chips[..4].join(" "))),
+            "four chips, and the rest counted: {bar}"
+        );
+    }
+
+    #[test]
+    fn the_chips_are_shed_last() {
+        let mut a = App::new();
+        informed(&mut a);
+        let id = AgentId::next();
+        update(&mut a, started(id));
+        let chip = format!("{id}▸");
+        let wide = bar_text(&a, 120);
+        assert!(wide.contains("MiniMax-M3") && wide.contains(&chip), "{wide}");
+        // narrower: the model name sheds first — the banner already said
+        // it — while the chips, the last question a human asks, survive
+        let narrow = bar_text(&a, 25);
+        assert!(!narrow.contains("MiniMax-M3"), "the model sheds first: {narrow}");
+        assert!(narrow.contains(&chip), "the chips outlast it: {narrow}");
     }
 
     // ---- the transcript ----
