@@ -187,13 +187,14 @@ fn ask_secret_api_key(output: &mut dyn Write, input: &mut dyn BufRead, prompt: &
 
 #[cfg(all(unix, not(test)))]
 unsafe fn set_echo(fd: std::os::unix::io::RawFd, on: bool) -> std::io::Result<()> {
-    // The libc crate (already a unix dependency for mcp's kill_on_drop)
-    // owns the per-platform termios layout. The hand-rolled struct this
-    // replaces was 60 bytes where macOS's kernel writes 72 (tcflag_t is
-    // u64 there, c_cc is [u8; 20]) — tcgetattr ran 12 bytes past the end
-    // of the object, so every hidden-key prompt either scrambled the
-    // terminal settings or smashed the stack outright: `jingwei login`
-    // segfaulted right after the api key was read.
+    // The libc crate's `termios` binding is why `libc` is a dependency at
+    // all: it owns the per-platform layout. (The MCP stdio transport's
+    // `kill_on_drop` is tokio's, and needs no dependency.) The hand-rolled
+    // struct this replaces was 60 bytes where macOS's kernel writes 72
+    // (tcflag_t is u64 there, c_cc is [u8; 20]) — tcgetattr ran 12 bytes
+    // past the end of the object, so every hidden-key prompt either
+    // scrambled the terminal settings or smashed the stack outright:
+    // `jingwei login` segfaulted right after the api key was read.
     let mut t: libc::termios = std::mem::zeroed();
     if libc::tcgetattr(fd, &mut t) != 0 { return Err(std::io::Error::last_os_error()); }
     if on { t.c_lflag |= libc::ECHO } else { t.c_lflag &= !libc::ECHO }
