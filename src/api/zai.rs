@@ -111,7 +111,7 @@ mod tests {
 
         let mut c = cfg("https://x".into(), true);
         c.protocol = Protocol::ZAI;
-        let cx = crate::core::context::Context::new(&md);
+        let cx = crate::core::context::Context::new(&md, crate::config::DEFAULT_CONTEXT_SIZE);
         let msgs = vec![crate::core::ir::Message::User("task".into())];
         let b = super::body(&c, &cx, &msgs, false);
         let system = b["messages"][0]["content"].as_str().unwrap();

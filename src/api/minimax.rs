@@ -211,7 +211,7 @@ mod tests {
 
         let mut c = cfg("https://x".into(), true);
         c.cache = crate::api::CacheMode::Active; // exercise the array-with-cache branch
-        let cx = crate::core::context::Context::new(&md);
+        let cx = crate::core::context::Context::new(&md, crate::config::DEFAULT_CONTEXT_SIZE);
         let b = super::body(&c, &cx, &[], false);
         let arr = b["system"].as_array().expect("active cache ⇒ array of blocks");
         assert_eq!(arr.len(), 2,
@@ -249,7 +249,7 @@ mod tests {
 
         let mut c = cfg("https://x".into(), true);
         c.cache = crate::api::CacheMode::Active;
-        let cx = crate::core::context::Context::new(&md);
+        let cx = crate::core::context::Context::new(&md, crate::config::DEFAULT_CONTEXT_SIZE);
         let b = super::body(&c, &cx, &[], false);
         let arr = b["system"].as_array().expect("active cache ⇒ array of blocks");
         assert_eq!(arr.len(), 1,

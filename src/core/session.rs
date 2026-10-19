@@ -97,27 +97,32 @@ pub fn project_dir_of(cwd: &str) -> Option<PathBuf> {
 
 // ---- the conversation handle ----------------------------------------------
 
-/// The conversation a process runs on: the history the agent core borrows,
-/// plus the session that remembers it. The bridge is one call,
+/// The conversation a process runs on: the session that remembers it.
+///
+/// The transcript itself is *not* here — the agent core owns it, and
+/// keeps it in its [`crate::core::context::Context`]. What the Convo
+/// holds is the file behind it. The bridge is one call,
 /// [`Convo::persist`], made at run boundaries only — the file-never-ends-
 /// mid-run invariant is enforced by *who calls when*, not by either side
 /// checking (see the module docs).
+///
+/// The history is handed to [`Convo::persist`] rather than kept, so the
+/// two can never drift apart: there is one copy, and the file is a
+/// projection of it.
 pub struct Convo {
-    /// The internal history — the agent core's own shape, borrowed as `&mut`.
-    pub history: Vec<Message>,
     session: Option<Session>,
 }
 
 impl Convo {
     /// A conversation that lives in memory only (a one-shot run).
     pub fn ephemeral() -> Self {
-        Self { history: vec![], session: None }
+        Self { session: None }
     }
 
-    /// A conversation persisted to `session` — fresh, or resumed with its
-    /// history loaded from the file.
-    pub fn persistent(session: Session, history: Vec<Message>) -> Self {
-        Self { history, session: Some(session) }
+    /// A conversation persisted to `session` — fresh, or resumed: the
+    /// transcript it continues is the caller's, loaded from the file.
+    pub fn persistent(session: Session) -> Self {
+        Self { session: Some(session) }
     }
 
     /// Land everything not yet on disk. Run boundaries only. A failure
@@ -126,9 +131,9 @@ impl Convo {
     /// error (banner, log line, silent retry) and how. Returning a Result
     /// keeps session from importing display (which is a presentation
     /// type) and lets each frontend translate the io::Error its own way.
-    pub fn persist(&mut self) -> std::io::Result<()> {
+    pub fn persist(&mut self, history: &[Message]) -> std::io::Result<()> {
         let Some(s) = self.session.as_mut() else { return Ok(()); };
-        s.sync(&self.history)
+        s.sync(history)
     }
 }
 
@@ -923,9 +928,11 @@ mod tests {
     #[test]
     fn ephemeral_convo_persists_nothing_and_never_panics() {
         let mut c = Convo::ephemeral();
-        c.history.push(crate::core::ir::user_message("hi"));
-        c.persist().unwrap(); // a quiet no-op — one-shots leave no session behind
-        assert_eq!(c.history.len(), 1);
+        // The transcript is the caller's now — the Convo borrows it for
+        // the write and keeps no copy of its own.
+        let history = vec![crate::core::ir::user_message("hi")];
+        c.persist(&history).unwrap(); // a quiet no-op — one-shots leave no session behind
+        assert_eq!(history.len(), 1);
     }
 
     #[test]

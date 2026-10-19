@@ -88,7 +88,7 @@ pub(crate) fn cfg(base: String, streaming: bool) -> crate::config::Config {
 #[cfg(test)]
 pub(crate) fn ctx() -> crate::core::context::Context {
     let md = crate::core::agents_md::AgentsMdContext::empty(&std::path::PathBuf::from("."));
-    crate::core::context::Context::new(&md)
+    crate::core::context::Context::new(&md, crate::config::DEFAULT_CONTEXT_SIZE)
 }
 
 /// Serve one HTTP response on a fresh port: `response` as JSON (status 200)

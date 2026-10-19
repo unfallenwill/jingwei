@@ -2,8 +2,9 @@
 //! it down a wire. This module owns the parts of the prompt the model sees
 //! but the agent core doesn't think about — system text (just `SYSTEM`),
 //! the active reminder list (every non-static system-side instruction:
-//! AGENTS.md today, runtime context and compaction anchors tomorrow), and
-//! the trim policy that keeps the history inside the configured budget.
+//! AGENTS.md today, runtime context and compaction anchors tomorrow), the
+//! tool surface, the transcript the model is having, and the trim policy
+//! that keeps that transcript inside the configured budget.
 //!
 //! Why this is its own module: before, the same work was scattered across
 //! three places — `agents_md::system_prompt_extras` (now retired), the
@@ -13,6 +14,16 @@
 //! contracts, no name. Here the work has one home and one name
 //! (`Context`); vendors consume what the agent loop has already assembled
 //! and never reach into AGENTS.md or the tool registry themselves.
+//!
+//! ## The Context owns the transcript
+//!
+//! One Context is one agent's model-visible state, and it holds that
+//! agent's messages. That is what makes the trim budget *per agent*: two
+//! contexts cannot trim each other's messages, because neither can reach
+//! the other's transcript. The transcript used to live in the session
+//! handle, which meant the agent borrowed it as a separate `&mut` and
+//! the budget was a number the caller passed alongside — two things that
+//! could drift apart. Now there is one owner.
 //!
 //! ## Architectural room for v2
 //!
@@ -50,11 +61,11 @@ pub(crate) const SYSTEM: &str = "You are jingwei (精卫), a coding agent with t
     When asked your name, say you are jingwei (精卫). \
     When finished, reply with a concise 1-3 sentence summary of what you did.";
 
-/// The per-turn context the model sees. Vendors consume it; the agent
-/// loop mutates `history` and asks `refresh()` to update the parts that
-/// can change between requests (tool list — and, in v2, the reminder
-/// list after a runtime injection).
-#[derive(Clone)]
+/// One agent's model-visible state: the prompt, the nudges, the tool
+/// surface, the transcript, and the budget that trims the transcript.
+///
+/// The Context is the only owner of a transcript. Two agents therefore
+/// cannot trim each other's messages, and the trim budget is per agent.
 pub(crate) struct Context {
     /// The static system prompt — exactly `SYSTEM`, nothing else.
     /// Vendors send this as the first system block on every wire. It is
@@ -75,6 +86,17 @@ pub(crate) struct Context {
     /// set by the agent loop from the router, one turn at a time — the
     /// providers own it, and the context only carries it.
     pub(crate) tools: Vec<Value>,
+    /// The transcript — the conversation this agent is having. The
+    /// Context is its only owner: the agent loop appends to it, the
+    /// vendors read it, and the trim policy shrinks it. Private, so
+    /// that every change to it goes through the methods below — the
+    /// pairing invariant the trim policy maintains stays one step away
+    /// from being broken.
+    history: Vec<Message>,
+    /// The trim budget: the token estimate the transcript must fit. It
+    /// comes from `--context-size`, and it is this agent's own — two
+    /// contexts trim independently.
+    budget: u64,
 }
 
 impl Context {
@@ -85,7 +107,10 @@ impl Context {
     /// schemas come from the tool providers, and the agent loop sets them
     /// per turn — a context that has never seen a router must not show
     /// the model a tool list of its own.
-    pub fn new(agents_md: &AgentsMdContext) -> Self {
+    ///
+    /// `budget` is this agent's trim budget in tokens — the `--context-size`
+    /// the configuration resolved to.
+    pub fn new(agents_md: &AgentsMdContext, budget: u64) -> Self {
         let mut reminders = Vec::new();
         if let Some(path) = agents_md.found_path.as_ref() {
             if !agents_md.content.is_empty() {
@@ -133,6 +158,8 @@ impl Context {
             system_text: SYSTEM.to_string(),
             reminders,
             tools: Vec::new(),
+            history: Vec::new(),
+            budget,
         }
     }
 
@@ -144,6 +171,42 @@ impl Context {
     pub(crate) fn set_tools(&mut self, tools: Vec<Value>) {
         self.tools = tools;
     }
+
+    /// The transcript, as the model will see it.
+    pub(crate) fn history(&self) -> &[Message] {
+        &self.history
+    }
+
+    /// The transcript, to be appended to. The agent loop owns the
+    /// appends; a resumed session seeds it once at start-up, and
+    /// `clear_history` empties it when a new session begins.
+    pub(crate) fn history_mut(&mut self) -> &mut Vec<Message> {
+        &mut self.history
+    }
+
+    /// Append one message to the transcript.
+    pub(crate) fn push(&mut self, m: Message) {
+        self.history.push(m);
+    }
+
+    /// Drop the transcript. A new session starts empty — the old
+    /// conversation belongs to the old session's file, and carrying it
+    /// into a new one would put one model's answers in another's context.
+    pub(crate) fn clear_history(&mut self) {
+        self.history.clear();
+    }
+
+    /// Shrink the transcript until it fits the budget, trimming the oldest
+    /// tool_result first. Returns whether anything was trimmed.
+    ///
+    /// The policy is unchanged from the free function this replaced: a tool
+    /// result longer than 200 characters is truncated in place, and only
+    /// when nothing is left to truncate is the oldest result dropped
+    /// together with its tool_use, the thinking beside it, and any message
+    /// left empty.
+    pub(crate) fn fit(&mut self) -> bool {
+        fit_context(&mut self.history, self.budget)
+    }
 }
 
 // ---- history trim ----------------------------------------------------------
@@ -151,10 +214,10 @@ impl Context {
 /// Rough token estimate (bytes/3 — conservative for CJK-heavy content).
 /// Counts the serialized history alone; system prompt and tool schemas
 /// are part of the request yet sit outside the budget the `--context-size`
-/// knob controls. Vendors stop at `cfg.context_size` history tokens; the
-/// system + tools layers are assumed to fit their own budgets (they're
+/// knob controls. Vendors stop at the budget's worth of history tokens;
+/// the system + tools layers are assumed to fit their own budgets (they're
 /// static and small in practice).
-pub(crate) fn est_tokens(history: &[Message]) -> u64 {
+fn est_tokens(history: &[Message]) -> u64 {
     serde_json::to_string(&history_value(history)).map_or(0, |s| (s.len() / 3) as u64)
 }
 
@@ -163,7 +226,7 @@ pub(crate) fn est_tokens(history: &[Message]) -> u64 {
 /// in-place cut touches only the result's text, and a minimal result leaves
 /// together with its paired tool_use (an orphaned tool_use is a 400 on the
 /// next request), along with any message left holding no blocks.
-pub(crate) fn fit_context(history: &mut Vec<Message>, limit: u64) -> bool {
+fn fit_context(history: &mut Vec<Message>, limit: u64) -> bool {
     let mut changed = false;
     while est_tokens(history) > limit {
         let Some((mi, bi)) = oldest_tool_result(history) else { break };
@@ -224,6 +287,10 @@ mod tests {
     use crate::test_util::temp_dir;
     use serde_json::json;
 
+    /// The trim budget the context tests run with: big enough that the
+    /// history fits unless a test says otherwise.
+    const BUDGET: u64 = 1_000_000;
+
     // JSON fixtures + serializing helpers shared by the trim tests below.
     // `hv` builds a typed history from JSON literals (the wire shape the
     // model sees); `hist` serializes a typed history back to JSON so the
@@ -267,7 +334,7 @@ mod tests {
         // existed, and `agents_md.found_path` is None
         let dir = temp_dir("ctx_none");
         let md = AgentsMdContext::load(&dir);
-        let ctx = Context::new(&md);
+        let ctx = Context::new(&md, BUDGET);
         assert_eq!(ctx.system_text, SYSTEM);
         assert!(md.found_path.is_none());
         assert!(ctx.reminders.is_empty(),
@@ -282,7 +349,7 @@ mod tests {
         let dir = temp_dir("ctx_with_md");
         std::fs::write(dir.join("AGENTS.md"), "use rustfmt").unwrap();
         let md = AgentsMdContext::load(&dir);
-        let ctx = Context::new(&md);
+        let ctx = Context::new(&md, BUDGET);
 
         // system_text is just SYSTEM — AGENTS.md does NOT leak in here
         assert!(ctx.system_text.contains(SYSTEM));
@@ -316,7 +383,7 @@ mod tests {
         let dir = temp_dir("ctx_empty_md");
         std::fs::write(dir.join("AGENTS.md"), "").unwrap();
         let md = AgentsMdContext::load(&dir);
-        let ctx = Context::new(&md);
+        let ctx = Context::new(&md, BUDGET);
         assert!(ctx.reminders.is_empty(),
             "an AGENTS.md with no body produces no reminder; only `system_text` is sent");
     }
@@ -328,7 +395,7 @@ mod tests {
         let dir = temp_dir("ctx_pure");
         std::fs::write(dir.join("AGENTS.md"), "use rustfmt").unwrap();
         let md = AgentsMdContext::load(&dir);
-        let ctx = Context::new(&md);
+        let ctx = Context::new(&md, BUDGET);
         assert_eq!(ctx.system_text, SYSTEM,
             "system_text is the bare SYSTEM constant; all AGENTS.md content rides in reminders");
     }
@@ -354,7 +421,7 @@ mod tests {
         std::fs::write(sibling.join("AGENTS.md"), "from sibling").unwrap();
 
         let md = AgentsMdContext::load(&workspace);
-        let ctx = Context::new(&md);
+        let ctx = Context::new(&md, BUDGET);
 
         // closest walks up from deeper; finds sub/AGENTS.md first
         assert_eq!(md.found_path, Some(sub.join("AGENTS.md")));
@@ -399,7 +466,7 @@ mod tests {
         // the same as before nested enumeration shipped.
         let dir = temp_dir("ctx_no_nested");
         std::fs::write(dir.join("AGENTS.md"), "from root").unwrap();
-        let ctx = Context::new(&AgentsMdContext::load(&dir));
+        let ctx = Context::new(&AgentsMdContext::load(&dir), BUDGET);
         assert_eq!(ctx.reminders.len(), 1,
             "no nested paths ⇒ no index reminder, only the closest");
         assert!(matches!(ctx.reminders[0].id, ReminderId::AgentsMdClosest { .. }));
@@ -412,7 +479,7 @@ mod tests {
         // router composed. The list is taken as it comes — the order and
         // the bytes are a cache contract, so nothing here sorts or
         // rewrites it.
-        let mut ctx = Context::new(&AgentsMdContext::empty(&std::path::PathBuf::from(".")));
+        let mut ctx = Context::new(&AgentsMdContext::empty(&std::path::PathBuf::from(".")), BUDGET);
         assert!(ctx.tools.is_empty(),
             "a context that has never seen a router shows no tools");
         ctx.set_tools(vec![json!({"name": "b"}), json!({"name": "a"})]);
@@ -422,6 +489,69 @@ mod tests {
         ctx.set_tools(vec![json!({"name": "c"})]);
         let names: Vec<&str> = ctx.tools.iter().filter_map(|v| v["name"].as_str()).collect();
         assert_eq!(names, vec!["c"]);
+    }
+
+    // ---- the transcript ---------------------------------------------------
+
+    /// A context with no AGENTS.md and the given trim budget.
+    fn bare(budget: u64) -> Context {
+        Context::new(&AgentsMdContext::empty(&std::path::PathBuf::from(".")), budget)
+    }
+
+    #[test]
+    fn the_context_owns_the_transcript() {
+        // The transcript lives in the context: push, read, and clear all
+        // go through it, and nothing else keeps a copy. One owner means
+        // the trim policy, the wire, and the session file all read the
+        // same messages.
+        let mut ctx = bare(BUDGET);
+        assert!(ctx.history().is_empty(), "a fresh context has no transcript");
+        ctx.push(Message::User("go".into()));
+        ctx.push(Message::Assistant(vec![Block::Text("ok".into())]));
+        assert_eq!(ctx.history().len(), 2);
+        let j = hist(ctx.history());
+        assert_eq!(j[0]["role"], json!("user"));
+        assert_eq!(j[1]["content"][0]["text"], json!("ok"));
+        // a new session starts empty
+        ctx.clear_history();
+        assert!(ctx.history().is_empty());
+    }
+
+    #[test]
+    fn a_resumed_transcript_is_seeded_into_the_context() {
+        // The session file's messages are the context's transcript: the
+        // caller hands them over once at start-up, and the context keeps
+        // them — the file and the wire then speak the same thing.
+        let resumed = hv(vec![json!({"role": "user", "content": "earlier task"})]);
+        let mut ctx = bare(BUDGET);
+        ctx.history_mut().extend(resumed);
+        assert_eq!(ctx.history().len(), 1);
+        assert_eq!(hist(ctx.history())[0]["content"], json!("earlier task"));
+    }
+
+    #[test]
+    fn fit_trims_to_the_contexts_own_budget() {
+        // The budget is the context's own: `fit` shrinks the transcript
+        // until the estimate fits it, and says whether it had to. A
+        // generous budget leaves the transcript alone.
+        let big = "x".repeat(10_000);
+        let mut ctx = bare(500);
+        for m in hv(vec![
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]}),
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": big}]}),
+        ]) {
+            ctx.push(m);
+        }
+        assert!(ctx.fit(), "the transcript was over the budget, so it was trimmed");
+        let j = hist(ctx.history());
+        assert!(j[2]["content"][0]["content"].as_str().unwrap().contains("trimmed"));
+        assert_eq!(j[1]["content"][0]["id"], j[2]["content"][0]["tool_use_id"],
+            "the tool_use keeps its tool_result through the trim");
+        // and a context with room does not trim
+        let mut roomy = bare(BUDGET);
+        roomy.push(Message::User("hi".into()));
+        assert!(!roomy.fit());
     }
 
     // ---- est_tokens --------------------------------------------------------

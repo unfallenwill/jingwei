@@ -578,7 +578,7 @@ mod tests {
         let dir = crate::test_util::temp_dir("chat_sys_compose");
         std::fs::write(dir.join("AGENTS.md"), "x").unwrap();
         let md = crate::core::agents_md::AgentsMdContext::load(&dir);
-        let cx = crate::core::context::Context::new(&md);
+        let cx = crate::core::context::Context::new(&md, crate::config::DEFAULT_CONTEXT_SIZE);
         let s = chat_system_text(&cx);
         assert!(s.starts_with(crate::core::context::SYSTEM),
             "system_text comes first");

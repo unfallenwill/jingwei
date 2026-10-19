@@ -397,12 +397,21 @@ fn needs_paint(
     }
 }
 
+/// What the TUI carries between turns: the model-visible context — which
+/// owns the transcript — and the session file behind it. One lock for
+/// both, so the transcript and the file can never disagree, and so the
+/// spawned agent task can own the pair for the length of a turn.
+struct SessionState {
+    ctx: crate::core::context::Context,
+    convo: Convo,
+}
+
 /// Open the TUI: terminal setup, the event loop, guaranteed restore.
 /// `convo` is the conversation to run on; `hub` is the MCP hub: a clone
 /// the TUI shares with the agent loop, and uses itself for `/mcp`
 /// slash commands while idle. `router` is the tool router every tool
 /// call goes through.
-pub async fn run(cfg: Config, mut ctx: crate::core::context::Context, convo: Convo, banners: Vec<String>, hub: Hub, router: std::sync::Arc<ToolRouter>) -> crate::Result<()> {
+pub async fn run(cfg: Config, ctx: crate::core::context::Context, convo: Convo, banners: Vec<String>, hub: Hub, router: std::sync::Arc<ToolRouter>) -> crate::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sink = ChannelSink::new(tx);
     sink.show(Msg::Banner(format!(
@@ -428,11 +437,11 @@ pub async fn run(cfg: Config, mut ctx: crate::core::context::Context, convo: Con
     };
 
     let mut cfg = cfg;
-    // convo is replaceable — `/model` swaps in a fresh Convo without
-    // disturbing the running event loop. Each replacement wraps a new
-    // AsyncMutex; the previous one is dropped with its lock held at
-    // most until any in-flight agent coroutine finishes.
-    let mut convo = Arc::new(AsyncMutex::new(convo));
+    // The session state: the context (which owns the transcript) and the
+    // file behind it, under one lock. The spawned agent task holds the
+    // lock for the length of a turn — that is what keeps two turns from
+    // interleaving, and what keeps the transcript and the file in step.
+    let session = Arc::new(AsyncMutex::new(SessionState { ctx, convo }));
     let mut agent: Option<Agent> = None;
     // The MCP hub is shared with the spawned agent task (so MCP tool
     // calls have a hub to dispatch to) and with the slash dispatcher
@@ -583,12 +592,12 @@ pub async fn run(cfg: Config, mut ctx: crate::core::context::Context, convo: Con
                             // crossed a slash-command boundary — sync the
                             // menu from scratch (cheap when nothing changes).
                             refresh_completion(&mut app, &hub).await;
-                            apply_outcome(handle(action, &cfg, &mut ctx, &convo, &mut agent, &sink, &hub, &router), &mut cfg, &mut convo, &mut app, &sink);
+                            apply_outcome(handle(action, &cfg, &session, &mut agent, &sink, &hub, &router), &mut cfg, &mut app, &sink);
                         }
                         crossterm::event::Event::Paste(p) => {
                             let action = step(&mut app, Ev::Paste(p));
                             refresh_completion(&mut app, &hub).await;
-                            apply_outcome(handle(action, &cfg, &mut ctx, &convo, &mut agent, &sink, &hub, &router), &mut cfg, &mut convo, &mut app, &sink);
+                            apply_outcome(handle(action, &cfg, &session, &mut agent, &sink, &hub, &router), &mut cfg, &mut app, &sink);
                         }
                         // a resize needs no arm of its own: the Input arm
                         // polls the size every frame and redraws the viewport
@@ -657,10 +666,10 @@ fn draw_overlay(term: &mut ratatui::Terminal<Backend>, app: &App) -> io::Result<
 /// The outcome of `handle` — what the main loop needs to do next.
 /// `Submit` already starts the agent coroutine inside `handle`, so the
 /// only outcomes that escape are the ones the loop itself must act on:
-/// cancel a running task, switch to a new (cfg, convo, banners), or do
+/// cancel a running task, switch to a new (cfg, banners), or do
 /// nothing.
 #[derive(Default)]
-#[allow(clippy::large_enum_variant)] // Switch carries a full Config + Convo; the
+#[allow(clippy::large_enum_variant)] // Switch carries a full Config; the
                                       // other arms are empty. The trade-off is fine:
                                       // None / Cancel are the common case (zero cost)
                                       // and Switch is the rare path that pays for it.
@@ -668,13 +677,12 @@ enum HandleOutcome {
     #[default]
     None,
     Cancel,
-    /// Replace cfg / convo / banners with the ones in here. The previous
-    /// Convo is dropped (its session file is already on disk from the
-    /// last `persist`); the new Convo starts a fresh session file under
-    /// the same project subdirectory.
+    /// Replace cfg / banners with the ones in here. The session file is
+    /// already switched in place by the command that built this (it
+    /// owns the lock), and so is the transcript — a new session starts
+    /// an empty conversation.
     Switch {
         cfg: Config,
-        convo: Convo,
         banners: Vec<String>,
         /// A short status line the loop will show in the transcript so
         /// the user sees what just happened (model name, protocol).
@@ -695,15 +703,16 @@ impl std::fmt::Debug for HandleOutcome {
 }
 
 /// Apply the outcome of `handle` to the loop's mutable state. The
-/// switch arm is the one that mutates: the loop's `cfg` and `convo`
-/// are replaced, the `info` row of the pane is refreshed, and a
-/// transcript note announces what happened.
-fn apply_outcome(outcome: HandleOutcome, cfg: &mut Config, convo: &mut Arc<AsyncMutex<Convo>>, app: &mut App, sink: &ChannelSink) {
+/// switch arm is the one that mutates: the loop's `cfg` is replaced,
+/// the `info` row of the pane is refreshed, and a transcript note
+/// announces what happened. The session file and the transcript were
+/// already switched by the command that built the outcome — it holds
+/// the session lock.
+fn apply_outcome(outcome: HandleOutcome, cfg: &mut Config, app: &mut App, sink: &ChannelSink) {
     match outcome {
         HandleOutcome::None | HandleOutcome::Cancel => {}
-        HandleOutcome::Switch { cfg: new_cfg, convo: new_convo, banners, announce } => {
+        HandleOutcome::Switch { cfg: new_cfg, banners, announce } => {
             *cfg = new_cfg;
-            *convo = Arc::new(AsyncMutex::new(new_convo));
             app.info = model::Info {
                 model: cfg.model.clone(),
                 effort: cfg.effort_label().map(str::to_owned),
@@ -740,14 +749,14 @@ struct SlashCmd<'a> {
 /// accretion — every new command adds a match arm and nothing else.
 /// Unknown commands surface in the transcript as a `Note` so the user
 /// sees the typo (no silent failure).
-fn dispatch_slash(cmd: SlashCmd<'_>, cfg: &Config, convo: &Arc<AsyncMutex<Convo>>, sink: &ChannelSink, hub: &Hub) -> HandleOutcome {
+fn dispatch_slash(cmd: SlashCmd<'_>, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>, agent: &Option<Agent>, sink: &ChannelSink, hub: &Hub) -> HandleOutcome {
     match cmd.name {
         "exit" | "quit" => {
             // the loop owns the quit flag; we just stop the current
             // agent and let the loop see Cancel → drain → exit
             HandleOutcome::Cancel
         }
-        "model" => match slash_model(cmd.args, cfg, convo) {
+        "model" => match slash_model(cmd.args, cfg, session, agent) {
             Ok(o) => o,
             Err(e) => {
                 sink.show(Msg::Note { sev: Sev::Err, text: format!(" {e} ") });
@@ -781,11 +790,13 @@ fn dispatch_slash(cmd: SlashCmd<'_>, cfg: &Config, convo: &Arc<AsyncMutex<Convo>
     }
 }
 
-/// `/model` switches the active profile. The new Config + a fresh Convo
-/// ride back through `HandleOutcome::Switch`; the loop swaps them in.
+/// `/model` switches the active profile. The new Config rides back
+/// through `HandleOutcome::Switch`; the loop swaps it in. The session
+/// file and the transcript are switched here, under the session lock:
+/// a new session is a new conversation, so the transcript starts empty.
 /// With no args we surface the current selection and the available
 /// profiles; with one arg we look it up under `<provider>/<model>`.
-fn slash_model(args: Vec<&str>, cfg: &Config, convo: &Arc<AsyncMutex<Convo>>) -> Result<HandleOutcome, String> {
+fn slash_model(args: Vec<&str>, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>, agent: &Option<Agent>) -> Result<HandleOutcome, String> {
     let settings = Settings::load().map_err(|e| e.to_string())?;
     let current_key = settings
         .active
@@ -846,17 +857,25 @@ fn slash_model(args: Vec<&str>, cfg: &Config, convo: &Arc<AsyncMutex<Convo>>) ->
         .ok_or_else(|| format!("profile key '{selected_key}' is not '<provider>/<model>'"))?;
     new_cfg.model = model_id;
 
-    // Close the current session: persist one last time so any agent turn
-    // in flight is on disk, then drop the in-memory convo. The file is
-    // already closed by Convo's Drop.
-    let mut c = match convo.try_lock() {
+    // Close the current session: persist one last time so the transcript
+    // is on disk before the file behind it is replaced.
+    //
+    // A running turn refuses the switch outright: the turn owns the
+    // session lock, and a switch that cleared the transcript under it
+    // would leave the model answering a conversation it never saw.
+    if agent.is_some() {
+        return Err("cannot switch profile while an agent turn is running — wait for it to finish (or /exit)".into());
+    }
+    let mut st = match session.try_lock() {
         Ok(g) => g,
         Err(_) => return Err("cannot switch profile while an agent turn is running — wait for it to finish (or /exit)".into()),
     };
-    if let Err(e) = c.persist() {
-        return Err(format!("could not close current session: {e}"));
+    {
+        let SessionState { ctx, convo } = &mut *st;
+        if let Err(e) = convo.persist(ctx.history()) {
+            return Err(format!("could not close current session: {e}"));
+        }
     }
-    drop(c);
 
     // Persist the new active. Loading+rewriting preserves any unknown
     // future fields; if settings.json doesn't exist yet we create the
@@ -883,8 +902,17 @@ fn slash_model(args: Vec<&str>, cfg: &Config, convo: &Arc<AsyncMutex<Convo>>) ->
         Some(p) => format!("session {} · {}", new_session.id(), p.display()),
         None => format!("session {} · no home directory: this conversation stays in memory", new_session.id()),
     };
-    let new_convo = crate::core::session::Convo::persistent(new_session, vec![]);
-    Ok(HandleOutcome::Switch { cfg: new_cfg, convo: new_convo, banners: vec![banner], announce })
+    let new_convo = crate::core::session::Convo::persistent(new_session);
+    // The switch, under the lock we still hold: the new file starts an
+    // empty conversation — the old transcript belongs to the old
+    // session, and a new model's context must not inherit it.
+    {
+        let SessionState { ctx, convo } = &mut *st;
+        ctx.clear_history();
+        *convo = new_convo;
+    }
+    drop(st);
+    Ok(HandleOutcome::Switch { cfg: new_cfg, banners: vec![banner], announce })
 }
 
 /// Translate a protocol name string into the `Protocol` enum, falling
@@ -895,10 +923,10 @@ fn protocol_of(name: &str) -> Option<crate::api::Protocol> {
 
 /// Perform an update's side effect. `Submit` is fully consumed inside
 /// (the agent coroutine is spawned) and yields no outcome — the loop
-/// keeps its current cfg and convo. Slash commands on the input line
+/// keeps its current cfg and session. Slash commands on the input line
 /// resolve here too: dispatching `/model` returns `Switch` with the
-/// newly-built Config and Convo.
-fn handle(action: Action, cfg: &Config, ctx: &mut crate::core::context::Context, convo: &Arc<AsyncMutex<Convo>>,
+/// newly-built Config.
+fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
           agent: &mut Option<Agent>, sink: &ChannelSink, hub: &Hub, router: &Arc<ToolRouter>) -> HandleOutcome {
     match action {
         Action::None => HandleOutcome::None,
@@ -913,15 +941,15 @@ fn handle(action: Action, cfg: &Config, ctx: &mut crate::core::context::Context,
             // they never reach the agent. Dispatch first, and only fall
             // through to a real submit when the line is just a task.
             if let Some(cmd) = parse_slash(&line) {
-                return dispatch_slash(cmd, cfg, convo, sink, hub);
+                return dispatch_slash(cmd, cfg, session, agent, sink, hub);
             }
             // The narrow race: the agent's `Msg::TaskBegin` rides the
             // channel back to update `app.working()`; between sending
             // it and the loop reading it, the user could press Enter
             // again — the agent Option already holds a live job, and
             // spawning a second one would orphan the first. Two
-            // coroutines then race the convo lock and both push into
-            // history; the file would be torn. Refuse instead.
+            // coroutines then race the session lock and both push into
+            // the transcript; the file would be torn. Refuse instead.
             if agent.is_some() {
                 sink.show(Msg::Note {
                     sev: Sev::Warn,
@@ -930,27 +958,31 @@ fn handle(action: Action, cfg: &Config, ctx: &mut crate::core::context::Context,
                 return HandleOutcome::None;
             }
             let cfg = cfg.clone();
-            let mut ctx = ctx.clone();
-            let convo = convo.clone();
+            let session = session.clone();
             let router = router.clone();
             let token = Arc::new(crate::cancel::CancelToken::new());
             let tok = token.clone();
             sink.show(Msg::TaskBegin(line.clone()));
             let sink = sink.clone(); // one for the spawned task, one for the shell
             let job = tokio::spawn(async move {
-                let mut c = convo.lock().await;
-                c.history.push(user_message(&line));
-                if let Err(e) = c.persist() {
+                // The session lock is held for the whole turn: the
+                // transcript the model sees and the file it lands in are
+                // one thing, and a second turn must not interleave with
+                // this one.
+                let mut st = session.lock().await;
+                let SessionState { ctx, convo } = &mut *st;
+                ctx.push(user_message(&line));
+                if let Err(e) = convo.persist(ctx.history()) {
                     sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
                 }
                 // the task is on disk before the first stone moves
                 let mut turn = crate::core::turn::Turn::new(0);
-                match agent_turn(&cfg, &mut ctx, &mut c.history, &mut turn, &tok, &router, &sink).await {
+                match agent_turn(&cfg, ctx, &mut turn, &tok, &router, &sink).await {
                     Err(Error::Interrupted) => {}
                     Err(e) => sink.show(Msg::Note { sev: Sev::Err, text: format!(" error: {e} ") }),
                     Ok(()) => {}
                 }
-                if let Err(e) = c.persist() {
+                if let Err(e) = convo.persist(ctx.history()) {
                     sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
                 }
                 // run boundary: the file never ends mid-run
@@ -1696,19 +1728,24 @@ mod tests {
         ]))
     }
 
+    /// A session state with one seeded message — the transcript the
+    /// agent loop extends, next to the file it lands in.
+    fn session_state() -> Arc<AsyncMutex<SessionState>> {
+        let mut ctx = crate::test_util::ctx();
+        ctx.push(crate::core::ir::Message::User("seed".into()));
+        Arc::new(AsyncMutex::new(SessionState { ctx, convo: Convo::ephemeral() }))
+    }
+
     /// A handle that lets a test inspect the agent that was spawned.
     fn run_handle(action: Action) -> (ChannelSink, Option<Agent>) {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
         let cfg = tcfg("http://127.0.0.1:1");
-        let mut convo = Convo::ephemeral();
-        convo.history.push(crate::core::ir::Message::User("seed".into()));
-        let convo = Arc::new(AsyncMutex::new(convo));
+        let session = session_state();
         let mut agent: Option<Agent> = None;
         let hub = crate::mcp::Hub::empty();
         let router = router(&hub);
-        let mut ctx = crate::test_util::ctx();
-        handle(action, &cfg, &mut ctx, &convo, &mut agent, &sink, &hub, &router);
+        handle(action, &cfg, &session, &mut agent, &sink, &hub, &router);
         (sink, agent)
     }
 
@@ -1735,15 +1772,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
         let cfg = tcfg("http://127.0.0.1:1");
-        let mut convo = Convo::ephemeral();
-        convo.history.push(crate::core::ir::Message::User("seed".into()));
-        let convo = Arc::new(AsyncMutex::new(convo));
+        let session = session_state();
         let mut agent: Option<Agent> = None;
         let hub = crate::mcp::Hub::empty();
         let router = router(&hub);
-        let mut cx = crate::core::context::Context::new(&crate::core::agents_md::AgentsMdContext::empty(&std::path::PathBuf::from(".")));
         // tokio::test gives us the runtime; handle does its own tokio::spawn.
-        handle(Action::Submit("hello world".into()), &cfg, &mut cx, &convo, &mut agent, &sink, &hub, &router);
+        handle(Action::Submit("hello world".into()), &cfg, &session, &mut agent, &sink, &hub, &router);
         assert!(agent.is_some(), "submit sets the agent slot");
         // a task begin landed in the sink
         let got = rx.try_recv().expect("TaskBegin emitted by submit");
@@ -1767,19 +1801,18 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
         let cfg = tcfg("http://127.0.0.1:1");
-        let convo = Arc::new(AsyncMutex::new(Convo::ephemeral()));
+        let session = session_state();
         // a pre-existing agent slot, as if the first Submit had already
         // run and the spawned coroutine were still in flight
         let mut agent: Option<Agent>;
         let first_token = Arc::new(crate::cancel::CancelToken::new());
         let hub = crate::mcp::Hub::empty();
         let router = router(&hub);
-        let mut cx = crate::core::context::Context::new(&crate::core::agents_md::AgentsMdContext::empty(&std::path::PathBuf::from(".")));
         // tokio::test wraps us in a runtime; spawn the pre-existing agent
         // slot inside this scope so its JoinHandle has a home.
         let first_job = tokio::spawn(async {});
         agent = Some(Agent { token: first_token.clone(), job: first_job });
-        handle(Action::Submit("second task".into()), &cfg, &mut cx, &convo, &mut agent, &sink, &hub, &router);
+        handle(Action::Submit("second task".into()), &cfg, &session, &mut agent, &sink, &hub, &router);
         // the original agent is still there — same token, not replaced
         assert!(agent.is_some());
         assert_eq!(Arc::as_ptr(&agent.as_ref().unwrap().token), Arc::as_ptr(&first_token));
@@ -1944,12 +1977,12 @@ mod tests {
         // `/garbage` does not exist; the dispatcher surfaces a warning
         // and returns None so the loop keeps its current cfg / convo.
         let cfg = tcfg("https://x");
-        let convo = Arc::new(AsyncMutex::new(crate::core::session::Convo::ephemeral()));
+        let session = session_state();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
         let cmd = SlashCmd { name: "garbage", args: vec![] };
         let hub = crate::mcp::Hub::empty();
-        let outcome = dispatch_slash(cmd, &cfg, &convo, &sink, &hub);
+        let outcome = dispatch_slash(cmd, &cfg, &session, &None, &sink, &hub);
         // we don't read the warning Note — the sink it would land on is
         // a fake channel — but we pin the outcome, which is what the
         // loop acts on.
@@ -1959,12 +1992,12 @@ mod tests {
     #[tokio::test]
     async fn slash_help_announces_available_commands() {
         let cfg = tcfg("https://x");
-        let convo = Arc::new(AsyncMutex::new(crate::core::session::Convo::ephemeral()));
+        let session = session_state();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = ChannelSink::new(tx);
         let cmd = SlashCmd { name: "help", args: vec![] };
         let hub = crate::mcp::Hub::empty();
-        let outcome = dispatch_slash(cmd, &cfg, &convo, &sink, &hub);
+        let outcome = dispatch_slash(cmd, &cfg, &session, &None, &sink, &hub);
         assert!(matches!(outcome, HandleOutcome::None));
     }
 
@@ -1987,15 +2020,51 @@ mod tests {
         std::env::set_var("HOME", dir);
         // No settings file written — slash_model loads an empty Settings.
         let cfg = tcfg("https://x");
-        let convo = Arc::new(AsyncMutex::new(crate::core::session::Convo::ephemeral()));
+        let session = session_state();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let _sink = ChannelSink::new(tx);
-        let r = slash_model(vec!["minimax/MiniMax-M3"], &cfg, &convo);
+        let r = slash_model(vec!["minimax/MiniMax-M3"], &cfg, &session, &None);
         match r {
             Err(e) => assert!(e.contains("no profile named"), "got: {e}"),
             Ok(_) => panic!("must error without settings"),
         }
         // restore HOME so other tests are not affected
+        if let Some(v) = _prev { std::env::set_var("HOME", v); } else { std::env::remove_var("HOME"); }
+    }
+
+    #[tokio::test]
+    async fn slash_model_starts_a_new_session_with_an_empty_transcript() {
+        // A new session is a new conversation: the old transcript belongs
+        // to the old session's file, and the new model's context must not
+        // inherit it. The switch happens under the session lock, so the
+        // transcript and the file move together.
+        let _lock = crate::test_util::env_lock();
+        let _prev = std::env::var("HOME").ok();
+        let dir = crate::test_util::temp_dir("slash_switch");
+        std::env::set_var("HOME", &dir);
+        let settings = serde_json::json!({
+            "$schema_version": 2,
+            "active": "zai/one",
+            "providers": {
+                "zai/one": {"protocol": "zai", "api_key": "k1", "base_url": "https://one"},
+                "zai/two": {"protocol": "zai", "api_key": "k2", "base_url": "https://two"},
+            },
+        });
+        std::fs::create_dir_all(dir.join(".jingwei")).unwrap();
+        std::fs::write(dir.join(".jingwei").join("settings.json"), settings.to_string()).unwrap();
+
+        let cfg = tcfg("https://one");
+        let session = session_state(); // seeded with one message
+        let r = slash_model(vec!["zai/two"], &cfg, &session, &None);
+        match r {
+            Ok(HandleOutcome::Switch { .. }) => {}
+            Ok(_) => panic!("the switch must produce a Switch outcome"),
+            Err(e) => panic!("the switch must succeed: {e}"),
+        }
+        let st = session.try_lock().expect("the switch released the lock");
+        assert!(st.ctx.history().is_empty(),
+            "the new session starts a new conversation — the old transcript does not carry over");
+
         if let Some(v) = _prev { std::env::set_var("HOME", v); } else { std::env::remove_var("HOME"); }
     }
 }

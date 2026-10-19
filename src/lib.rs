@@ -30,7 +30,7 @@ use crate::config::{Args, Config, build_config};
 use crate::core::agent::agent_turn;
 use crate::core::agents_md::AgentsMdContext;
 use crate::core::context::Context;
-use crate::core::ir::user_message;
+use crate::core::ir::{user_message, Message};
 use crate::core::ports::ToolRouter;
 use crate::core::session;
 use crate::core::turn::Turn;
@@ -87,7 +87,7 @@ pub async fn run() -> Result<()> {
     } else {
         AgentsMdContext::load(&workspace)
     };
-    let ctx = Context::new(&agents_ctx);
+    let ctx = Context::new(&agents_ctx, cfg.context_size);
     // MCP hub: external servers' tools, offered to the model as though
     // they were the agent's own. Spawned once per process and shared
     // across every turn (and every front-end). The user's servers are
@@ -113,7 +113,10 @@ pub async fn run() -> Result<()> {
 /// every exit path.
 async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agents_ctx: AgentsMdContext, router: Arc<ToolRouter>) -> Result<()> {
     let interactive = args.prompt.is_empty();
-    let (mut convo, banners) = begin_session(&args, &cfg, interactive)?;
+    // The session decides the file; the transcript it continues is the
+    // context's — the context owns it from here on.
+    let (mut convo, resumed, banners) = begin_session(&args, &cfg, interactive)?;
+    ctx.history_mut().extend(resumed);
     // AGENTS.md gets a banner slot too, when one was loaded. Prepended
     // so the user sees it before the session id — the context comes
     // first in attention order, and the banner says the same thing.
@@ -137,14 +140,14 @@ async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agent
         sink.show(Msg::Banner(b.clone()));
     }
     sink.show(Msg::TaskBegin(prompt.clone()));
-    convo.history.push(user_message(&prompt));
-    if let Err(e) = convo.persist() {
+    ctx.push(user_message(&prompt));
+    if let Err(e) = convo.persist(ctx.history()) {
         sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
     }
     let token = CancelToken::new();
     let mut turn = Turn::new(0);
-    let res = agent_turn(&cfg, &mut ctx, &mut convo.history, &mut turn, &token, &router, &sink).await;
-    if let Err(e) = convo.persist() {
+    let res = agent_turn(&cfg, &mut ctx, &mut turn, &token, &router, &sink).await;
+    if let Err(e) = convo.persist(ctx.history()) {
         sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
     }
     sink.show(Msg::TaskEnd);
@@ -168,14 +171,18 @@ fn read_user_mcp() -> Option<Value> {
     }
 }
 
-/// The conversation this process runs on, and the banners the frontend
-/// shows beside its own. Policy lives here, at the composition root;
-/// session.rs owns the mechanism. A one-shot stays ephemeral; a resumed
-/// one persists to the file it came from.
-fn begin_session(args: &Args, cfg: &Config, interactive: bool) -> Result<(session::Convo, Vec<String>)> {
+/// The conversation this process runs on, the transcript it continues, and
+/// the banners the frontend shows beside its own. Policy lives here, at the
+/// composition root; session.rs owns the mechanism. A one-shot stays
+/// ephemeral; a resumed one persists to the file it came from.
+///
+/// The transcript comes back separately because the context owns it: the
+/// caller seeds the context with it, and the context is what the agent
+/// loop, the trim policy, and the file all read.
+fn begin_session(args: &Args, cfg: &Config, interactive: bool) -> Result<(session::Convo, Vec<Message>, Vec<String>)> {
     if !args.resuming() {
         if !interactive {
-            return Ok((session::Convo::ephemeral(), vec![]));
+            return Ok((session::Convo::ephemeral(), vec![], vec![]));
         }
         let prov = session::Provenance {
             model: cfg.model.clone(),
@@ -187,7 +194,7 @@ fn begin_session(args: &Args, cfg: &Config, interactive: bool) -> Result<(sessio
             Some(p) => format!("session {} · the conversation persists to {}", s.id(), p.display()),
             None => format!("session {} · no home directory: this conversation stays in memory", s.id()),
         };
-        return Ok((session::Convo::persistent(s, vec![]), vec![banner]));
+        return Ok((session::Convo::persistent(s), vec![], vec![banner]));
     }
     let here = session::current_dir_string();
     // Scoping comes from the layout: the project subdirectory is the
@@ -215,6 +222,6 @@ fn begin_session(args: &Args, cfg: &Config, interactive: bool) -> Result<(sessio
             session::dir_tail(&here)
         ));
     }
-    Ok((session::Convo::persistent(s, history), banners))
+    Ok((session::Convo::persistent(s), history, banners))
 }
 

@@ -4,15 +4,15 @@
 //! batch it asked for, and around again, until the model answers in
 //! plain text or a bound (`--max-turns`, Ctrl-C, an error) stops it.
 //!
-//! The loop owns no resources: the config, history, context, cancel
-//! token, MCP hub, and output sink are all handed in by the caller
+//! The loop owns no resources: the config, context, cancel token, tool
+//! router, and output sink are all handed in by the caller
 //! (`crate::run_with_hub` or a frontend), which is exactly why every
 //! piece can be tested with mocks and why new frontends cost nothing.
 
 use crate::api::call_api as api_call_api;
 use crate::cancel::CancelToken;
 use crate::config::Config;
-use crate::core::context::{self, Context};
+use crate::core::context::Context;
 use crate::core::ir::{Block, Message, ToolResult};
 use crate::core::ports::ToolRouter;
 use crate::core::turn::{Turn, TurnOutcome, TurnState};
@@ -37,8 +37,8 @@ const MAX_TOOL_OUTPUT: usize = 50_000;
 /// returns to read the terminal state — the wrapper owns the cancel
 /// select (`tokio::select!` against Ctrl-C) and the double-signal
 /// semantics, not to hide the turn from anyone.
-pub(crate) async fn agent_turn(cfg: &Config, ctx: &mut Context, history: &mut Vec<Message>, turn: &mut Turn, token: &CancelToken, router: &ToolRouter, sink: &dyn Show) -> crate::Result<()> {
-    let agent = agent_loop(cfg, ctx, history, turn, token, router, sink);
+pub(crate) async fn agent_turn(cfg: &Config, ctx: &mut Context, turn: &mut Turn, token: &CancelToken, router: &ToolRouter, sink: &dyn Show) -> crate::Result<()> {
+    let agent = agent_loop(cfg, ctx, turn, token, router, sink);
     tokio::pin!(agent);
     tokio::select! {
         res = &mut agent => return res,
@@ -78,11 +78,12 @@ pub(crate) async fn agent_turn(cfg: &Config, ctx: &mut Context, history: &mut Ve
 /// whichever provider owns it. Re-fetching the schemas every turn is what
 /// lets `/mcp enable|disable|reconnect` take effect mid-session.
 ///
-/// `ctx` is the model-side context — system text + tool list, owned by
-/// `crate::core::context`. The agent loop asks the router for the current
-/// schemas each turn so the next request sees whatever the providers
+/// `ctx` is the model-side context — system text, tool list, and the
+/// transcript itself — owned by `crate::core::context`. The agent loop
+/// appends to the transcript and asks the router for the current
+/// schemas each turn, so the next request sees whatever the providers
 /// report.
-async fn agent_loop(cfg: &Config, ctx: &mut Context, history: &mut Vec<Message>, turn: &mut Turn, token: &CancelToken, router: &ToolRouter, sink: &dyn Show) -> crate::Result<()> {
+async fn agent_loop(cfg: &Config, ctx: &mut Context, turn: &mut Turn, token: &CancelToken, router: &ToolRouter, sink: &dyn Show) -> crate::Result<()> {
     // The only legal first move. An Illegal here would mean the caller
     // handed us a non-fresh turn — a programming bug — and we surface it
     // as a regular error rather than a panic so a misconfigured caller
@@ -90,7 +91,7 @@ async fn agent_loop(cfg: &Config, ctx: &mut Context, history: &mut Vec<Message>,
     turn.transition(TurnState::InProgress, None)
         .map_err(|e| Error::Msg(e.to_string()))?;
 
-    let result = run_turn(cfg, ctx, history, token, router, sink).await;
+    let result = run_turn(cfg, ctx, token, router, sink).await;
     // The Result → TurnOutcome translation lives here because `Error`
     // is a crate-root type and turn.rs deliberately does not depend on it.
     // From TurnOutcome onward, the mapping is the turn's own concern.
@@ -106,16 +107,18 @@ async fn agent_loop(cfg: &Config, ctx: &mut Context, history: &mut Vec<Message>,
 /// Drive one turn's worth of API calls and tool runs. Pure mechanics — the
 /// [`Turn`] state machine is owned by the caller. Returns whatever
 /// happened; the caller maps it onto a terminal state via [`Turn::finish`].
-async fn run_turn(cfg: &Config, ctx: &mut Context, history: &mut Vec<Message>, token: &CancelToken, router: &ToolRouter, sink: &dyn Show) -> crate::Result<()> {
+async fn run_turn(cfg: &Config, ctx: &mut Context, token: &CancelToken, router: &ToolRouter, sink: &dyn Show) -> crate::Result<()> {
     for step in 0..cfg.max_turns {
         if token.is_cancelled() { return Err(Error::Interrupted); }
         // The tool list the model sees is whatever the providers say right
         // now — the built-ins first, the servers' tools after them.
         ctx.set_tools(router.definitions().await);
-        if context::fit_context(history, cfg.context_size) {
+        if ctx.fit() {
             sink.show(Msg::Note { sev: Sev::Warn, text: " trimmed history to fit --context-size ".into() });
         }
-        let (resp, interrupted, _body) = api_call_api(cfg, ctx, history, token, sink).await?;
+        // The context owns the transcript, so the wire is rendered from
+        // the same object the trim policy just worked on.
+        let (resp, interrupted, _body) = api_call_api(cfg, ctx, ctx.history(), token, sink).await?;
         let content = resp.blocks;
         if interrupted {
             // Cut off mid-response: keep finished text/thinking, drop tool
@@ -123,7 +126,7 @@ async fn run_turn(cfg: &Config, ctx: &mut Context, history: &mut Vec<Message>, t
             // the next request.
             let kept: Vec<Block> = content.into_iter().filter(|b| b.tool_use().is_none()).collect();
             if !kept.is_empty() {
-                history.push(Message::Assistant(kept));
+                ctx.push(Message::Assistant(kept));
             }
             return Err(Error::Interrupted);
         }
@@ -131,7 +134,7 @@ async fn run_turn(cfg: &Config, ctx: &mut Context, history: &mut Vec<Message>, t
         // Echo the full assistant turn back — including the final
         // text-only turn, so follow-up questions keep context.
         if !content.is_empty() {
-            history.push(Message::Assistant(content));
+            ctx.push(Message::Assistant(content));
         }
         if calls.is_empty() { return Ok(()); }
 
@@ -152,7 +155,7 @@ async fn run_turn(cfg: &Config, ctx: &mut Context, history: &mut Vec<Message>, t
             results.push(ToolResult { id: id.to_string(), content: out });
             if token.is_cancelled() { stopped = true; }
         }
-        history.push(Message::ToolResults(results));
+        ctx.push(Message::ToolResults(results));
         if stopped { return Err(Error::Interrupted); }
 
         if step + 1 == cfg.max_turns {
@@ -181,11 +184,6 @@ mod tests {
     use serde_json::Value;
     use std::sync::Arc;
 
-    /// A typed history from JSON literals — the tests still speak the wire
-    /// shape, and `ir` owns the only translation of it.
-    fn hv(values: Vec<Value>) -> Vec<Message> {
-        values.iter().map(Message::from_value).collect()
-    }
     /// History back as JSON, for the assertions the tests have always made.
     fn hist(history: &[Message]) -> Value {
         crate::core::ir::history_value(history)
@@ -205,6 +203,15 @@ mod tests {
             Box::new(hub.clone()),
         ]);
         (router, hub)
+    }
+
+    /// A context seeded with one user message — the transcript the
+    /// agent loop extends. The transcript lives in the context, so the
+    /// tests read it back from there.
+    fn ctx_with(text: &str) -> Context {
+        let mut cx = crate::test_util::ctx();
+        cx.push(Message::User(text.into()));
+        cx
     }
 
     // ---- truncate: the bounded-output safety net --------------------------
@@ -249,19 +256,18 @@ mod tests {
         let tool = r#"{"content":[{"type":"tool_use","id":"t1","name":"bash","input":{"command":"echo hi"}}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
         let done = r#"{"content":[{"type":"text","text":"done"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
         let (port, reqs) = mock_seq(vec![(200, tool.into()), (200, done.into())]);
-        let mut history = hv(vec![json!({"role": "user", "content": "run echo"})]);
+        let mut cx = ctx_with("run echo");
         let mut turn = Turn::new(0);
         block_on(async {
             // Hub::empty() spawns an actor task — the test needs a runtime
             // for the spawn to land, even though the hub itself has no work
             // to do in this test.
             let (router, hub) = router();
-            let mut cx = crate::test_util::ctx();
-            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut history, &mut turn, &CancelToken::new(), &router, &sink()).await.unwrap();
+            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut turn, &CancelToken::new(), &router, &sink()).await.unwrap();
             hub.shutdown().await;
         });
-        assert_eq!(history.len(), 4); // user + assistant(tool_use) + user(tool_result) + assistant(text)
-        let j = hist(&history);
+        assert_eq!(cx.history().len(), 4); // user + assistant(tool_use) + user(tool_result) + assistant(text)
+        let j = hist(cx.history());
         assert_eq!(j[1]["role"], json!("assistant"));
         assert_eq!(j[1]["content"][0]["id"], json!("t1")); // full turn echoed back, thinking intact
         assert_eq!(j[2]["content"][0]["type"], json!("tool_result"));
@@ -282,15 +288,14 @@ mod tests {
         let (port, _) = mock_seq(vec![(200, tool.into())]);
         let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
         c.max_turns = 1;
-        let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
+        let mut cx = ctx_with("go");
         let mut turn = Turn::new(0);
         block_on(async {
             let (router, hub) = router();
-            let mut cx = crate::test_util::ctx();
-            agent_loop(&c, &mut cx, &mut history, &mut turn, &CancelToken::new(), &router, &sink()).await.unwrap(); // must return instead of spinning
+            agent_loop(&c, &mut cx, &mut turn, &CancelToken::new(), &router, &sink()).await.unwrap(); // must return instead of spinning
             hub.shutdown().await;
         });
-        assert_eq!(history.len(), 3); // user + assistant(tool_use) + user(tool_result)
+        assert_eq!(cx.history().len(), 3); // user + assistant(tool_use) + user(tool_result)
         // hitting max_turns is a normal exit, not a failure — Completed, not Failed
         assert_eq!(turn.state, TurnState::Completed);
     }
@@ -316,11 +321,10 @@ mod tests {
             r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
             r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answ"}}"#, "\n\n");
         let (port, stalled_written) = mock_stall(tool, stalled);
-        let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
+        let mut cx = ctx_with("go");
         let mut turn = Turn::new(0);
         let err = block_on(async {
             let (router, hub) = router();
-            let mut cx = crate::test_util::ctx();
             let token = Arc::new(CancelToken::new());
             let t = token.clone();
             // Cancel only once the mock has actually written the stalled
@@ -336,14 +340,14 @@ mod tests {
                 }
                 t.cancel();
             });
-            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), true), &mut cx, &mut history, &mut turn, &token, &router, &sink()).await;
+            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), true), &mut cx, &mut turn, &token, &router, &sink()).await;
             hub.shutdown().await;
             res
         }).unwrap_err();
         assert!(matches!(err, Error::Interrupted), "got: {err}");
         // user + assistant(tool_use) + user(tool_result) + assistant(partial text; tool_use dropped)
-        assert_eq!(history.len(), 4);
-        let j = hist(&history);
+        assert_eq!(cx.history().len(), 4);
+        let j = hist(cx.history());
         assert_eq!(j[3]["role"], json!("assistant"));
         assert_eq!(j[3]["content"][0]["type"], json!("text"));
         assert_eq!(j[3]["content"][0]["text"], json!("partial answ"));
@@ -367,26 +371,25 @@ mod tests {
         let tool = format!(
             r#"{{"content":[{{"type":"tool_use","id":"t1","name":"bash","input":{{"command":"{cmd}"}}}}],"usage":{{"input_tokens":1,"output_tokens":1}}}}"#);
         let (port, _) = mock_seq(vec![(200, tool)]);
-        let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
+        let mut cx = ctx_with("go");
         let mut turn = Turn::new(0);
         let err = block_on(async {
             let (router, hub) = router();
-            let mut cx = crate::test_util::ctx();
             let token = Arc::new(CancelToken::new());
             let t = token.clone();
             tokio::task::spawn_blocking(move || {
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 t.cancel();
             });
-            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut history, &mut turn, &token, &router, &sink()).await;
+            let res = agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut turn, &token, &router, &sink()).await;
             hub.shutdown().await;
             res
         }).unwrap_err();
         assert!(matches!(err, Error::Interrupted), "got: {err}");
-        assert_eq!(history.len(), 3); // user + assistant(tool_use) + user(tool_result)
-        let result = hist(&history)[2]["content"][0]["content"].as_str().unwrap().to_string();
+        assert_eq!(cx.history().len(), 3); // user + assistant(tool_use) + user(tool_result)
+        let result = hist(cx.history())[2]["content"][0]["content"].as_str().unwrap().to_string();
         assert!(result.contains("[interrupted by user]"), "got: {result}");
-        assert_eq!(hist(&history)[2]["content"][0]["tool_use_id"], json!("t1"));
+        assert_eq!(hist(cx.history())[2]["content"][0]["tool_use_id"], json!("t1"));
         // mid-tool cancel also lands on `Interrupted` — same state, same reason.
         assert_eq!(turn.state, TurnState::Interrupted);
     }
@@ -407,12 +410,11 @@ mod tests {
             responses.push((500, five_hundred.into()));
         }
         let (port, _) = mock_seq(responses);
-        let mut history = hv(vec![json!({"role": "user", "content": "go"})]);
+        let mut cx = ctx_with("go");
         let mut turn = Turn::new(0);
         let err = block_on(async {
             let (router, _hub) = router();
-            let mut cx = crate::test_util::ctx();
-            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut history, &mut turn, &CancelToken::new(), &router, &sink()).await
+            agent_loop(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut turn, &CancelToken::new(), &router, &sink()).await
         }).unwrap_err();
         // the error reaches the caller — the same one we record on the turn
         assert!(matches!(err, Error::Api(500, _)), "got: {err}");
@@ -437,11 +439,10 @@ mod tests {
         // a wrapper-level run starts in Queued — that's the caller's job
         // to construct, and the wrapper must not silently rewind it.
         assert_eq!(turn.state, TurnState::Queued);
-        let mut history = hv(vec![json!({"role": "user", "content": "say hi"})]);
+        let mut cx = ctx_with("say hi");
         block_on(async {
             let (router, hub) = router();
-            let mut cx = crate::test_util::ctx();
-            agent_turn(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut history, &mut turn, &CancelToken::new(), &router, &sink()).await.unwrap();
+            agent_turn(&cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &mut turn, &CancelToken::new(), &router, &sink()).await.unwrap();
             hub.shutdown().await;
         });
         // the wrapper drove Queued → InProgress → Completed on the turn
@@ -450,6 +451,6 @@ mod tests {
         assert_eq!(turn.id, 7, "wrapper must not rewind turn id");
         assert_eq!(turn.state, TurnState::Completed);
         assert!(turn.started_at.is_some() && turn.ended_at.is_some());
-        assert_eq!(hist(&history).as_array().unwrap().last().unwrap()["role"], json!("assistant"));
+        assert_eq!(hist(cx.history()).as_array().unwrap().last().unwrap()["role"], json!("assistant"));
     }
 }
