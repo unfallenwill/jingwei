@@ -14,8 +14,12 @@ use std::time::Duration;
 pub enum Action {
     /// The user submitted this task text.
     Submit(String),
-    /// Ctrl-C: cancel the running agent (first press) / exit (second).
+    /// Ctrl-C: cancel the running agent (first press) / stop the
+    /// background agents (second press, when there are any) / exit
+    /// (last press).
     Cancel,
+    /// Ctrl-C, the ladder's middle step: stop every background agent.
+    StopWorkers,
     /// Nothing — just redraw.
     None,
 }
@@ -70,6 +74,7 @@ fn msg(app: &mut App, m: Msg) -> Action {
             // its live rows and holds through the folds between
             app.status.pane_floor = 0;
             app.cancel_sent = false;
+            app.workers_stopped = false;
             app.scroll = Scroll::Tail;
             // a run boundary proves no request is in flight: a reading
             // the last run left open (a request that never sent its
@@ -85,6 +90,7 @@ fn msg(app: &mut App, m: Msg) -> Action {
             app.fold_thought();
             app.status.task = None;
             app.cancel_sent = false;
+            app.workers_stopped = false;
             app.rows.push(Row::Sep);
         }
         Msg::Text(t) => app.push_text(&t),
@@ -325,16 +331,32 @@ pub fn apply_completion(app: &mut App) -> bool {
     true
 }
 
+/// The Ctrl-C ladder, while a task runs.
+///
+/// The first press cancels the turn, the second stops the background
+/// agents, the last exits. The middle step exists only when there is a
+/// worker to stop: a step that does nothing is not a step, and without
+/// a worker the ladder is exactly what it has always been — cancel,
+/// then exit.
+fn ctrl_c_ladder(app: &mut App) -> Action {
+    if !app.cancel_sent {
+        app.cancel_sent = true;
+        return Action::Cancel;
+    }
+    if !app.workers_stopped && app.fleet.has_live_workers() {
+        app.workers_stopped = true;
+        return Action::StopWorkers;
+    }
+    app.quit = true;
+    Action::None
+}
+
 fn input_mode(app: &mut App, k: KeyEvent) -> Action {
-    // Ctrl-C outranks mode: while a task runs it cancels, twice exits.
+    // Ctrl-C outranks mode: while a task runs it cancels, then stops the
+    // background agents, then exits.
     if matches!(k.code, KeyCode::Char('c')) && k.modifiers.contains(KeyModifiers::CONTROL) {
         if app.working() {
-            if app.cancel_sent {
-                app.quit = true;
-            } else {
-                app.cancel_sent = true;
-                return Action::Cancel;
-            }
+            return ctrl_c_ladder(app);
         } else {
             input_clear(app);
         }
@@ -489,12 +511,7 @@ fn input_mode(app: &mut App, k: KeyEvent) -> Action {
 fn browse_mode(app: &mut App, k: KeyEvent) -> Action {
     if matches!(k.code, KeyCode::Char('c')) && k.modifiers.contains(KeyModifiers::CONTROL) {
         if app.working() {
-            if app.cancel_sent {
-                app.quit = true;
-            } else {
-                app.cancel_sent = true;
-                return Action::Cancel;
-            }
+            return ctrl_c_ladder(app);
         } else {
             app.mode = Mode::Input;
         }
@@ -1221,6 +1238,32 @@ mod tests {
         drive(&mut b, vec![key(KeyCode::Char('c'), KeyModifiers::CONTROL)]);
         assert_eq!(b.input.text, "");
         assert!(!b.quit);
+    }
+
+    #[test]
+    fn the_ctrl_c_ladder_gains_a_step_only_with_workers() {
+        // With a worker, the ladder gains a step: cancel the turn, stop
+        // the workers, exit. The middle step exists only when there is
+        // something to stop — the other test pins the ladder without one.
+        let fleet = std::sync::Arc::new(crate::workflow::exec::Fleet::new(
+            crate::workflow::exec::AgentCfg::default(),
+        ));
+        // A worker the fleet holds: the roster is what "there is
+        // something to stop" means, and a spawn registers the worker
+        // there before the coroutine starts.
+        fleet
+            .roster()
+            .register(crate::core::ids::AgentId::next(), crate::cancel::CancelScope::new());
+        let mut a = App::with_fleet(fleet);
+        drive(&mut a, vec![Ev::Msg(Msg::TaskBegin("running".into()))]);
+        let acts = drive(&mut a, vec![key(KeyCode::Char('c'), KeyModifiers::CONTROL)]);
+        assert_eq!(acts, vec![Action::Cancel], "the first Ctrl-C cancels the turn");
+        let acts = drive(&mut a, vec![key(KeyCode::Char('c'), KeyModifiers::CONTROL)]);
+        assert_eq!(acts, vec![Action::StopWorkers], "the second stops the workers");
+        assert!(!a.quit, "and does not exit yet");
+        let acts = drive(&mut a, vec![key(KeyCode::Char('c'), KeyModifiers::CONTROL)]);
+        assert_eq!(acts, vec![Action::None]);
+        assert!(a.quit, "the third exits");
     }
 
     #[test]

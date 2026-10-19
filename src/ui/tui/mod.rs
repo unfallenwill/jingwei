@@ -959,6 +959,23 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
             }
             HandleOutcome::Cancel
         }
+        Action::StopWorkers => {
+            // The ladder's middle step: the background agents are
+            // stopped, and the human is told how many there were. The
+            // workers hang under the run's scope, so the first Ctrl-C
+            // already told them to stop — this makes the stop immediate
+            // and says what happened.
+            let n = fleet.stop_all();
+            sink.show(Msg::Note {
+                sev: Sev::Warn,
+                text: if n == 0 {
+                    " no background agents to stop ".into()
+                } else {
+                    format!(" stopped {n} background agent{} ", if n == 1 { "" } else { "s" })
+                },
+            });
+            HandleOutcome::None
+        }
         Action::Submit(line) => {
             // Slash commands share the input line with regular tasks —
             // they never reach the agent. Dispatch first, and only fall
@@ -1800,6 +1817,30 @@ mod tests {
         // no-op (the action runs against a now-empty run slot)
         let (_sink, run) = run_handle(Action::Cancel);
         assert!(run.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_stop_workers_action_says_how_many_were_stopped() {
+        // The ladder's middle step, from the other end: the action
+        // stops the workers the fleet holds and says how many.
+        let fleet = fleet();
+        fleet
+            .roster()
+            .register(crate::core::ids::AgentId::next(), crate::cancel::CancelScope::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        let cfg = tcfg("http://127.0.0.1:1");
+        let session = session_state();
+        let mut run: Option<RunHandle> = None;
+        let hub = crate::mcp::Hub::empty();
+        let router = router(&hub);
+        let outcome = handle(Action::StopWorkers, &cfg, &session, &mut run, &sink, &hub, &router, &fleet);
+        assert!(matches!(outcome, HandleOutcome::None));
+        let m = rx.try_recv().expect("the note was shown");
+        assert!(
+            matches!(&m, Msg::Note { text, .. } if text.contains("stopped 1 background agent")),
+            "got: {m:?}"
+        );
     }
 
     #[tokio::test]

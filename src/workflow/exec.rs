@@ -397,18 +397,16 @@ impl Fleet {
             .collect()
     }
 
-    /// Is a worker live? The TUI's Ctrl-C ladder asks: the middle step
-    /// only exists when there is something to stop.
+    /// Is a worker still running? The TUI's Ctrl-C ladder asks: the
+    /// middle step only exists when there is something to stop.
     ///
-    /// "Live" means *running and not on its way out*: a worker whose
-    /// scope is already cancelled is stopping, and a stop request would
-    /// find nothing to do.
-    #[allow(dead_code)] // the ctrl-c ladder reads it; that lands with the ladder
+    /// The roster is the answer: it holds a worker from the moment it
+    /// is spawned until the moment it ends, and [`Fleet::stop_all`]
+    /// reaches exactly the workers it holds. A worker on its way out is
+    /// still in it — that is the point: a stop request that finds one
+    /// is a stop request that has something to do.
     pub(crate) fn has_live_workers(&self) -> bool {
-        let inner = self.lock();
-        inner.workers.values().any(|w| {
-            w.done.lock().unwrap().is_none() && !w.scope.is_cancelled()
-        })
+        !self.roster.list().is_empty()
     }
 
     /// The workers the wait is still waiting for: the requested ones, or
@@ -864,7 +862,10 @@ mod tests {
             h.fleet.stop_all();
             assert!(!main_scope.is_cancelled(), "the conversation is not the fleet's to stop");
             assert!(!h.scope.is_cancelled(), "and neither is the run the workers hung under");
-            assert!(!h.fleet.has_live_workers(), "the worker is: {:?}", h.fleet.rows());
+            // the worker is on its way out
+            let rows = h.fleet.rows();
+            let row = rows.first().expect("the worker is on the list");
+            assert_eq!(row.state, "stopping", "the worker is stopping: {rows:?}");
         });
     }
 

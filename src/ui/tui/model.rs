@@ -261,6 +261,13 @@ pub struct App {
     pub info: Info,
     /// Ctrl-C was sent to the running agent; a second one exits.
     pub cancel_sent: bool,
+    /// The ladder's middle step was taken: the background agents were
+    /// stopped, and said so. A third Ctrl-C exits.
+    ///
+    /// It is a latch, not a fact about the fleet: the fleet is asked
+    /// whether there is a worker to stop, and this remembers that the
+    /// answer was acted on.
+    pub workers_stopped: bool,
     pub quit: bool,
     /// Where the review overlay looks (see [`Scroll`]). The REPL itself
     /// never scrolls — its transcript lives in the terminal's scrollback.
@@ -363,6 +370,7 @@ impl App {
             },
             info: Info::default(),
             cancel_sent: false,
+            workers_stopped: false,
             quit: false,
             scroll: Scroll::Tail,
             completion: None,
