@@ -246,17 +246,25 @@ mod tests {
     #[test]
     fn cancelled_wakes_only_after_the_flag_is_set() {
         // the first branch of the loop: `if self.is_cancelled() { return; }`
+        // and the re-check after the waiter is registered. A `cancelled()`
+        // that came back while the flag was still false would be a waiter
+        // waking for nothing — so the test watches both halves of the
+        // name: while the flag is false the waiter is still parked, and
+        // the flag is true the moment the waiter comes back.
         let t = CancelToken::new();
-        crate::test_util::block_on(async {
-            // immediate: the flag is still false, so we have to wait —
-            // a sibling cancel wakes us up
-            let tc = t.clone();
-            let waiter = tokio::spawn(async move { t.cancelled().await });
-            tokio::task::spawn_blocking(move || {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                tc.cancel();
-            });
+        let tc = t.clone();
+        crate::test_util::block_on(async move {
+            let waiter = {
+                let t = t.clone();
+                tokio::spawn(async move { t.cancelled().await })
+            };
+            // give the waiter a beat to reach the notify
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(!t.is_cancelled(), "the flag is still false");
+            assert!(!waiter.is_finished(), "the waiter is still parked on the flag");
+            tc.cancel();
             waiter.await.unwrap();
+            assert!(t.is_cancelled(), "the waiter came back with the flag set");
         });
     }
 
