@@ -62,6 +62,13 @@
 //! - `disconnect`: as `reconnect`, and the server's tools leave the offered
 //!   list at once.
 //!
+//! Two operations on one server do not wait for each other, so they can
+//! land in either order. The later one is the one that stands: the
+//! registry's view is the later operation's, and the earlier one is told
+//! it was superseded. A connection that comes up after the server was
+//! taken offline is not that server's any more, and does not bring it
+//! back.
+//!
 //! The old behaviour — the op waited behind the in-flight call — was an
 //! accident of the actor's loop, not a contract, and it is not described as
 //! one.
@@ -129,9 +136,12 @@ enum Command {
     /// A server's task has opened a fresh connection and is telling the
     /// registry what it found. The reply is the one the operation is
     /// waiting for: it is answered here, once the registry has been told.
+    /// The epoch is the one the connection was opened under — the registry
+    /// adopts the connection only if that is still the server's epoch.
     Adopted {
         server: String,
         op: ServerOp,
+        epoch: u64,
         outcome: Result<inner::Adoption, String>,
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -391,8 +401,8 @@ where
                     let _ = reply.send(inner.list());
                 }
                 Command::ServerOp { op, name, reply } => inner.server_op(op, &name, reply),
-                Command::Adopted { server, op, outcome, reply } => {
-                    inner.finish_adopt(&server, op, outcome, reply);
+                Command::Adopted { server, op, epoch, outcome, reply } => {
+                    inner.finish_adopt(&server, op, epoch, outcome, reply);
                 }
                 Command::Shutdown { reply } => {
                     inner.shutdown_all().await;
@@ -809,6 +819,25 @@ mod tests {
         (stub, entry)
     }
 
+    /// A stub whose *start* is slow: the script waits before it speaks, so a
+    /// connection is still opening when the next operation lands. The wait
+    /// is in the wrapper the test builds, so the fixture itself is
+    /// unchanged.
+    fn slow_start_stub(name: &str, seconds: u32) -> (Stub, Entry) {
+        let stub = Stub::new();
+        let script = stub.script();
+        let mut entry = stub.entry(&[("STUB_TOOLS", "echo")]);
+        let path = script.to_string_lossy().replace('\'', r"'\''");
+        if let Ok(config) = &mut entry.config {
+            config.args = vec![
+                "-c".into(),
+                format!("sleep {seconds}; exec bash '{path}'"),
+            ];
+        }
+        entry.name = name.to_string();
+        (stub, entry)
+    }
+
     /// The names of the tools on offer, in the order they are offered.
     fn offered(defs: Vec<Value>) -> Vec<String> {
         defs.iter()
@@ -952,6 +981,51 @@ mod tests {
         // And the call that was already running still finishes.
         std::fs::write(stub.gate(), "open").unwrap();
         assert_eq!(held.await.unwrap(), "called with {text:slow}");
+        hub.shutdown().await;
+    }
+
+    /// A server taken offline while a reconnect is still opening its
+    /// connection stays offline.
+    ///
+    /// The connection the reconnect was opening comes up late. It is not
+    /// the server's any more — the user was told "disable: done" while it
+    /// was on its way — so the registry must not bring the server back
+    /// because of it, and must not offer its tools to the model again.
+    #[tokio::test]
+    async fn a_disable_during_a_reconnect_is_not_undone_by_the_connection_that_comes_up() {
+        let (_stub, entry) = slow_start_stub("slow", 1);
+        let hub = Hub::of_entries(vec![entry]).await;
+
+        // The reconnect is taken in: the server's tools leave the offered
+        // list as it is issued, while its connection is still opening.
+        let reconnecting = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.reconnect("slow").await }
+        });
+        let mut taken_in = false;
+        for _ in 0..200 {
+            if hub.definitions().await.is_empty() {
+                taken_in = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(taken_in, "the reconnect was never taken in");
+
+        // The disable lands while the connection is still opening.
+        hub.disable("slow").await.unwrap();
+
+        // The connection comes up, and the server is still disabled.
+        let outcome = reconnecting.await.unwrap();
+        let err = outcome.expect_err("the reconnect was superseded by the disable");
+        assert!(err.contains("disabled"), "{err}");
+        let statuses = hub.list().await;
+        assert_eq!(statuses.len(), 1, "got: {statuses:?}");
+        assert_eq!(statuses[0].state, ServerState::Disabled, "got: {statuses:?}");
+        assert_eq!(statuses[0].tools_count, 0, "got: {statuses:?}");
+        assert!(hub.definitions().await.is_empty(), "no tools are offered");
+        let out = hub.call("mcp__slow__echo", r#"{"text":"hi"}"#).await;
+        assert!(out.starts_with("error: mcp server slow is disabled"), "{out}");
         hub.shutdown().await;
     }
 

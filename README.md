@@ -323,6 +323,12 @@ cancels it nor waits for it. Calls to different servers overlap; calls to
 one server are one at a time, because one connection is a request/response
 protocol.
 
+Two commands on one server do not wait for each other, so they can land in
+either order. The later one is the one that stands — the registry's view
+is the later command's — and the earlier one is told it was superseded: a
+connection that comes up after the server was taken offline does not bring
+it back.
+
 1. POST `{base}/v1/messages` (minimax — base defaulting to
    `https://api.minimax.cn/anthropic`, model to `MiniMax-M3`) or
    `{base}/chat/completions` (zai — base defaulting to

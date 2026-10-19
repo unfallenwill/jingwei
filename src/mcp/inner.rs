@@ -56,6 +56,10 @@ enum ServerMsg {
     Adopt {
         op: ServerOp,
         config: config::ServerConfig,
+        /// The registry's epoch when this was asked for. The connection is
+        /// the server's only if that is still the server's epoch when it
+        /// comes up.
+        epoch: u64,
         reply: oneshot::Sender<Result<(), String>>,
     },
     /// Close the connection at the next safe point, and keep the task.
@@ -149,6 +153,14 @@ struct ServerEntry {
     /// up the file again.
     config: Result<config::ServerConfig, String>,
     state: InternalState,
+    /// How many times this server has been taken offline.
+    ///
+    /// A connection is opened under the epoch that was current when it was
+    /// asked for, and the number travels with it. If the server has been
+    /// taken offline since, the connection that came up is not the server's
+    /// any more: the registry has already said what it wants, and a
+    /// connection that arrives late must not undo that.
+    epoch: u64,
     /// The task that owns this server's connection, and the queue it takes
     /// calls from. Present for *every* configured server — including one
     /// that failed to start — because `enable` and `reconnect` have to be
@@ -264,6 +276,7 @@ impl HubInner {
                             from,
                             config,
                             state: InternalState::Failed(why),
+                            epoch: 0,
                             queue,
                         },
                     );
@@ -291,6 +304,7 @@ impl HubInner {
                                 protocol,
                                 tools: offered_names,
                             },
+                            epoch: 0,
                             queue,
                         },
                     );
@@ -550,7 +564,8 @@ impl HubInner {
             }
         };
         let queue = entry.queue.clone();
-        if let Err(sent) = queue.send(ServerMsg::Adopt { op: ServerOp::Enable, config, reply }) {
+        let epoch = entry.epoch;
+        if let Err(sent) = queue.send(ServerMsg::Adopt { op: ServerOp::Enable, config, epoch, reply }) {
             if let ServerMsg::Adopt { reply, .. } = sent.0 {
                 let _ = reply.send(Err(format!("mcp server {name} is not connected")));
             }
@@ -585,10 +600,17 @@ impl HubInner {
             .expect("the server was there a moment ago")
             .queue
             .clone();
-        self.servers
-            .get_mut(name)
-            .expect("the server was there a moment ago")
-            .state = state;
+        {
+            let entry = self
+                .servers
+                .get_mut(name)
+                .expect("the server was there a moment ago");
+            // Taking the server offline is what supersedes a connection that
+            // is still on its way: the epoch moves, and a connection opened
+            // under the old one is not this server's when it arrives.
+            entry.epoch += 1;
+            entry.state = state;
+        }
         self.remove_server_tools(name);
         let _ = queue.send(ServerMsg::Retire);
         let _ = reply.send(Ok(()));
@@ -609,11 +631,12 @@ impl HubInner {
             }
         };
         let queue = entry.queue.clone();
+        let epoch = entry.epoch;
         // The registry forgets the server's tools at once: the connection
         // that is being replaced is on its way out, and the model should
         // not be offered a tool whose server is in the middle of a change.
         self.remove_server_tools(name);
-        if let Err(sent) = queue.send(ServerMsg::Adopt { op: ServerOp::Reconnect, config, reply }) {
+        if let Err(sent) = queue.send(ServerMsg::Adopt { op: ServerOp::Reconnect, config, epoch, reply }) {
             if let ServerMsg::Adopt { reply, .. } = sent.0 {
                 let _ = reply.send(Err(format!("mcp server {name} is not connected")));
             }
@@ -627,9 +650,19 @@ impl HubInner {
         &mut self,
         server: &str,
         op: ServerOp,
+        epoch: u64,
         outcome: Result<Adoption, String>,
         reply: oneshot::Sender<Result<(), String>>,
     ) {
+        // The connection is the server's only if nothing has been done to
+        // the server since it was asked for. A server that was taken
+        // offline while the connection was opening keeps the state it was
+        // taken to: the registry does not bring a server back because a
+        // connection it had already given up on came up late.
+        if self.servers.get(server).map(|entry| entry.epoch) != Some(epoch) {
+            let _ = reply.send(Err(self.superseded(server, op)));
+            return;
+        }
         match outcome {
             Ok(adoption) => {
                 let Adoption { identity, protocol, tools, notes } = adoption;
@@ -658,6 +691,23 @@ impl HubInner {
                 }
             }
         }
+    }
+
+    /// What to say when a connection came up after the server it was opened
+    /// for was taken offline: the operation did not happen, and what stopped
+    /// it is named.
+    fn superseded(&self, server: &str, op: ServerOp) -> String {
+        let what = match self.servers.get(server).map(|entry| &entry.state) {
+            Some(InternalState::Disabled) => "disabled",
+            Some(InternalState::Disconnected) => "disconnected",
+            _ => "changed",
+        };
+        let busy = match op {
+            ServerOp::Enable => "enabling",
+            ServerOp::Reconnect => "reconnecting",
+            _ => "changing",
+        };
+        format!("mcp server {server} was {what} while it was {busy}")
     }
 
     /// End every connection: what a session does on its way out, so that the
@@ -826,7 +876,7 @@ async fn server_task(
                 };
                 let _ = call.reply.send(answer);
             }
-            ServerMsg::Adopt { op, config, reply } => {
+            ServerMsg::Adopt { op, config, epoch, reply } => {
                 // The old connection is retired here — at the next safe
                 // point, which is where this message is found.
                 if let Some(old) = connection.take() {
@@ -848,6 +898,7 @@ async fn server_task(
                 let _ = actor.send(Command::Adopted {
                     server: name.clone(),
                     op,
+                    epoch,
                     outcome,
                     reply,
                 });
