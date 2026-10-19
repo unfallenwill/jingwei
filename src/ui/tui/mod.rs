@@ -948,8 +948,9 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
                 return dispatch_slash(cmd, cfg, session, run, sink, hub);
             }
             // A second Submit must not orphan the first run: the run
-            // slot is filled here, synchronously, before the job is
-            // spawned — so a Submit that arrives while the first is in
+            // slot is filled here, synchronously — the spawn and the
+            // assignment sit next to each other with no await between
+            // them, so a Submit that arrives while the first is in
             // flight finds the slot occupied and refuses. Two
             // coroutines racing the session lock would push into the
             // same transcript and tear the file.
