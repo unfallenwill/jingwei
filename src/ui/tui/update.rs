@@ -144,8 +144,12 @@ fn agent_event(app: &mut App, id: AgentId, ev: AgentMsg) {
         AgentMsg::Think(t) => app.push_agent_think(id, &t),
         AgentMsg::ThinkEnd => app.fold_agent_thought(id),
         AgentMsg::Tool { name, summary, output } => app.fold_agent_tool(id, &name, summary, output),
-        // the tag in front of the note; the note's own spacing is its own
+        // the tag in front of the note; the note's own spacing is its own.
+        // The main's live line lands first — the same order the main's
+        // own note keeps, so the transcript reads in the order the
+        // screen did.
         AgentMsg::Note { sev, text } => {
+            app.flush_partial();
             let tag = agent_tag(id);
             app.rows.push(Row::Note(sev, format!("{tag}{text}")));
         }
@@ -1008,6 +1012,92 @@ mod tests {
             }
             r => panic!("the note landed a row: {r:?}"),
         }
+    }
+
+    /// The transcript's rows as plain text, in order — so a test can pin
+    /// the *order* the rows land in, not only that they exist.
+    fn row_texts(app: &App) -> Vec<String> {
+        app.rows.iter().map(|r| match r {
+            Row::Task(t) => format!("task {t}"),
+            Row::Line(l) => l.clone(),
+            Row::Thought(f) => format!("thought #{}", f.n),
+            Row::Tool { head, .. } => head.clone(),
+            Row::Note(_, t) => t.clone(),
+            Row::Sep => "sep".to_string(),
+        }).collect()
+    }
+
+    #[test]
+    fn a_workers_row_lands_after_the_mains_live_line() {
+        // the transcript reads in the order the screen did: the main's
+        // live line lands before the worker's row — the same order the
+        // main's own note keeps. A worker's row committed ahead of it
+        // would sit above text the human was already reading.
+        let mut a = App::new();
+        let id = AgentId::next();
+        drive(&mut a, vec![
+            Ev::Msg(Msg::TaskBegin("t".into())),
+            Ev::Msg(Msg::Text("the main's half line".into())),
+        ]);
+        drive(&mut a, vec![Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Note {
+            sev: Sev::Warn, text: " watch out ".into(),
+        }) })]);
+        assert_eq!(row_texts(&a), vec![
+            "task t".to_string(),
+            "the main's half line".to_string(),
+            format!("[{id}]  watch out "),
+        ], "the main's live line lands first: {:?}", a.rows);
+        // and the rest of the main's line follows it, as it does when
+        // the main's own note interrupts the same line
+        drive(&mut a, vec![Ev::Msg(Msg::Text(" and more\n".into()))]);
+        assert_eq!(row_texts(&a), vec![
+            "task t".to_string(),
+            "the main's half line".to_string(),
+            format!("[{id}]  watch out "),
+            " and more".to_string(),
+        ], "the main's line resumes after the worker's row: {:?}", a.rows);
+    }
+
+    #[test]
+    fn a_workers_tool_row_lands_after_the_mains_live_line() {
+        // the same rule for the worker's tool row
+        let mut a = App::new();
+        let id = AgentId::next();
+        drive(&mut a, vec![
+            Ev::Msg(Msg::TaskBegin("t".into())),
+            Ev::Msg(Msg::Text("the main's half line".into())),
+        ]);
+        drive(&mut a, vec![Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Tool {
+            name: "bash".into(), summary: "$ ls".into(), output: "a\n".into(),
+        }) })]);
+        assert_eq!(row_texts(&a), vec![
+            "task t".to_string(),
+            "the main's half line".to_string(),
+            format!("[{id}] [bash] $ ls"),
+        ], "the main's live line lands first: {:?}", a.rows);
+    }
+
+    #[test]
+    fn a_finished_worker_lands_after_the_mains_live_line() {
+        // and for the worker's last rows
+        let mut a = App::new();
+        let id = AgentId::next();
+        drive(&mut a, vec![
+            Ev::Msg(Msg::TaskBegin("t".into())),
+            Ev::Msg(Msg::Text("the main's half line".into())),
+        ]);
+        drive(&mut a, vec![
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Started { label: "build".into() }) }),
+            Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Finished {
+                state: TurnState::Completed, report: "all done".into(),
+            }) }),
+        ]);
+        assert_eq!(row_texts(&a), vec![
+            "task t".to_string(),
+            "the main's half line".to_string(),
+            format!("[{id}] ✓ build · 0s · 0 tools"),
+            format!("[{id}] all done"),
+        ], "the main's live line lands first: {:?}", a.rows);
     }
 
     #[test]

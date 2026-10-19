@@ -471,6 +471,15 @@ impl App {
     // counterparts of `push_text` / `push_think` / `fold_thought` /
     // `fold_tool`. The main's own fold machinery is untouched: the
     // main's half-typed line stays the main's business.
+    //
+    // One rule the worker's rows share with the main's: a row that
+    // interrupts the main's live line lands *after* it. The main's own
+    // note, thought and tool rows flush the main's partial first
+    // (`fold_thought`, `fold_tool`, the `Msg::Note` arm), so the
+    // transcript reads in the order the screen did; a worker's row is
+    // committed to the same transcript and owes the main the same
+    // courtesy — otherwise a worker's row lands above text the human was
+    // already reading.
 
     /// A worker's text: buffered, and landed when the agent ends.
     pub fn push_agent_text(&mut self, id: AgentId, t: &str) {
@@ -503,6 +512,9 @@ impl App {
             };
             (body, duration)
         };
+        // the main's live line lands before the worker's row — the same
+        // order the main's own fold keeps
+        self.flush_partial();
         // The numbering is the transcript's, not the agent's: a worker's
         // fold takes its place in the one shared sequence, so no two
         // rows of a transcript can both say "thought #1".
@@ -519,6 +531,8 @@ impl App {
 
     /// A worker's tool call: a tagged head and the tool's tail.
     pub fn fold_agent_tool(&mut self, id: AgentId, name: &str, summary: String, output: String) {
+        // the main's live line lands before the worker's row
+        self.flush_partial();
         // the worker's open reasoning block closes before its tool row,
         // exactly as the main's open block closes before the main's
         self.fold_agent_thought(id);
@@ -533,6 +547,8 @@ impl App {
 
     /// A worker ended: land its text, fold its reasoning, note it.
     pub fn finish_agent(&mut self, id: AgentId, state: TurnState, report: String) {
+        // the main's live line lands before the worker's rows
+        self.flush_partial();
         let tag = agent_tag(id);
         let (partial, label, tools, elapsed) = {
             let buf = self.agents.entry(id).or_default();
