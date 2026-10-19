@@ -229,7 +229,7 @@ mod tests {
     use crate::agent::{AgentRole, AgentId};
     use crate::cancel::{CancelScope, CancelToken};
     use crate::mcp::Hub;
-    use crate::test_util::{block_on, cfg, mock_seq, mock_seq_with, mock_stall, sink};
+    use crate::test_util::{block_on, cfg, mock_seq, mock_seq_with, mock_stall, sink, Recorder};
     use serde_json::json;
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
@@ -369,24 +369,42 @@ mod tests {
         let (port, stalled_written) = mock_stall(tool, stalled);
         let mut cx = ctx_with("go");
         let mut agent = Agent::main("go");
+        // The sink that sees what the client actually *delivered*: the
+        // cancellation has to land after the partial text, or the
+        // interruption cuts the response short of the text it had
+        // already streamed.
+        let recorder = Recorder::default();
         let err = block_on(async {
             let (router, hub) = router();
             let token = Arc::new(CancelToken::new());
             let t = token.clone();
+            let seen = recorder.clone();
             // Cancel only once the mock has actually written the stalled
             // bytes — the interruption then provably lands mid-stream,
             // whatever the scheduler is doing with the other 487 tests.
             // (A fixed 400ms delay raced the stall setup and flaked under
             // parallel load; this waits for the fact, not the clock.)
+            //
+            // The bytes being on the wire is not enough on its own: the
+            // client may not have read them yet, and the cancel would
+            // then land before the partial text was recorded — a red
+            // test that says nothing about the code under test. So the
+            // cancel waits for the delivery too: the sink has seen the
+            // text. (That residual race is what still reddened the suite
+            // about one run in twenty under a full parallel load.)
             tokio::task::spawn_blocking(move || {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while !stalled_written.load(std::sync::atomic::Ordering::SeqCst) {
                     if std::time::Instant::now() > deadline { panic!("mock never wrote the stalled response"); }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
+                while !seen.msgs().iter().any(|m| matches!(m, Msg::Text(t) if t.contains("partial answ"))) {
+                    if std::time::Instant::now() > deadline { panic!("the client never delivered the stalled text"); }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
                 t.cancel();
             });
-            let res = agent_loop(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), true), &mut cx, &router, &token, &sink()).await;
+            let res = agent_loop(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), true), &mut cx, &router, &token, &recorder).await;
             hub.shutdown().await;
             res
         }).unwrap_err();
