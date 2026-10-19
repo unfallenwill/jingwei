@@ -20,6 +20,7 @@
 //! | `STUB_FOREVER` | always hands back another cursor |
 //! | `STUB_JUNK` | offers entries that are not tools |
 //! | `STUB_LOG` | appends every line it reads, and `eof` when its input ends |
+//! | `STUB_GATE` | the file the `gate` tool waits for before it answers |
 //!
 //! The tool a call names decides what the call does:
 //!
@@ -32,6 +33,7 @@
 //! | `structured` | structure and no prose |
 //! | `big` | more text than a result is allowed to carry |
 //! | `slow` | nothing for a while, so that a budget runs out |
+//! | `gate` | nothing until the file named by `STUB_GATE` appears |
 //! | `die` | nothing, because the server exits |
 //! | `noise` | a banner where a message belongs, then an answer |
 //! | `ping` | a request of its own to answer first, then the result |
@@ -83,6 +85,13 @@ impl Stub {
         self.dir.join("received.log")
     }
 
+    /// The file the `gate` tool waits for. A test opens it — by creating the
+    /// file — to let a held call go. It lives in the stub's own directory,
+    /// so it goes away with the fixture and leaves nothing behind.
+    pub fn gate(&self) -> PathBuf {
+        self.dir.join("gate")
+    }
+
     /// What the server was sent, one line each, and `eof` when its input ended.
     pub fn received(&self) -> Vec<String> {
         std::fs::read_to_string(self.log())
@@ -90,6 +99,31 @@ impl Stub {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    /// How many of the lines the server read carry `needle`.
+    pub fn count(&self, needle: &str) -> usize {
+        self.received()
+            .iter()
+            .filter(|line| line.contains(needle))
+            .count()
+    }
+
+    /// Wait until the server has read a line carrying `needle`, and say
+    /// whether it did.
+    ///
+    /// The tests that need a call to be *in flight* wait for the request to
+    /// reach the server: the log is what the server writes as it reads, so
+    /// a line in it is proof that the request is there and not merely on its
+    /// way.
+    pub async fn wait_for(&self, needle: &str) -> bool {
+        for _ in 0..500 {
+            if self.received().iter().any(|line| line.contains(needle)) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
     }
 
     /// The entry for this stub, with `vars` added to its environment.
@@ -193,6 +227,26 @@ answer_call() {
     structured) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[],"structuredContent":{"count":2,"of":"things"}}}\n' "$id" ;;
     big) text_result "$id" "$(head -c 60000 /dev/zero | tr '\0' 'x')" ;;
     slow) sleep 5; text_result "$id" "eventually" ;;
+    gate)
+      local args
+      args=$(arguments "$line")
+      if [ -z "${STUB_GATE:-}" ]; then
+        text_result "$id" "the gate tool needs STUB_GATE"
+      else
+        # The wait runs in the background, so the read loop goes straight
+        # back to `read` and can take the next request while this one is
+        # still held. That is what makes two calls to one server able to be
+        # in flight at once, which is the thing the hub has to prevent.
+        (
+          n=0
+          while [ "$n" -lt 300 ]; do
+            if [ -e "$STUB_GATE" ]; then break; fi
+            sleep 0.1
+            n=$((n+1))
+          done
+          text_result "$id" "called with ${args//\"/}"
+        ) &
+      fi ;;
     die) exit 3 ;;
     noise)
       printf 'Stub MCP server ready.\n'
