@@ -93,6 +93,15 @@ impl std::fmt::Debug for Roster {
 mod tests {
     use super::*;
 
+    /// The roster is shared, not owned: one registry answers "who is
+    /// running" for the whole process, and the reader that answers it
+    /// may be a different task from the one that registered.
+    #[test]
+    fn the_roster_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Roster>();
+    }
+
     #[test]
     fn the_roster_holds_a_live_agent() {
         let roster = Roster::new();
