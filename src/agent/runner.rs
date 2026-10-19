@@ -15,7 +15,6 @@ use crate::api::call_api as api_call_api;
 use crate::cancel::{CancelScope, CancelToken};
 use crate::config::Config;
 use crate::core::context::Context;
-use crate::core::ids::AgentId;
 use crate::core::ir::{Block, Message, ToolResult};
 use crate::core::ports::ToolRouter;
 use crate::core::turn::{TurnOutcome, TurnState};
@@ -134,7 +133,7 @@ async fn agent_loop(agent: &mut Agent, cfg: &Config, ctx: &mut Context, router: 
     agent.lifecycle.transition(TurnState::InProgress, None)
         .map_err(|e| Error::Msg(e.to_string()))?;
 
-    let result = run_turn(cfg, ctx, router, token, sink, agent.id).await;
+    let result = run_turn(cfg, ctx, router, token, sink, agent).await;
     // The Result → TurnOutcome translation lives here because `core::turn`
     // deliberately keeps no dependency on the error vocabulary: the turn
     // carries a failure as a `String`, and turning the error type into
@@ -157,7 +156,7 @@ async fn agent_loop(agent: &mut Agent, cfg: &Config, ctx: &mut Context, router: 
 /// per-agent view of every file on it, so two agents cannot overwrite each
 /// other's work without either of them finding out. It is the agent's own
 /// value, so the tools it called are recorded on it as they happen.
-async fn run_turn(cfg: &Config, ctx: &mut Context, router: &ToolRouter, token: &CancelToken, sink: &dyn Show, agent: AgentId) -> crate::Result<()> {
+async fn run_turn(cfg: &Config, ctx: &mut Context, router: &ToolRouter, token: &CancelToken, sink: &dyn Show, agent: &mut Agent) -> crate::Result<()> {
     for step in 0..cfg.max_turns {
         if token.is_cancelled() { return Err(Error::Interrupted); }
         // The tool list the model sees is whatever the providers say right
@@ -198,10 +197,11 @@ async fn run_turn(cfg: &Config, ctx: &mut Context, router: &ToolRouter, token: &
             let out = if stopped {
                 "skipped: this run was interrupted before the tool ran".into()
             } else {
-                router.call(name, input, token, agent).await
+                router.call(name, input, token, agent.id).await
             };
             let out = truncate(&out);
             print_tool_call(name, input, &out, sink);
+            agent.tools_used.push(name.to_string());
             results.push(ToolResult { id: id.to_string(), content: out });
             if token.is_cancelled() { stopped = true; }
         }
@@ -327,6 +327,25 @@ mod tests {
         // the turn reached Completed — the natural exit on a final-text response
         assert_eq!(agent.state(), TurnState::Completed);
         assert!(agent.started_at().is_some() && agent.ended_at().is_some());
+    }
+
+    /// The agent records the tools it called, in order.
+    ///
+    /// The fleet's table says how much work an agent did, and the tools
+    /// it called are the only honest measure of that.
+    #[test]
+    fn the_agent_records_the_tools_it_called() {
+        let tool = r#"{"content":[{"type":"tool_use","id":"t1","name":"bash","input":{"command":"echo hi"}}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let done = r#"{"content":[{"type":"text","text":"done"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let (port, _) = mock_seq(vec![(200, tool.into()), (200, done.into())]);
+        let mut cx = ctx_with("run echo");
+        let mut agent = Agent::main("run echo");
+        block_on(async {
+            let (router, hub) = router();
+            agent_loop(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &CancelToken::new(), &sink()).await.unwrap();
+            hub.shutdown().await;
+        });
+        assert_eq!(agent.tools_used, vec!["bash".to_string()], "the tool it called, recorded on it");
     }
 
     #[test]
