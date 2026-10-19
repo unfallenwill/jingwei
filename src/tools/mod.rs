@@ -173,8 +173,17 @@ pub(crate) fn bash_output(status: Option<&ExitStatus>, out: &str, err: &str) -> 
     s
 }
 
-pub(crate) fn dispatch(name: &str, input: &Value) -> String {
+/// The registry's entry for a tool name, if it has one.
+///
+/// The one lookup the registry answers with: the provider's `owns` and the
+/// dispatcher both ask it, so the list of tools the model is shown and the
+/// list of tools the router will run cannot drift apart.
+pub(crate) fn find(name: &str) -> Option<Tool> {
     tools().into_iter().find(|t| t.name == name)
+}
+
+pub(crate) fn dispatch(name: &str, input: &Value) -> String {
+    find(name)
         .map(|t| (t.run)(input))
         .unwrap_or_else(|| format!("error: unknown tool '{name}'"))
 }
@@ -195,9 +204,10 @@ pub(crate) fn builtin_schemas() -> Vec<Value> {
 /// The four shipped tools, as a tool provider.
 ///
 /// The provider is the seam the router talks to; the registry below it is
-/// unchanged. `owns` is "one of the four", `definitions` is the four
-/// schemas in the registry's order, and `call` runs the same bodies the
-/// tool runtime ran before the provider existed.
+/// unchanged. `owns` asks the registry — the provider and the list it
+/// advertises cannot disagree — `definitions` is the four schemas in the
+/// registry's order, and `call` runs the same bodies the tool runtime ran
+/// before the provider existed.
 ///
 /// Cancellation formats are deliberately different — the model can tell
 /// what happened from the prefix alone: bash preserves whatever output
@@ -208,7 +218,7 @@ pub(crate) struct Builtins;
 
 impl ToolProvider for Builtins {
     fn owns(&self, name: &str) -> bool {
-        matches!(name, "bash" | "read_file" | "write_file" | "edit_file")
+        find(name).is_some()
     }
 
     fn definitions<'a>(&'a self) -> BoxFuture<'a, Vec<Value>> {
