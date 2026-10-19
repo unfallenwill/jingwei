@@ -225,12 +225,6 @@ impl Scroll {
 pub struct AgentBuf {
     /// The label the fleet gave it ("build", "test").
     pub label: String,
-    /// The task it was given.
-    ///
-    /// The port's `Started` event carries a label only, so nothing can
-    /// fill this yet — the fleet slice brings the task along with it.
-    #[allow(dead_code)]
-    pub task: String,
     /// Where it stands.
     pub state: TurnState,
     /// Streamed text, not yet a row. It lands when the agent ends.
