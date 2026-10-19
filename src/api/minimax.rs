@@ -18,13 +18,19 @@ use serde_json::{json, Value};
 
 /// The minimax adapter's one entry into the provider port. Strip is a
 /// wire rule wearing a policy flag: this wire carries thinking blocks in
-/// its history verbatim, so stripping them is this adapter's job, never
-/// the core's. The third tuple slot is the rendered wire body the vendor
-/// sent — the session records it verbatim.
-pub(super) async fn turn(cfg: &Config, ctx: &Context, history: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
-    let messages: Vec<Message> = if cfg.thinking == Thinking::Strip { strip_thinking(history) } else { history.to_vec() };
+/// the context's transcript verbatim, so stripping them is this adapter's
+/// job, never the core's. The third tuple slot is the rendered wire body
+/// the vendor sent — the session records it verbatim.
+pub(super) async fn turn(cfg: &Config, ctx: &Context, token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
     let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
-    let body = body(cfg, ctx, &messages, cfg.streaming);
+    // The transcript is the context's: it is read from there, never
+    // copied alongside it. The strip branch transforms it; the preserve
+    // branch hands the very same slice over.
+    let body = if cfg.thinking == Thinking::Strip {
+        body(cfg, ctx, &strip_thinking(ctx.history()), cfg.streaming)
+    } else {
+        body(cfg, ctx, ctx.history(), cfg.streaming)
+    };
     let key = cfg.api_key.clone();
     if cfg.streaming { streaming(url, body, key, token, sink).await }
     else { blocking(url, body, key, token, sink).await }
@@ -160,7 +166,8 @@ mod tests {
 
     use crate::api::{call_api, Protocol};
     use crate::api::{Effort, Thinking as CThinking};
-    use crate::test_util::{block_on, cfg, ctx as make_ctx, mock, mock_seq, sink, BlockExt};
+    use crate::core::ir::{Block, Message, ToolResult};
+    use crate::test_util::{block_on, cfg, ctx as make_ctx, mock, mock_seq, request_body, sink, BlockExt};
     use serde_json::json;
 
     #[test]
@@ -266,12 +273,12 @@ mod tests {
         c.protocol = Protocol::MINIMAX;
         let token = crate::cancel::CancelToken::new();
         let cx = make_ctx();
-        let (resp, _, _) = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
+        let (resp, _, _) = block_on(call_api(&c, &cx, &token, &sink())).unwrap();
         assert_eq!(resp.blocks.len(), 1);
         let bad = mock(&json!({"error": {"message": "boom"}}).to_string(), 400, false);
         let mut c = cfg(format!("http://127.0.0.1:{bad}"), false);
         c.protocol = Protocol::MINIMAX;
-        let err = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap_err();
+        let err = block_on(call_api(&c, &cx, &token, &sink())).unwrap_err();
         assert!(err.to_string().contains("boom"), "got: {err}");
     }
 
@@ -312,7 +319,7 @@ mod tests {
         let c = cfg(format!("http://127.0.0.1:{port}"), true);
         let token = crate::cancel::CancelToken::new();
         let cx = make_ctx();
-        let (resp, _, _) = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
+        let (resp, _, _) = block_on(call_api(&c, &cx, &token, &sink())).unwrap();
         assert_eq!(resp.blocks.len(), 2);
         assert_eq!(resp.blocks[0].text().unwrap(), "hello world");
         assert_eq!(resp.blocks[1].name(), "bash");
@@ -336,7 +343,7 @@ mod tests {
         let c = cfg(format!("http://127.0.0.1:{port}"), true);
         let token = crate::cancel::CancelToken::new();
         let cx = make_ctx();
-        let (resp, _, _) = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
+        let (resp, _, _) = block_on(call_api(&c, &cx, &token, &sink())).unwrap();
         // message_start's usage must reach the response — both input and
         // cache_read survive even though message_delta carries neither.
         assert_eq!(resp.usage["input_tokens"], 1234, "message_start input must persist");
@@ -360,7 +367,7 @@ mod tests {
         let c = cfg(format!("http://127.0.0.1:{port}"), true);
         let token = crate::cancel::CancelToken::new();
         let cx = make_ctx();
-        let err = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap_err();
+        let err = block_on(call_api(&c, &cx, &token, &sink())).unwrap_err();
         assert!(err.to_string().contains("rate limit"), "got: {err}");
     }
 
@@ -371,11 +378,66 @@ mod tests {
         let (port, seen) = mock_seq(vec![(200, body)]);
         let c = cfg(format!("http://127.0.0.1:{port}"), false);
         let cx = make_ctx();
-        let _ = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
+        let _ = block_on(call_api(&c, &cx, &token, &sink())).unwrap();
         let raw = seen.lock().unwrap()[0].clone();
         assert!(raw.contains("POST /v1/messages"), "minimax hits /v1/messages: {raw}");
         assert!(raw.contains("x-api-key: test-key") && raw.contains("anthropic-version: 2023-06-01"),
             "minimax carries both auth headers: {raw}");
+    }
+
+    /// The transcript has one owner — the context — and the wire is
+    /// rendered from it. What the model sees is what the context holds:
+    /// the same turns, in the same order, with the tool_use and its
+    /// tool_result still paired.
+    #[test]
+    fn the_contexts_transcript_reaches_the_messages_wire() {
+        let mut cx = make_ctx();
+        cx.push(Message::User("first".into()));
+        cx.push(Message::Assistant(vec![Block::ToolUse {
+            id: "t1".into(), name: "bash".into(), input: json!({}),
+        }]));
+        cx.push(Message::ToolResults(vec![ToolResult { id: "t1".into(), content: "ok".into() }]));
+        let (port, seen) = mock_seq(vec![(200, r#"{"content":[],"usage":{}}"#.into())]);
+        let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
+        c.protocol = Protocol::MINIMAX;
+        let token = crate::cancel::CancelToken::new();
+        block_on(call_api(&c, &cx, &token, &sink())).unwrap();
+        let v = request_body(&seen.lock().unwrap()[0]);
+        let msgs = v["messages"].as_array().expect("the Messages wire sends messages");
+        assert_eq!(msgs.len(), 3, "the context's three turns reach the wire: {v}");
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "first");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"][0]["type"], "tool_use");
+        assert_eq!(msgs[1]["content"][0]["id"], "t1");
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
+        assert_eq!(msgs[2]["content"][0]["tool_use_id"], "t1",
+            "the tool_use and its tool_result stay paired on the wire");
+    }
+
+    /// Strip is this wire's own rule, and it applies to the context's
+    /// transcript: the thinking block goes, the rest of the turn stays.
+    /// A vendor that "just read `ctx.history()`" without the strip would
+    /// put the thinking block on the wire.
+    #[test]
+    fn strip_drops_thinking_from_the_contexts_transcript() {
+        let mut cx = make_ctx();
+        cx.push(Message::Assistant(vec![
+            Block::Thinking { text: "secret".into(), signature: Some("sig".into()) },
+            Block::Text("kept".into()),
+        ]));
+        let (port, seen) = mock_seq(vec![(200, r#"{"content":[],"usage":{}}"#.into())]);
+        let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
+        c.protocol = Protocol::MINIMAX;
+        c.thinking = CThinking::Strip;
+        let token = crate::cancel::CancelToken::new();
+        block_on(call_api(&c, &cx, &token, &sink())).unwrap();
+        let v = request_body(&seen.lock().unwrap()[0]);
+        let blocks = v["messages"][0]["content"].as_array().expect("the turn is on the wire");
+        assert_eq!(blocks.len(), 1, "the thinking block is stripped: {v}");
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "kept");
     }
 
     #[test]

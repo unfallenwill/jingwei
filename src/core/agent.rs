@@ -120,7 +120,7 @@ async fn run_turn(cfg: &Config, ctx: &mut Context, token: &CancelToken, router: 
         }
         // The context owns the transcript, so the wire is rendered from
         // the same object the trim policy just worked on.
-        let (resp, interrupted, _body) = api_call_api(cfg, ctx, ctx.history(), token, sink).await?;
+        let (resp, interrupted, _body) = api_call_api(cfg, ctx, token, sink).await?;
         let content = resp.blocks;
         if interrupted {
             // Cut off mid-response: keep finished text/thinking, drop tool

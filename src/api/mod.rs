@@ -8,6 +8,10 @@
 // family helpers, and the per-vendor "rules" (what this wire can serve)
 // all live here; the per-vendor files (`minimax.rs`, `zai.rs`, `deepseek.rs`)
 // own only their bodies, their usage translations, and their tests.
+//
+// The transcript reaches the wire through the context and nowhere else: a
+// vendor's `turn` reads `ctx.history()`. One owner, one path — the context
+// and the messages the model sees cannot drift apart.
 
 use crate::config::Config;
 use crate::cancel::CancelToken;
@@ -34,6 +38,10 @@ pub(crate) type Turn<'a> = Pin<Box<dyn Future<Output = Result<(Response, bool, V
 /// [`Protocol`] handle and calls through it — no `match` anywhere. Adding a
 /// vendor is one `impl` and one row in [`VENDORS`], both the compiler's
 /// problem to keep complete.
+///
+/// The transcript comes from the context: `turn` reads `ctx.history()`, so
+/// there is one path to the wire and a context and its messages can never
+/// drift apart.
 pub(crate) trait Vendor: Sync {
     fn label(&self) -> &'static str;
     fn default_base(&self) -> Option<&'static str>;
@@ -43,7 +51,6 @@ pub(crate) trait Vendor: Sync {
         &'a self,
         cfg: &'a Config,
         ctx: &'a Context,
-        history: &'a [Message],
         token: &'a CancelToken,
         sink: &'a dyn Show,
     ) -> Turn<'a>;
@@ -70,10 +77,10 @@ impl Vendor for MiniMax {
     fn accepts(&self, cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
         minimax_accepts(cache, thinking, effort)
     }
-    fn turn<'a>(&'a self, cfg: &'a Config, ctx: &'a Context, history: &'a [Message], token: &'a CancelToken, sink: &'a dyn Show)
+    fn turn<'a>(&'a self, cfg: &'a Config, ctx: &'a Context, token: &'a CancelToken, sink: &'a dyn Show)
         -> Turn<'a>
     {
-        Box::pin(minimax::turn(cfg, ctx, history, token, sink))
+        Box::pin(minimax::turn(cfg, ctx, token, sink))
     }
 }
 
@@ -84,10 +91,10 @@ impl Vendor for Zai {
     fn accepts(&self, cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
         zai_accepts(cache, thinking, effort)
     }
-    fn turn<'a>(&'a self, cfg: &'a Config, ctx: &'a Context, history: &'a [Message], token: &'a CancelToken, sink: &'a dyn Show)
+    fn turn<'a>(&'a self, cfg: &'a Config, ctx: &'a Context, token: &'a CancelToken, sink: &'a dyn Show)
         -> Turn<'a>
     {
-        Box::pin(zai::turn(cfg, ctx, history, token, sink))
+        Box::pin(zai::turn(cfg, ctx, token, sink))
     }
 }
 
@@ -98,10 +105,10 @@ impl Vendor for DeepSeek {
     fn accepts(&self, cache: CacheMode, thinking: Thinking, effort: Option<Effort>) -> Result<()> {
         deepseek_accepts(cache, thinking, effort)
     }
-    fn turn<'a>(&'a self, cfg: &'a Config, ctx: &'a Context, history: &'a [Message], token: &'a CancelToken, sink: &'a dyn Show)
+    fn turn<'a>(&'a self, cfg: &'a Config, ctx: &'a Context, token: &'a CancelToken, sink: &'a dyn Show)
         -> Turn<'a>
     {
-        Box::pin(deepseek::turn(cfg, ctx, history, token, sink))
+        Box::pin(deepseek::turn(cfg, ctx, token, sink))
     }
 }
 
@@ -170,8 +177,8 @@ impl Effort {
 
 // ---- transport: shared by every wire --------------------------------------
 
-pub(crate) async fn call_api(cfg: &Config, ctx: &Context, history: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
-    cfg.protocol.0.turn(cfg, ctx, history, token, sink).await
+pub(crate) async fn call_api(cfg: &Config, ctx: &Context, token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
+    cfg.protocol.0.turn(cfg, ctx, token, sink).await
 }
 
 fn show_turn(resp: &Response, sink: &dyn Show) {
@@ -308,11 +315,11 @@ pub(super) fn chat_system_text(ctx: &Context) -> String {
     out
 }
 
-fn chat_messages(ctx: &Context, history: &[Message]) -> Vec<Value> {
+fn chat_messages(ctx: &Context, messages: &[Message]) -> Vec<Value> {
     let system = chat_system_text(ctx);
-    let mut out = Vec::with_capacity(history.len() + 1);
+    let mut out = Vec::with_capacity(messages.len() + 1);
     out.push(json!({"role": "system", "content": system}));
-    for m in history {
+    for m in messages {
         out.push(Message::to_value(m));
     }
     out
@@ -846,7 +853,7 @@ mod tests {
         ]);
         let cx = crate::test_util::ctx();
         let (resp, _, _) = block_on(call_api(
-            &cfg(format!("http://127.0.0.1:{port}"), false), &cx, &[], &CancelToken::new(), &sink(),
+            &cfg(format!("http://127.0.0.1:{port}"), false), &cx, &CancelToken::new(), &sink(),
         )).unwrap();
         assert_eq!(blocks(&resp.blocks)[0]["text"], "after retry");
         assert_eq!(reqs.lock().unwrap().len(), 2, "the request went out twice");
@@ -860,7 +867,7 @@ mod tests {
         ]);
         let cx = crate::test_util::ctx();
         let err = block_on(call_api(
-            &cfg(format!("http://127.0.0.1:{port}"), false), &cx, &[], &CancelToken::new(), &sink(),
+            &cfg(format!("http://127.0.0.1:{port}"), false), &cx, &CancelToken::new(), &sink(),
         )).unwrap_err();
         assert!(err.to_string().contains("bad model"), "got: {err}");
         assert_eq!(reqs.lock().unwrap().len(), 1, "no second request");

@@ -222,6 +222,15 @@ pub(crate) fn block_input(b: &crate::core::ir::Block) -> &serde_json::Value {
 }
 
 
+/// The JSON body of a raw HTTP request as the mock recorded it: the bytes
+/// after the head/body separator. A test that wants to assert on what
+/// went on the wire slices the body out of the raw text and parses it.
+#[cfg(test)]
+pub(crate) fn request_body(raw: &str) -> serde_json::Value {
+    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or(raw);
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("the request body is json: {e}\n{raw}"))
+}
+
 /// Test-only extension trait — `resp.blocks[i].text()` etc. with no
 /// `test_util::` prefix inside the tests. Vendor tests use these because
 /// the production code has no reason to reach into a Block variant's

@@ -13,9 +13,10 @@ use crate::core::ir::{Message, Response};
 use crate::Result;
 use serde_json::{json, Value};
 
-/// The deepseek vendor's one entry into the provider port.
-pub(super) async fn turn(cfg: &Config, ctx: &Context, history: &[Message], token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
-    let body = body(cfg, ctx, history, cfg.streaming);
+/// The deepseek vendor's one entry into the provider port. The transcript
+/// is the context's: it is read from there, never copied alongside it.
+pub(super) async fn turn(cfg: &Config, ctx: &Context, token: &CancelToken, sink: &dyn Show) -> Result<(Response, bool, Value)> {
+    let body = body(cfg, ctx, ctx.history(), cfg.streaming);
     if cfg.streaming { chat_streaming(cfg, body, usage, token, sink).await }
     else { chat_blocking(cfg, body, |v| chat_to_internal(v, usage), token, sink).await }
 }
@@ -23,7 +24,7 @@ pub(super) async fn turn(cfg: &Config, ctx: &Context, history: &[Message], token
 /// The deepseek request body: the dialect's shape plus the `thinking`
 /// toggle. Strip is the toggle off (`disabled` makes the model generate
 /// no reasoning — the only honest strip on a wire whose echo rule
-/// would break on a stripped history). Effort rides `reasoning_effort`
+/// would break on a stripped transcript). Effort rides `reasoning_effort`
 /// verbatim; the wire maps medium→high itself.
 ///
 /// The system prompt is built by `chat_messages` from `Context.system_text`
@@ -61,7 +62,8 @@ mod tests {
 
     use crate::api::{call_api, Protocol};
     use crate::api::{Effort, Thinking as CThinking};
-    use crate::test_util::{block_on, cfg, ctx as make_ctx, mock, sink, BlockExt};
+    use crate::core::ir::{Block, Message};
+    use crate::test_util::{block_on, cfg, ctx as make_ctx, mock, mock_seq, request_body, sink, BlockExt};
     use serde_json::json;
 
     #[test]
@@ -104,7 +106,7 @@ mod tests {
         c.protocol = Protocol::DEEPSEEK;
         let token = crate::cancel::CancelToken::new();
         let cx = make_ctx();
-        let (resp, _, _) = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
+        let (resp, _, _) = block_on(call_api(&c, &cx, &token, &sink())).unwrap();
         assert_eq!(resp.blocks.len(), 2);
         assert_eq!(resp.blocks[0].text().unwrap(), "hello world");
         assert_eq!(resp.blocks[1].name(), "bash");
@@ -122,13 +124,38 @@ mod tests {
         c.protocol = Protocol::DEEPSEEK;
         let token = crate::cancel::CancelToken::new();
         let cx = make_ctx();
-        let (resp, _, _) = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap();
+        let (resp, _, _) = block_on(call_api(&c, &cx, &token, &sink())).unwrap();
         assert_eq!(resp.blocks[0].text().unwrap(), "ok");
         let bad = mock(&json!({"error":{"message":"boom"}}).to_string(), 400, false);
         let mut c = cfg(format!("http://127.0.0.1:{bad}"), false);
         c.protocol = Protocol::DEEPSEEK;
-        let err = block_on(call_api(&c, &cx, &[], &token, &sink())).unwrap_err();
+        let err = block_on(call_api(&c, &cx, &token, &sink())).unwrap_err();
         assert!(err.to_string().contains("boom"), "got: {err}");
+    }
+
+    /// The transcript has one owner — the context — and this wire reads
+    /// it from there. The chat-completions family still puts the system
+    /// message first and the transcript after it, in order.
+    #[test]
+    fn the_contexts_transcript_reaches_the_chat_wire() {
+        let mut cx = make_ctx();
+        cx.push(Message::User("first".into()));
+        cx.push(Message::Assistant(vec![Block::Text("answer".into())]));
+        let (port, seen) = mock_seq(vec![
+            (200, r#"{"choices":[{"message":{"content":"ok"}}],"usage":{}}"#.into()),
+        ]);
+        let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
+        c.protocol = Protocol::DEEPSEEK;
+        let token = crate::cancel::CancelToken::new();
+        block_on(call_api(&c, &cx, &token, &sink())).unwrap();
+        let v = request_body(&seen.lock().unwrap()[0]);
+        let msgs = v["messages"].as_array().expect("the chat wire sends messages");
+        assert_eq!(msgs.len(), 3, "the system message plus the context's two turns: {v}");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "first");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"][0]["text"], "answer");
     }
 
     #[test]
