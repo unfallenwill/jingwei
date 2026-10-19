@@ -244,6 +244,46 @@ pub fn state_glyph(state: TurnState) -> &'static str {
     }
 }
 
+/// The tag every line a background agent produces carries: the agent's
+/// id in brackets — `[a1] `.
+///
+/// One spelling, defined once, in the port both frontends render
+/// through: a log line and a transcript row can never disagree about
+/// who spoke. The main agent's own lines carry no tag — the
+/// conversation *is* the transcript, and it needs no speaker labels.
+pub fn agent_tag(id: AgentId) -> String {
+    format!("[{id}] ")
+}
+
+/// The one-line summary a finished background agent leaves behind:
+/// `[a1] ✓ build · 48s · 23 tools`.
+///
+/// The parts are the facts a frontend actually has: the tag, the state
+/// glyph, the label the fleet gave the agent, the elapsed time, and the
+/// number of tools it called. The elapsed time is optional — the TUI
+/// owns a clock and the plain log has none, and a frontend with no clock
+/// does not fake one. An empty label is left out, so the line says only
+/// what it knows.
+pub fn agent_summary(
+    id: AgentId,
+    state: TurnState,
+    label: &str,
+    elapsed: Option<Duration>,
+    tools: usize,
+) -> String {
+    let mut head = format!("{}{}", agent_tag(id), state_glyph(state));
+    if !label.is_empty() {
+        head.push(' ');
+        head.push_str(label);
+    }
+    let mut parts = vec![head];
+    if let Some(d) = elapsed {
+        parts.push(elapsed_str(d));
+    }
+    parts.push(if tools == 1 { "1 tool".to_string() } else { format!("{tools} tools") });
+    parts.join(" · ")
+}
+
 /// Elapsed time, the way both the status bar and the fold markers read it:
 /// `3s`, then `1m03s`. A shared vocabulary word, not two spellings.
 pub fn elapsed_str(d: Duration) -> String {
@@ -697,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn a_state_glyph_for_every_state() {
+    fn the_state_glyphs_are_distinct() {
         let all = [
             (TurnState::Queued, "○"),
             (TurnState::InProgress, "▸"),
@@ -715,5 +755,26 @@ mod tests {
         let before = seen.len();
         seen.dedup();
         assert_eq!(seen.len(), before, "the six states wear six glyphs");
+    }
+
+    #[test]
+    fn the_tag_and_the_summary_name_the_agent() {
+        let id = AgentId::next();
+        assert_eq!(agent_tag(id), format!("[{id}] "), "the id in brackets");
+        // the summary reads: tag, glyph, label, elapsed, tools
+        assert_eq!(
+            agent_summary(id, TurnState::Completed, "build", Some(Duration::from_secs(48)), 23),
+            format!("[{id}] ✓ build · 48s · 23 tools"),
+        );
+        // a frontend with no clock leaves the time out — it does not fake one
+        assert_eq!(
+            agent_summary(id, TurnState::Completed, "build", None, 23),
+            format!("[{id}] ✓ build · 23 tools"),
+        );
+        // one tool is one tool
+        assert_eq!(
+            agent_summary(id, TurnState::Failed, "", None, 1),
+            format!("[{id}] ✗ · 1 tool"),
+        );
     }
 }
