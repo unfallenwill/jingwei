@@ -3,11 +3,12 @@
 //! (folding, scrolling, editing, the status bar) is a fact about this data
 //! that a test can pin.
 
-use crate::agent::roster::Roster;
 use crate::core::ids::AgentId;
 use crate::core::turn::TurnState;
 use crate::ui::{agent_summary, agent_tag, Sev, Usage};
+use crate::workflow::exec::{AgentCfg, Fleet};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The one heartbeat cadence; the task clock accumulates the *measured*
@@ -269,10 +270,11 @@ pub struct App {
     /// `/mcp` subcommands + server names). `None` while the input is not
     /// a slash command — and the only state the menu itself owns.
     pub completion: Option<Completion>,
-    /// The registry of live agents. The run site clones it into the
+    /// The session's background agents. The run site clones it into the
     /// spawned task, so the agent a run starts is registered while it
-    /// runs and gone when it ends.
-    pub roster: Roster,
+    /// runs and gone when it ends — and the fleet's own tools reach the
+    /// same workers through it.
+    pub fleet: Arc<Fleet>,
     /// The background agents this session has heard from, by id.
     ///
     /// The main agent is **not** in it: its own stream is the live
@@ -305,6 +307,10 @@ pub enum CompletionKind {
     McpSub,
     /// `/mcp <sub> <something>` — a server name.
     McpServer,
+    /// `/agents <something>` — a subcommand name.
+    AgentsSub,
+    /// `/agents stop <something>` — the id of a live worker.
+    AgentsId,
 }
 
 /// The slash-command menu: which completions are on offer, what was
@@ -334,6 +340,13 @@ impl Completion {
 
 impl App {
     pub fn new() -> Self {
+        Self::with_fleet(Arc::new(Fleet::new(AgentCfg::default())))
+    }
+
+    /// The app, over a fleet the session already owns. The run site and
+    /// the slash commands reach the *same* workers through it — a second
+    /// fleet would be a second record of who is running.
+    pub fn with_fleet(fleet: Arc<Fleet>) -> Self {
         Self {
             mode: Mode::Input,
             rows: vec![],
@@ -353,7 +366,7 @@ impl App {
             quit: false,
             scroll: Scroll::Tail,
             completion: None,
-            roster: Roster::new(),
+            fleet,
             agents: BTreeMap::new(),
         }
     }

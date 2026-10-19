@@ -44,10 +44,8 @@ pub(crate) struct Config {
     pub(crate) context_size: u64,
     pub(crate) max_turns: u32,
     /// How many background agents may run at once. Zero disables spawning.
-    #[allow(dead_code)] // the fleet slice reads the cap; until then only the tests do
     pub(crate) max_agents: u32,
     /// How long `wait_agents` waits before it reports what it has.
-    #[allow(dead_code)] // the fleet slice reads the timeout; until then only the tests do
     pub(crate) agent_wait_ms: u64,
     pub(crate) streaming: bool,
 }

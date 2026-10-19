@@ -210,6 +210,16 @@ pub fn detect_completion(text: &str) -> Option<(CompletionKind, String)> {
             (2, false) => Some((CompletionKind::McpServer, tokens[2].to_string())),
             _ => None,
         },
+        // `/agents [<sub> [<id>]]` — the subcommand, then the id of a
+        // live worker.
+        "agents" => match (rest, trailing_space) {
+            (0, false) => Some((CompletionKind::Command, cmd.to_string())),
+            (0, true) => Some((CompletionKind::AgentsSub, String::new())),
+            (1, false) => Some((CompletionKind::AgentsSub, tokens[1].to_string())),
+            (1, true) => Some((CompletionKind::AgentsId, String::new())),
+            (2, false) => Some((CompletionKind::AgentsId, tokens[2].to_string())),
+            _ => None,
+        },
         // Unknown command being typed: keep offering command names as
         // long as the user has not yet typed a space.
         other => {
@@ -1246,6 +1256,12 @@ mod tests {
                 CompletionItem { insert: "alpha".into(), label: "alpha".into(), description: "first server".into(), trailing_space: false },
                 CompletionItem { insert: "beta".into(), label: "beta".into(), description: "second server".into(), trailing_space: false },
             ],
+            CompletionKind::AgentsSub => vec![
+                CompletionItem { insert: "stop".into(), label: "stop".into(), description: "stop a worker".into(), trailing_space: true },
+            ],
+            CompletionKind::AgentsId => vec![
+                CompletionItem { insert: "a1".into(), label: "a1".into(), description: "a worker".into(), trailing_space: false },
+            ],
         }
         .into_iter()
         .filter(|c| c.insert.starts_with(prefix) || c.label.trim_start_matches('/').starts_with(prefix) || prefix.is_empty())
@@ -1276,6 +1292,18 @@ mod tests {
         assert_eq!(detect_completion("/mcp enable "), Some((CompletionKind::McpServer, String::new())));
         assert_eq!(detect_completion("/mcp enable a"), Some((CompletionKind::McpServer, "a".into())));
         assert_eq!(detect_completion("/mcp enable alpha "), None);
+    }
+
+    #[test]
+    fn detect_walks_through_the_agents_levels() {
+        // `/agents st<TAB>` completes to `/agents stop `, and the live
+        // ids complete after it — the `/mcp` precedent, one level down.
+        assert_eq!(detect_completion("/agents"), Some((CompletionKind::Command, "agents".into())));
+        assert_eq!(detect_completion("/agents "), Some((CompletionKind::AgentsSub, String::new())));
+        assert_eq!(detect_completion("/agents st"), Some((CompletionKind::AgentsSub, "st".into())));
+        assert_eq!(detect_completion("/agents stop "), Some((CompletionKind::AgentsId, String::new())));
+        assert_eq!(detect_completion("/agents stop a"), Some((CompletionKind::AgentsId, "a".into())));
+        assert_eq!(detect_completion("/agents stop a1 "), None);
     }
 
     #[test]

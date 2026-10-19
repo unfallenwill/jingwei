@@ -27,7 +27,7 @@ mod workflow;
 pub mod ui;
 
 #[cfg(test)] mod test_util;
-use crate::agent::roster::Roster;
+use crate::agent::tools::AgentTools;
 use crate::cancel::CancelScope;
 use crate::config::{Args, Config, build_config};
 use crate::core::agents_md::AgentsMdContext;
@@ -40,6 +40,7 @@ use crate::mcp::Hub;
 use crate::tools::Builtins;
 use crate::config::settings::Settings;
 use crate::workflow::run_task;
+use crate::workflow::exec::{AgentCfg, Fleet};
 use serde_json::Value;
 use std::env;
 use std::path::PathBuf;
@@ -101,11 +102,19 @@ pub async fn run() -> Result<()> {
     // The tool router: the built-ins first, the servers' tools after
     // them. The order is a cache contract — the combined schema list is
     // part of the cached prefix — and the router is where it is fixed.
+    // The fleet's own four schemas come last, and they never move: a
+    // schema that changed every turn would miss the cache every turn.
+    //
+    // The fleet is built before the router, because the agent tools are
+    // a provider over it; the router reaches the fleet in turn, through
+    // the run that opens it.
+    let fleet = Arc::new(Fleet::new(AgentCfg::from_config(&cfg)));
     let router = Arc::new(ToolRouter::new(vec![
         Box::new(Builtins),
         Box::new(hub.clone()),
+        Box::new(AgentTools::new(fleet.clone())),
     ]));
-    run_with_hub(args, cfg, ctx, hub, agents_ctx, router).await
+    run_with_hub(args, cfg, ctx, hub, agents_ctx, router, fleet).await
 }
 
 /// The rest of `run` after the hub is spawned. The TUI and plain REPL take
@@ -113,7 +122,7 @@ pub async fn run() -> Result<()> {
 /// `mpsc::Sender`); the one-shot path also takes a clone, then calls
 /// `shutdown` on its own copy at the end so the connections close in
 /// every exit path.
-async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agents_ctx: AgentsMdContext, router: Arc<ToolRouter>) -> Result<()> {
+async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agents_ctx: AgentsMdContext, router: Arc<ToolRouter>, fleet: Arc<Fleet>) -> Result<()> {
     let interactive = args.prompt.is_empty();
     // The session decides the file; the transcript it continues is the
     // context's — the context owns it from here on.
@@ -129,15 +138,17 @@ async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agent
     if interactive {
         // A terminal gets the TUI; pipes, tests, and one-shots get the log.
         return if ui::tui::wanted() {
-            ui::tui::run(cfg, ctx, convo, banners, hub, router).await
+            ui::tui::run(cfg, ctx, convo, banners, hub, router, fleet).await
         } else {
-            ui::plain::plain_repl(&cfg, ctx, convo, banners, hub, router).await
+            ui::plain::plain_repl(&cfg, ctx, convo, banners, hub, router, fleet).await
         };
     }
     // One-shot: always the plain frontend — its output must stay in the
     // terminal after the process exits, and an alt-screen would take it.
     let prompt = args.prompt.join(" ");
-    let sink = ui::plain::PlainSink::new();
+    // The sink is shared: the run shows through it, and so does every
+    // worker the fleet spawns under it.
+    let sink: Arc<dyn Show> = Arc::new(ui::plain::PlainSink::new());
     for b in &banners {
         sink.show(Msg::Banner(b.clone()));
     }
@@ -146,8 +157,7 @@ async fn run_with_hub(args: Args, cfg: Config, mut ctx: Context, hub: Hub, agent
     // exit code stays the run's own. It says nothing about a failure
     // itself: the error is the process's, and the binary paints it.
     let scope = CancelScope::new();
-    let roster = Roster::new();
-    let res = run_task(&prompt, &cfg, &mut ctx, &mut convo, &router, &scope, &roster, &sink, &|_| None).await;
+    let res = run_task(&prompt, &cfg, &mut ctx, &mut convo, &router, &scope, &fleet, &sink, &|_| None).await;
     hub.shutdown().await;
     res
 }

@@ -238,8 +238,11 @@ pub async fn plain_repl(
     banners: Vec<String>,
     hub: Hub,
     router: std::sync::Arc<crate::core::ports::ToolRouter>,
+    fleet: std::sync::Arc<crate::workflow::exec::Fleet>,
 ) -> crate::Result<()> {
-    let sink = PlainSink::new();
+    // The sink is shared: the run shows through it, and so does every
+    // worker the fleet spawns under it.
+    let sink: std::sync::Arc<dyn Show> = std::sync::Arc::new(PlainSink::new());
     let tty = std::io::stdin().is_terminal();
     sink.show(Msg::Banner("jingwei — 精卫填海，一石一石 · type a task, /exit or Ctrl-D rests, Ctrl-C interrupts".into()));
     sink.show(Msg::Banner(cfg.identity()));
@@ -253,9 +256,6 @@ pub async fn plain_repl(
         sink.show(Msg::Banner(note));
     }
     let stdin = std::io::stdin();
-    // The registry of live agents: one for the whole REPL, so an agent
-    // that is running is registered for as long as it runs.
-    let roster = crate::agent::roster::Roster::new();
     loop {
         if tty {
             // The interactive prompt must match the TaskBegin banner
@@ -296,14 +296,35 @@ pub async fn plain_repl(
             handle_mcp_command(rest, &hub, &sink).await;
             continue;
         }
+        // `/agents` is the human's own surface on the fleet: the workers
+        // and their reports, without going through the model. It is
+        // handled before the line becomes a task, exactly like `/mcp`.
+        if let Some(rest) = line.strip_prefix("/agents") {
+            // the verb stands alone: `/agentsfoo` is a task, not a command
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                handle_agents_command(rest.trim(), &fleet, &sink);
+                continue;
+            }
+        }
         // The run boundary: the REPL hands the line to the run, which
         // owns the begin, the saves, the end — and the note a failure
         // earns, said inside the run's bracket so it belongs to the
         // task it is about.
         let scope = crate::cancel::CancelScope::new();
-        let _ = crate::workflow::run_task(&line, cfg, &mut ctx, &mut convo, &router, &scope, &roster, &sink, &ui::error_note).await;
+        let _ = crate::workflow::run_task(&line, cfg, &mut ctx, &mut convo, &router, &scope, &fleet, &sink, &ui::error_note).await;
     }
     Ok(())
+}
+
+/// The human's `/agents` verb: the workers and their reports, printed
+/// through the same port the agent uses.
+///
+/// One implementation, two frontends: the TUI's `/agents` reaches the
+/// same handler, so the two say the same thing for the same input.
+pub(crate) fn handle_agents_command(rest: &str, fleet: &crate::workflow::exec::Fleet, sink: &dyn Show) {
+    for m in crate::agent::cmd::handle(rest, fleet).unwrap_or_default() {
+        sink.show(m);
+    }
 }
 
 /// One `/mcp` subcommand. The bare `/mcp` (called as the empty `rest`)
@@ -689,6 +710,20 @@ mod tests {
             other => panic!("expected a note, got {other:?}"),
         }
         hub.shutdown().await;
+    }
+
+    /// The human's own surface on the fleet: the plain REPL prints the
+    /// same table the TUI prints, because both go through one handler.
+    #[test]
+    fn the_plain_repl_prints_the_agents_table() {
+        let rec = crate::test_util::Recorder::default();
+        let fleet = crate::workflow::exec::Fleet::new(crate::workflow::exec::AgentCfg::default());
+        handle_agents_command("", &fleet, &rec);
+        // the same port the agent uses, and the plain frontend's fold on
+        // top of it: the human sees one line
+        let out = run(rec.msgs());
+        let texts: Vec<String> = out.iter().map(|(_, l)| l.clone()).collect();
+        assert_eq!(texts, vec!["no background agents".to_string()]);
     }
 
     /// `format_mcp_status` produces one row with the columns a list needs:

@@ -118,7 +118,6 @@ impl CancelScope {
 
     /// A nested scope: a node under this scope. A node minted under an
     /// already-cancelled scope is born cancelled, exactly as a leaf is.
-    #[allow(dead_code)] // the fleet slice nests scopes; this round the tree is one level deep
     pub(crate) fn child(&self) -> CancelScope {
         let scope = CancelScope::new();
         let mut children = self.inner.children.lock().unwrap();
@@ -148,7 +147,6 @@ impl CancelScope {
 
     /// Has this scope been cancelled? A cancelled *child* does not set
     /// it: only this scope's own cancel does.
-    #[allow(dead_code)] // the fleet slice reads the scope's own bit
     pub(crate) fn is_cancelled(&self) -> bool {
         self.inner.flag.load(Ordering::Acquire)
     }

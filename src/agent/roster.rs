@@ -66,7 +66,6 @@ impl Roster {
     /// The main agent is not one of them: the conversation the human is
     /// talking to is not a background agent, and the fleet's limits and
     /// its listing both talk about workers.
-    #[allow(dead_code)] // the fleet slice reads the roster; until then only the tests do
     pub(crate) fn list(&self) -> Vec<AgentId> {
         self.ids().into_iter().filter(|id| *id != AgentId::MAIN).collect()
     }
@@ -77,7 +76,6 @@ impl Roster {
     /// is born cancelled and the run under it unwinds. The main agent is
     /// never stopped this way — the human ends the conversation, not a
     /// stop request.
-    #[allow(dead_code)] // the fleet slice reads the roster; until then only the tests do
     pub(crate) fn stop(&self, id: AgentId) -> bool {
         if id == AgentId::MAIN { return false; }
         let scope = {
@@ -91,7 +89,6 @@ impl Roster {
     }
 
     /// Stop every background agent, and leave the main one alone.
-    #[allow(dead_code)] // the fleet slice reads the roster; until then only the tests do
     pub(crate) fn stop_all(&self) {
         for (id, scope) in self.live() {
             if id != AgentId::MAIN { scope.cancel(); }

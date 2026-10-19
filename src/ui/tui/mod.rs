@@ -39,7 +39,6 @@ pub mod update;
 pub mod view;
 
 use crate::api::VENDORS;
-use crate::agent::roster::Roster;
 use crate::config::Config;
 use crate::ui::{error_note, ChannelSink, Msg, Sev, Show as DisplayShow};
 use crate::mcp::Hub;
@@ -47,6 +46,7 @@ use crate::core::ports::ToolRouter;
 use crate::core::session::Convo;
 use crate::config::settings::Settings;
 use crate::workflow::run_task;
+use crate::workflow::exec::Fleet;
 use crate::Error;
 
 fn home_dir() -> Option<std::path::PathBuf> {
@@ -420,7 +420,7 @@ struct SessionState {
 /// the TUI shares with the agent loop, and uses itself for `/mcp`
 /// slash commands while idle. `router` is the tool router every tool
 /// call goes through.
-pub async fn run(cfg: Config, ctx: crate::core::context::Context, convo: Convo, banners: Vec<String>, hub: Hub, router: std::sync::Arc<ToolRouter>) -> crate::Result<()> {
+pub async fn run(cfg: Config, ctx: crate::core::context::Context, convo: Convo, banners: Vec<String>, hub: Hub, router: std::sync::Arc<ToolRouter>, fleet: std::sync::Arc<Fleet>) -> crate::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sink = ChannelSink::new(tx);
     sink.show(Msg::Banner(format!(
@@ -437,7 +437,7 @@ pub async fn run(cfg: Config, ctx: crate::core::context::Context, convo: Convo, 
         sink.show(Msg::Banner(note));
     }
 
-    let mut app = App::new();
+    let mut app = App::with_fleet(fleet);
     app.input.history = load_history();
     app.info = model::Info {
         model: cfg.model.clone(),
@@ -601,12 +601,12 @@ pub async fn run(cfg: Config, ctx: crate::core::context::Context, convo: Convo, 
                             // crossed a slash-command boundary — sync the
                             // menu from scratch (cheap when nothing changes).
                             refresh_completion(&mut app, &hub).await;
-                            apply_outcome(handle(action, &cfg, &session, &mut run, &sink, &hub, &router, &app.roster), &mut cfg, &mut app, &sink);
+                            apply_outcome(handle(action, &cfg, &session, &mut run, &sink, &hub, &router, &app.fleet), &mut cfg, &mut app, &sink);
                         }
                         crossterm::event::Event::Paste(p) => {
                             let action = step(&mut app, Ev::Paste(p));
                             refresh_completion(&mut app, &hub).await;
-                            apply_outcome(handle(action, &cfg, &session, &mut run, &sink, &hub, &router, &app.roster), &mut cfg, &mut app, &sink);
+                            apply_outcome(handle(action, &cfg, &session, &mut run, &sink, &hub, &router, &app.fleet), &mut cfg, &mut app, &sink);
                         }
                         // a resize needs no arm of its own: the Input arm
                         // polls the size every frame and redraws the viewport
@@ -758,7 +758,7 @@ struct SlashCmd<'a> {
 /// accretion — every new command adds a match arm and nothing else.
 /// Unknown commands surface in the transcript as a `Note` so the user
 /// sees the typo (no silent failure).
-fn dispatch_slash(cmd: SlashCmd<'_>, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>, run: &Option<RunHandle>, sink: &ChannelSink, hub: &Hub) -> HandleOutcome {
+fn dispatch_slash(cmd: SlashCmd<'_>, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>, run: &Option<RunHandle>, sink: &ChannelSink, hub: &Hub, fleet: &Arc<Fleet>) -> HandleOutcome {
     match cmd.name {
         "exit" | "quit" => {
             // the loop owns the quit flag; we just stop the current
@@ -785,10 +785,23 @@ fn dispatch_slash(cmd: SlashCmd<'_>, cfg: &Config, session: &Arc<AsyncMutex<Sess
             });
             HandleOutcome::None
         }
+        "agents" => {
+            // The human's own surface on the fleet: the workers and
+            // their reports, without going through the model. The same
+            // handler the plain REPL uses, so the two frontends say the
+            // same thing for the same input.
+            let rest = cmd.args.join(" ");
+            if let Some(lines) = crate::agent::cmd::handle(&rest, fleet) {
+                for m in lines {
+                    sink.show(m);
+                }
+            }
+            HandleOutcome::None
+        }
         "help" => {
             sink.show(Msg::Note {
                 sev: Sev::Warn,
-                text: " commands: /model [<provider>/<model>] · /mcp [list|enable|disable|reconnect|disconnect <name>] · /exit · /help ".into(),
+                text: " commands: /model [<provider>/<model>] · /mcp [list|enable|disable|reconnect|disconnect <name>] · /agents [stop <id>] · /exit · /help ".into(),
             });
             HandleOutcome::None
         }
@@ -937,7 +950,7 @@ fn protocol_of(name: &str) -> Option<crate::api::Protocol> {
 /// newly-built Config.
 fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
           run: &mut Option<RunHandle>, sink: &ChannelSink, hub: &Hub, router: &Arc<ToolRouter>,
-          roster: &Roster) -> HandleOutcome {
+          fleet: &Arc<Fleet>) -> HandleOutcome {
     match action {
         Action::None => HandleOutcome::None,
         Action::Cancel => {
@@ -951,7 +964,7 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
             // they never reach the agent. Dispatch first, and only fall
             // through to a real submit when the line is just a task.
             if let Some(cmd) = parse_slash(&line) {
-                return dispatch_slash(cmd, cfg, session, run, sink, hub);
+                return dispatch_slash(cmd, cfg, session, run, sink, hub, fleet);
             }
             // A second Submit must not orphan the first run: the run
             // slot is filled here, synchronously — the spawn and the
@@ -973,7 +986,7 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
             let scope = crate::cancel::CancelScope::new();
             let run_scope = scope.clone();
             let sink = sink.clone(); // one for the spawned task, one for the shell
-            let roster = roster.clone(); // the registry of live agents, for the run
+            let fleet = fleet.clone(); // the session's background agents
             let job = tokio::spawn(async move {
                 // The session lock is held for the whole turn: the
                 // transcript the model sees and the file it lands in are
@@ -981,11 +994,14 @@ fn handle(action: Action, cfg: &Config, session: &Arc<AsyncMutex<SessionState>>,
                 // this one.
                 let mut st = session.lock().await;
                 let SessionState { ctx, convo } = &mut *st;
+                // The sink the run shows through, and the one every
+                // worker under it shows through: one sink, shared.
+                let sink: Arc<dyn crate::ui::Show> = Arc::new(sink);
                 // The run boundary: the job does not spell the sequence
                 // out — it hands the task to the run, which owns the
                 // begin, the saves, the end, and the note a failure
                 // earns (inside the run's bracket, where it belongs).
-                let _ = run_task(&line, &cfg, ctx, convo, &router, &run_scope, &roster, &sink, &error_note).await;
+                let _ = run_task(&line, &cfg, ctx, convo, &router, &run_scope, &fleet, &sink, &error_note).await;
             });
             *run = Some(RunHandle { scope, job });
             HandleOutcome::None
@@ -1006,7 +1022,7 @@ async fn refresh_completion(app: &mut App, hub: &Hub) {
         if app.completion.is_some() { app.completion = None; }
         return;
     };
-    let candidates = collect_candidates(kind, &prefix, hub).await;
+    let candidates = collect_candidates(kind, &prefix, hub, &app.fleet).await;
     set_completion(app, kind, &prefix, candidates);
 }
 
@@ -1017,6 +1033,7 @@ async fn collect_candidates(
     kind: CompletionKind,
     prefix: &str,
     hub: &Hub,
+    fleet: &Fleet,
 ) -> Vec<CompletionItem> {
     let prefix_lc = prefix.to_lowercase();
     let starts = |s: &str| s.to_lowercase().starts_with(&prefix_lc);
@@ -1026,6 +1043,7 @@ async fn collect_candidates(
             item("quit",   "/quit",   "leave the session"),
             item("model",  "/model",  "switch profile (bare lists, <key> switches)"),
             item("mcp",    "/mcp",    "manage MCP servers — list | enable | disable | reconnect | disconnect"),
+            item("agents", "/agents", "the background agents — bare lists, stop <id> stops one"),
             item("help",   "/help",   "show this menu"),
         ].into_iter().filter(|c| prefix.is_empty() || starts(&c.insert)).collect(),
         CompletionKind::McpSub => vec![
@@ -1059,6 +1077,19 @@ async fn collect_candidates(
                 })
                 .collect()
         }
+        CompletionKind::AgentsSub => vec![
+            item("stop", "stop", "stop a background agent"),
+        ].into_iter().filter(|c| prefix.is_empty() || starts(&c.insert)).collect(),
+        CompletionKind::AgentsId => fleet.live_ids().into_iter()
+            .map(|id| id.to_string())
+            .filter(|n| prefix.is_empty() || starts(n))
+            .map(|n| CompletionItem {
+                insert: n.clone(),
+                label: n,
+                description: "a background agent".into(),
+                trailing_space: false,
+            })
+            .collect(),
     }
 }
 
@@ -1067,6 +1098,7 @@ fn item(insert: &str, label: &str, description: &str) -> CompletionItem {
     // what comes next (subcommands, server tags). Profile keys and
     // server names are the whole argument — Tab just lands the caret.
     let trailing_space = matches!(insert, "exit" | "quit" | "help" | "model" | "mcp"
+                                       | "agents" | "stop"
                                        | "list" | "enable" | "disable" | "reconnect" | "disconnect");
     CompletionItem {
         insert: insert.into(),
@@ -1729,6 +1761,12 @@ mod tests {
         ]))
     }
 
+    /// The session's background agents: a fresh fleet, with the default
+    /// bounds.
+    fn fleet() -> Arc<Fleet> {
+        Arc::new(Fleet::new(crate::workflow::exec::AgentCfg::default()))
+    }
+
     /// A session state with one seeded message — the transcript the
     /// agent loop extends, next to the file it lands in.
     fn session_state() -> Arc<AsyncMutex<SessionState>> {
@@ -1746,7 +1784,7 @@ mod tests {
         let mut run: Option<RunHandle> = None;
         let hub = crate::mcp::Hub::empty();
         let router = router(&hub);
-        handle(action, &cfg, &session, &mut run, &sink, &hub, &router, &Roster::new());
+        handle(action, &cfg, &session, &mut run, &sink, &hub, &router, &fleet());
         (sink, run)
     }
 
@@ -1778,7 +1816,7 @@ mod tests {
         let hub = crate::mcp::Hub::empty();
         let router = router(&hub);
         // tokio::test gives us the runtime; handle does its own tokio::spawn.
-        handle(Action::Submit("hello world".into()), &cfg, &session, &mut run, &sink, &hub, &router, &Roster::new());
+        handle(Action::Submit("hello world".into()), &cfg, &session, &mut run, &sink, &hub, &router, &fleet());
         assert!(run.is_some(), "submit sets the run slot");
         // a task begin landed in the sink. The begin comes from the run
         // the job spawned, so we wait for it rather than assume it is
@@ -1818,7 +1856,7 @@ mod tests {
         // slot inside this scope so its JoinHandle has a home.
         let first_job = tokio::spawn(async {});
         run = Some(RunHandle { scope: first_scope.clone(), job: first_job });
-        handle(Action::Submit("second task".into()), &cfg, &session, &mut run, &sink, &hub, &router, &Roster::new());
+        handle(Action::Submit("second task".into()), &cfg, &session, &mut run, &sink, &hub, &router, &fleet());
         // the original run is still there — the same scope, not replaced.
         // The scope is the tree, and the tree has no pointer to compare:
         // cancel through the run's own scope and ask the first one.
@@ -2001,11 +2039,27 @@ mod tests {
         let sink = ChannelSink::new(tx);
         let cmd = SlashCmd { name: "garbage", args: vec![] };
         let hub = crate::mcp::Hub::empty();
-        let outcome = dispatch_slash(cmd, &cfg, &session, &None, &sink, &hub);
+        let outcome = dispatch_slash(cmd, &cfg, &session, &None, &sink, &hub, &fleet());
         // we don't read the warning Note — the sink it would land on is
         // a fake channel — but we pin the outcome, which is what the
         // loop acts on.
         assert!(matches!(outcome, HandleOutcome::None), "garbage must not switch");
+    }
+
+    #[tokio::test]
+    async fn the_tui_prints_the_agents_table() {
+        // The human's own surface on the fleet: `/agents` renders
+        // through the banner path, the same one `/mcp list` uses.
+        let cfg = tcfg("https://x");
+        let session = session_state();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ChannelSink::new(tx);
+        let cmd = SlashCmd { name: "agents", args: vec![] };
+        let hub = crate::mcp::Hub::empty();
+        let outcome = dispatch_slash(cmd, &cfg, &session, &None, &sink, &hub, &fleet());
+        assert!(matches!(outcome, HandleOutcome::None));
+        let m = rx.try_recv().expect("the table was shown");
+        assert!(matches!(&m, Msg::Banner(t) if t == "no background agents"), "got: {m:?}");
     }
 
     #[tokio::test]
@@ -2016,7 +2070,7 @@ mod tests {
         let sink = ChannelSink::new(tx);
         let cmd = SlashCmd { name: "help", args: vec![] };
         let hub = crate::mcp::Hub::empty();
-        let outcome = dispatch_slash(cmd, &cfg, &session, &None, &sink, &hub);
+        let outcome = dispatch_slash(cmd, &cfg, &session, &None, &sink, &hub, &fleet());
         assert!(matches!(outcome, HandleOutcome::None));
     }
 

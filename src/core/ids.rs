@@ -30,7 +30,6 @@ impl AgentId {
     pub(crate) const MAIN: AgentId = AgentId(0);
 
     /// A fresh id, distinct from every other id this process has handed out.
-    #[allow(dead_code)] // the fleet slice mints worker ids; until then only the tests do
     pub(crate) fn next() -> AgentId {
         AgentId(NEXT.fetch_add(1, Ordering::Relaxed))
     }
@@ -42,7 +41,6 @@ impl AgentId {
     /// back into the identity underneath it. Only the worker form parses:
     /// `main` is the conversation, not a background agent, and `a0` is the
     /// one number the counter never hands out.
-    #[allow(dead_code)] // the fleet slice hands ids back; until then only the tests do
     pub(crate) fn parse(s: &str) -> Option<AgentId> {
         let n: u64 = s.strip_prefix('a')?.parse().ok()?;
         if n == 0 { return None; }
@@ -63,10 +61,13 @@ static NEXT: AtomicU64 = AtomicU64::new(1);
 /// identity is the `u64` underneath.
 impl std::fmt::Display for AgentId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `pad`, not `write!`: a display that writes straight into the
+        // formatter drops the width and the alignment on the floor, and
+        // an id in a table column is exactly where those matter.
         if *self == AgentId::MAIN {
-            write!(f, "main")
+            f.pad("main")
         } else {
-            write!(f, "a{}", self.0)
+            f.pad(&format!("a{}", self.0))
         }
     }
 }
@@ -97,6 +98,15 @@ mod tests {
     fn a_worker_id_reads_as_a1() {
         assert_eq!(AgentId(1).to_string(), "a1");
         assert_eq!(AgentId(42).to_string(), "a42");
+    }
+
+    #[test]
+    fn an_id_fills_its_column() {
+        // The fleet's table is columns of ids, so the display has to
+        // honour the width it is given.
+        assert_eq!(format!("{:<4}|", AgentId(1)), "a1  |");
+        assert_eq!(format!("{:<4}|", AgentId(42)), "a42 |");
+        assert_eq!(format!("{:>5}|", AgentId(42)), "  a42|");
     }
 
     #[test]

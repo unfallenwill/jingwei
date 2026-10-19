@@ -15,6 +15,8 @@
 //!   *always*, including the error path, so a frontend never dangles;
 //! - the agent the run works is **registered while it runs** and gone when
 //!   it ends, so a stop request that reaches the roster finds it;
+//! - the fleet of background agents is **opened and closed** with the
+//!   run, so it does not survive it;
 //! - a failed save **warns and does not abort**: the conversation lives
 //!   in memory either way, and the agent must not die because the disk
 //!   did.
@@ -29,7 +31,8 @@
 //! stays right. Presentation belongs to the frontend, and the boundary
 //! only decides *when* it is said.
 
-use crate::agent::roster::Roster;
+pub(crate) mod exec;
+
 use crate::agent::runner::run_agent;
 use crate::agent::Agent;
 use crate::cancel::CancelScope;
@@ -39,6 +42,8 @@ use crate::core::ir::user_message;
 use crate::core::ports::ToolRouter;
 use crate::core::session::Convo;
 use crate::ui::{Msg, Sev, Show};
+use crate::workflow::exec::Fleet;
+use std::sync::Arc;
 
 /// Run one task, from the user's words to the end of the run.
 ///
@@ -59,18 +64,19 @@ use crate::ui::{Msg, Sev, Show};
 /// a cancel of the scope stops the run and everything under it — and a run
 /// that starts under an already-cancelled scope does no work.
 ///
-/// `roster` is the registry of live agents: the run registers the agent
-/// it runs and lets it go when the run ends, so a stop request that
-/// reaches the roster finds the agent it is meant to stop.
+/// `fleet` is the session's background agents. The run opens it at the
+/// start and closes it at the end — on every path, the way `TaskEnd` is
+/// emitted on every path — so the fleet does not survive a run: the
+/// workers it spawned are stopped and its record is cleared.
 pub(crate) async fn run_task(
     task: &str,
     cfg: &Config,
     ctx: &mut Context,
     convo: &mut Convo,
-    router: &ToolRouter,
+    router: &Arc<ToolRouter>,
     scope: &CancelScope,
-    roster: &Roster,
-    sink: &dyn Show,
+    fleet: &Fleet,
+    sink: &Arc<dyn Show>,
     on_error: &(dyn Fn(&crate::Error) -> Option<Msg> + Sync),
 ) -> crate::Result<()> {
     sink.show(Msg::TaskBegin(task.to_string()));
@@ -79,8 +85,11 @@ pub(crate) async fn run_task(
     if let Err(e) = convo.persist(ctx.history()) {
         sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
     }
+    // The fleet's run: the workers this run spawns are children of this
+    // run's scope, and they are stopped when the run ends.
+    fleet.begin_run(cfg, ctx, router, sink, scope);
     let mut agent = Agent::main(task);
-    let res = run_agent(&mut agent, cfg, ctx, router, scope, roster, sink).await;
+    let res = run_agent(&mut agent, cfg, ctx, router, scope, fleet.roster(), sink).await;
     // the failure is said inside the run: a note after the run's end
     // would belong to nothing
     if let Err(e) = &res {
@@ -91,6 +100,9 @@ pub(crate) async fn run_task(
     if let Err(e) = convo.persist(ctx.history()) {
         sink.show(Msg::Note { sev: Sev::Warn, text: format!(" warning: session not saved ({e}) ") });
     }
+    // the fleet does not survive a run: every live worker is stopped and
+    // the record goes, on every path out
+    fleet.end_run();
     // run boundary: the file never ends mid-run
     sink.show(Msg::TaskEnd);
     res
@@ -121,13 +133,18 @@ mod tests {
 
     /// The tool router a run uses: the four built-ins and an empty hub.
     /// The hub handle comes back so the test can shut its actor task down.
-    fn router() -> (ToolRouter, Hub) {
+    fn router() -> (Arc<ToolRouter>, Hub) {
         let hub = Hub::empty();
-        let router = ToolRouter::new(vec![
+        let router = Arc::new(ToolRouter::new(vec![
             Box::new(crate::tools::Builtins),
             Box::new(hub.clone()),
-        ]);
+        ]));
         (router, hub)
+    }
+
+    /// The fleet a run uses: a fresh one, with the default bounds.
+    fn fleet() -> Fleet {
+        Fleet::new(crate::workflow::exec::AgentCfg::default())
     }
 
     fn provenance() -> Provenance {
@@ -195,13 +212,13 @@ mod tests {
         task: &str,
         ctx: &mut Context,
         convo: &mut Convo,
-        sink: &dyn Show,
+        sink: &Arc<dyn Show>,
         on_error: &(dyn Fn(&crate::Error) -> Option<Msg> + Sync),
     ) -> crate::Result<()> {
         block_on(async {
             let (router, hub) = router();
             let res = run_task(task, &cfg(format!("http://127.0.0.1:{port}"), false),
-                               ctx, convo, &router, &CancelScope::new(), &Roster::new(), sink, on_error).await;
+                               ctx, convo, &router, &CancelScope::new(), &fleet(), sink, on_error).await;
             hub.shutdown().await;
             res
         })
@@ -222,7 +239,8 @@ mod tests {
                 *seen.lock().unwrap() = body;
             },
         );
-        let sink = Recorder::default();
+        let rec = Recorder::default();
+        let sink: Arc<dyn Show> = Arc::new(rec.clone());
         let mut ctx = crate::test_util::ctx();
         run(port, "count the files", &mut ctx, &mut convo, &sink, &silent).unwrap();
         let body = on_disk.lock().unwrap().clone();
@@ -242,11 +260,12 @@ mod tests {
         let session = Session::new(&provenance(), crate::config::HISTORY_FORMAT);
         let mut convo = Convo::persistent(session);
         let (port, _reqs) = mock_seq(vec![(200, ANSWER.into())]);
-        let sink = Recorder::default();
+        let rec = Recorder::default();
+        let sink: Arc<dyn Show> = Arc::new(rec.clone());
         let mut ctx = crate::test_util::ctx();
         let res = run(port, "count the files", &mut ctx, &mut convo, &sink, &silent);
         assert!(res.is_ok(), "a failed save does not abort the run: {res:?}");
-        let msgs = sink.msgs();
+        let msgs = rec.msgs();
         assert!(
             msgs.iter().any(|m| matches!(m, Msg::Note { sev: Sev::Warn, text } if text.contains("session not saved"))),
             "the failed save was reported — got: {msgs:?}"
@@ -260,11 +279,12 @@ mod tests {
     #[test]
     fn the_run_is_bracketed_by_a_task_begin_and_a_task_end() {
         let (port, _reqs) = mock_seq(vec![(200, ANSWER.into())]);
-        let sink = Recorder::default();
+        let rec = Recorder::default();
+        let sink: Arc<dyn Show> = Arc::new(rec.clone());
         let mut ctx = crate::test_util::ctx();
         let mut convo = Convo::ephemeral();
         run(port, "count the files", &mut ctx, &mut convo, &sink, &silent).unwrap();
-        let msgs = sink.msgs();
+        let msgs = rec.msgs();
         assert!(matches!(msgs.first(), Some(Msg::TaskBegin(t)) if t == "count the files"), "got: {msgs:?}");
         assert!(matches!(msgs.last(), Some(Msg::TaskEnd)), "got: {msgs:?}");
         assert_eq!(
@@ -277,13 +297,14 @@ mod tests {
     #[test]
     fn a_failed_run_still_ends_the_run_and_hands_the_error_back() {
         let (port, _reqs) = mock_seq(vec![(400, REFUSED.into())]);
-        let sink = Recorder::default();
+        let rec = Recorder::default();
+        let sink: Arc<dyn Show> = Arc::new(rec.clone());
         let mut ctx = crate::test_util::ctx();
         let mut convo = Convo::ephemeral();
         let res = run(port, "count the files", &mut ctx, &mut convo, &sink, &silent);
         // the error is handed back, not swallowed
         assert!(matches!(res, Err(crate::Error::Api(400, _))), "got: {res:?}");
-        let msgs = sink.msgs();
+        let msgs = rec.msgs();
         assert!(matches!(msgs.first(), Some(Msg::TaskBegin(_))), "got: {msgs:?}");
         assert!(matches!(msgs.last(), Some(Msg::TaskEnd)), "the run ends even when it fails — got: {msgs:?}");
     }
@@ -296,14 +317,15 @@ mod tests {
         // *after* the run had ended, and the error read as a footnote
         // to nothing.
         let (port, _reqs) = mock_seq(vec![(400, REFUSED.into())]);
-        let sink = Recorder::default();
+        let rec = Recorder::default();
+        let sink: Arc<dyn Show> = Arc::new(rec.clone());
         let mut ctx = crate::test_util::ctx();
         let mut convo = Convo::ephemeral();
         // the frontend's own mapper: the two interactive frontends say a
         // failed run this way
         let res = run(port, "count the files", &mut ctx, &mut convo, &sink, &crate::ui::error_note);
         assert!(res.is_err(), "the run failed: {res:?}");
-        let msgs = sink.msgs();
+        let msgs = rec.msgs();
         let note = msgs.iter().position(|m| matches!(m, Msg::Note { sev: Sev::Err, .. }));
         let end = msgs.iter().position(|m| matches!(m, Msg::TaskEnd));
         assert!(note.is_some(), "the failure was said — got: {msgs:?}");
@@ -316,7 +338,8 @@ mod tests {
     #[test]
     fn the_run_pushes_exactly_one_user_message() {
         let (port, _reqs) = mock_seq(vec![(200, ANSWER.into())]);
-        let sink = Recorder::default();
+        let rec = Recorder::default();
+        let sink: Arc<dyn Show> = Arc::new(rec.clone());
         let mut ctx = crate::test_util::ctx();
         let mut convo = Convo::ephemeral();
         run(port, "count the files", &mut ctx, &mut convo, &sink, &silent).unwrap();

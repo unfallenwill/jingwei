@@ -224,7 +224,6 @@ impl Context {
     /// The transcript is the part that does not travel — a worker starts
     /// with an empty one, because the conversation the human is having
     /// is not the worker's conversation.
-    #[allow(dead_code)] // the fleet slice seeds a worker's context; until then only the tests do
     pub(crate) fn seed(&self) -> ContextSeed {
         ContextSeed {
             system_text: self.system_text.clone(),
@@ -242,7 +241,6 @@ impl Context {
 /// a transcript of its own, empty. It is the one honest way to start a
 /// second agent off the first one's prompt without giving it the first
 /// one's conversation.
-#[allow(dead_code)] // the fleet slice seeds a worker's context; until then only the tests do
 #[derive(Clone)]
 pub(crate) struct ContextSeed {
     system_text: String,
@@ -258,7 +256,6 @@ impl ContextSeed {
     /// be shown, and the agent-tools reminder goes with them: a worker
     /// told it could spawn agents would try, and the fleet is one level
     /// deep.
-    #[allow(dead_code)] // the fleet slice seeds a worker's context; until then only the tests do
     pub(crate) fn context(&self, hidden_tools: &[&str]) -> Context {
         let hidden: Vec<String> = hidden_tools.iter().map(|s| s.to_string()).collect();
         Context {
