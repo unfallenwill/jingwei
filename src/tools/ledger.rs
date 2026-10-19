@@ -59,6 +59,12 @@ impl Ledger {
     ///
     /// The agent's own view wins. The process's view is the fallback, for
     /// the writer that has never touched the file at all.
+    ///
+    /// The read happens here, and this method is called with the ledger
+    /// locked: the check compares the disk against a view, so the disk has
+    /// to be read at a moment when nobody else can be writing. A file read
+    /// of a few KB under a mutex is cheap; the alternative is a check that
+    /// is not a check.
     pub(crate) fn stale(&self, agent: AgentId, p: &str) -> Option<String> {
         let key = ledger_key(p);
         let seen = self
