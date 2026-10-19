@@ -55,12 +55,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// **Terminal states** (`COMPLETED`, `FAILED`, `INTERRUPTED`, `CANCELED`):
 /// the turn will never move again. Resuming the conversation is what makes
 /// new turns possible — it does not resurrect a finished one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TurnState {
     /// Constructed but not yet handed to the scheduler. Today jingwei runs
     /// one turn per process synchronously, so this state is rarely
     /// *visible* — but it is the honest starting point, and what makes a
     /// future asynchronous scheduler possible without rewriting this enum.
+    ///
+    /// It is also the default: a turn's life starts here, so a freshly
+    /// built turn state says "queued" without anyone having to say so.
+    #[default]
     Queued,
     /// The agent loop is in flight: an HTTP call is open, a tool is
     /// running, or a stream is being parsed. `started_at` is set.
@@ -442,6 +446,15 @@ mod tests {
         assert!(TurnState::Failed.is_terminal());
         assert!(TurnState::Interrupted.is_terminal());
         assert!(TurnState::Canceled.is_terminal());
+    }
+
+    /// The default state is the state a turn starts in: `Queued`, where
+    /// `Turn::new` puts it. A state machine whose default is not its
+    /// start state has two starts.
+    #[test]
+    fn the_default_state_is_queued() {
+        assert_eq!(TurnState::default(), TurnState::Queued);
+        assert_eq!(Turn::new(0).state, TurnState::default(), "and the turn starts there");
     }
 
     /// The error type renders something a future CLI can show without
