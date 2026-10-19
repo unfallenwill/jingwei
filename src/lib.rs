@@ -38,61 +38,13 @@ use crate::mcp::Hub;
 use crate::config::settings::Settings;
 use serde_json::Value;
 use std::env;
-use std::io;
 use std::path::PathBuf;
-pub type Result<T> = std::result::Result<T, Error>;
 
-// ---- error -----------------------------------------------------------------
-
-#[derive(Debug)]
-pub enum Error {
-    Api(u16, String),
-    Msg(String),
-    Http(Box<ureq::Error>),
-    Json(serde_json::Error),
-    Io(io::Error),
-    /// The coroutine was cancelled (Ctrl-C). Not a failure — a stop.
-    Interrupted,
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Api(c, b) => write!(f, "api {c}: {b}"),
-            Self::Msg(m) => write!(f, "{m}"),
-            Self::Http(e) => write!(f, "{e}"),
-            Self::Json(e) => write!(f, "{e}"),
-            Self::Io(e) => write!(f, "{e}"),
-            Self::Interrupted => write!(f, "interrupted"),
-        }
-    }
-}
-impl std::error::Error for Error {}
-
-impl From<ureq::Error> for Error {
-    fn from(e: ureq::Error) -> Self {
-        match e {
-            ureq::Error::Status(c, r) => Self::Api(c, r.into_string().unwrap_or_default()),
-            other => Self::Http(Box::new(other)),
-        }
-    }
-}
-impl From<serde_json::Error> for Error { fn from(e: serde_json::Error) -> Self { Self::Json(e) } }
-impl From<io::Error> for Error { fn from(e: io::Error) -> Self { Self::Io(e) } }
-
-impl Error {
-    /// Is this worth sending again? A 429 or a 5xx, or a socket that
-    /// never answered, is not the request's fault — and the answer is
-    /// the same on every wire, so it lives on the error type. Pure, so
-    /// a test reaches it.
-    fn is_transient(&self) -> bool {
-        match self {
-            Error::Http(_) => true,
-            Error::Api(s, _) => *s == 408 || *s == 429 || *s >= 500,
-            _ => false,
-        }
-    }
-}
+/// The crate's one error type, and the `Result` that rides with it. They
+/// live in `core::error` (L0) — the root is the composition root, and a
+/// type an L4 module can only name through the root looks like an upward
+/// edge. The root re-exports them, so every call site keeps its spelling.
+pub use crate::core::error::{Error, Result};
 
 // ---- entry -----------------------------------------------------------------
 
@@ -256,97 +208,3 @@ fn begin_session(args: &Args, cfg: &Config, interactive: bool) -> Result<(sessio
     Ok((session::Convo::persistent(s, history), banners))
 }
 
-
-// ---- tests -----------------------------------------------------------------
-
-/// Cargo runs a crate's tests in parallel threads of one process, and
-/// `std::env` is process-global — one test's `NO_COLOR` is another test's
-/// surprise. Every test that reads or writes an environment variable holds
-/// this lock, so the env-touching set runs one at a time. Test-only: the
-/// binary never touches it.
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn error_display() {
-        assert_eq!(Error::Api(429, "limited".into()).to_string(), "api 429: limited");
-        assert_eq!(Error::Msg("bad".into()).to_string(), "bad");
-        assert_eq!(Error::Interrupted.to_string(), "interrupted");
-    }
-
-    // ---- retry: the transport's own rule ----
-    #[test]
-    fn only_transient_errors_are_resent() {
-        // the retryable kinds: a rate limit, a timeout, a server that is down
-        for code in [408, 429, 500, 502, 503, 504] {
-            assert!(Error::Api(code, "x".into()).is_transient(), "{code} should be resent");
-        }
-        // the request's own fault, or a stop: never resent
-        for code in [400, 401, 403, 404, 422] {
-            assert!(!Error::Api(code, "x".into()).is_transient(), "{code} must not be resent");
-        }
-        assert!(!Error::Msg("x".into()).is_transient());
-        assert!(!Error::Interrupted.is_transient(), "a cancellation is not a failure to retry");
-    }
-
-    #[test]
-    // ---- Error: the type's display & conversions -------------------------
-
-    #[test]
-    fn error_display_strings_are_actually_distinct() {
-        // each variant has its own Display shape — the test pins them
-        // so a refactor can't silently turn two variants into the same
-        // string (which would defeat the user's ability to tell what
-        // kind of failure they're looking at).
-        assert_eq!(format!("{}", Error::Interrupted), "interrupted");
-        // The passthrough variants delegate to their inner Display; the
-        // outer prefix is the variant's own word — we just check the
-        // inner value shows up verbatim, no "error: " or similar wrapper
-        // added by Error's Display.
-        let io = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
-        assert_eq!(format!("{}", Error::Io(io)), "denied");
-        // Error::Json's body is the inner error verbatim
-        let json_err = serde_json::from_str::<u32>("abc").unwrap_err();
-        let json_str = format!("{}", json_err);
-        assert_eq!(format!("{}", Error::Json(json_err)), json_str);
-        // Error::Msg shows the wrapped message verbatim
-        assert_eq!(format!("{}", Error::Msg("hi".into())), "hi");
-        // Error::Api prefix error shape: "api {code}: {body}"
-        assert_eq!(format!("{}", Error::Api(503, "unavailable".into())),
-            "api 503: unavailable");
-    }
-
-    #[test]
-    fn error_from_ureq_wraps_a_status_into_api() {
-        // the Status arm of From<ureq::Error>: the status code and body
-        // ride along as the Error::Api variant
-        let body = r#"{"error":"model gone"}"#;
-        let r = ureq::Response::new(404, "Not Found", body).unwrap();
-        let err: Error = ureq::Error::Status(404, r).into();
-        match err {
-            Error::Api(code, ref b) => {
-                assert_eq!(code, 404);
-                assert!(b.contains("model gone"), "body carries: {b}");
-            }
-            other => panic!("expected Error::Api, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn error_from_ureq_wraps_other_kinds_into_http() {
-        // transport / DNS / decode errors: they ride as Error::Http.
-        // Transport cannot be constructed outside ureq, so we trigger a
-        // real one — a request to a closed port.
-        let err: Error = ureq::get("http://127.0.0.1:1/nope").call().unwrap_err().into();
-        assert!(matches!(err, Error::Http(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn error_from_io_preserves_the_io_kind() {
-        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "nope");
-        let err: Error = io.into();
-        assert!(matches!(err, Error::Io(_)));
-    }
-
-    }

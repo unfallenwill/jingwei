@@ -69,7 +69,7 @@ const LAYERS: &[(&str, Layer)] = &[
     ("core::ir", Layer::L0),           // the typed internal shape
     ("core::session", Layer::L0),      // the JSON-lines transcript
     ("core::turn", Layer::L0),         // the per-run state machine
-    ("core::error", Layer::L0),        // Error and Result's reserved home
+    ("core::error", Layer::L0),        // Error and Result's home
     ("format", Layer::L0),             // string measurement; it imports
                                         // nothing, and the display port (L0)
                                         // and the session (L0) both reach it
@@ -131,17 +131,6 @@ fn layer_of(mod_name: &str) -> Option<Layer> {
 /// not of a module called "lib".
 const ROOT_MODULE: &str = "lib";
 const ROOT_SCOPE: &str = "";
-
-/// Items whose home is a module that does not exist yet.
-///
-/// `Error` and `Result` are defined at the crate root today, but the root
-/// is the composition root (L5) — an L4 module naming `crate::Error`
-/// would look like an upward edge into the composition root. They are not
-/// the root's: the brief puts `core::error` (L0) there, and the next
-/// slice moves them and re-exports them from the root. Until that move
-/// lands, the net measures them at the home they are headed for. Delete
-/// this table with the move.
-const RESERVED_HOMES: &[(&str, &str)] = &[("Error", "core::error"), ("Result", "core::error")];
 
 /// `src/api/mod.rs` is the `api` module; `src/api/deepseek.rs` is the
 /// `api::deepseek` submodule. `src/main.rs` is just `main`. This function
@@ -701,12 +690,6 @@ fn build_aliases(mods: &Modules, known: &HashSet<String>) -> Aliases {
     for (scope, name, deeper) in updates {
         if let Some(m) = aliases.get_mut(&scope) { m.insert(name, deeper); }
     }
-    // The items whose home is a module that does not exist yet.
-    if let Some(root) = aliases.get_mut(ROOT_SCOPE) {
-        for (name, home) in RESERVED_HOMES {
-            root.insert((*name).to_string(), (*home).to_string());
-        }
-    }
     aliases
 }
 
@@ -949,11 +932,16 @@ fn a_root_re_export_resolves_to_the_module_that_defines_it() {
 
 #[test]
 fn error_and_result_resolve_to_their_home_not_to_a_module_named_error() {
+    // The real shape: `core::error` defines the type, the root re-exports
+    // it, and a caller names it as `crate::Error`. The net must see the
+    // edge to the module that *defines* it — never to the root, and never
+    // to a module named "Error".
     let mut mods = Modules::new();
-    mods.insert("lib".to_string(), concat!(
+    mods.insert("core::error".to_string(), concat!(
         "pub enum Error { Interrupted }\n",
         "pub type Result<T> = std::result::Result<T, Error>;\n",
     ).to_string());
+    mods.insert("lib".to_string(), "pub use crate::core::error::{Error, Result};\n".to_string());
     mods.insert("core::ir".to_string(), "use crate::{Error, Result};\n".to_string());
     let known = known_modules(&mods);
     let aliases = build_aliases(&mods, &known);
