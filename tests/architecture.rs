@@ -10,16 +10,16 @@
 //                                                  — infra primitives
 //   L2  core::context, core::ports, core::prompt
 //                                                  — per-agent state + the ports
-//   L3  config (+ settings/login), tools (+ edit/ledger/runtime), mcp + submodules
+//   L3  config (+ settings/login), tools (+ edit/ledger/runtime), mcp (except its stub)
 //                                                  — the user's wishes and the tool tier
 //   L4  api (+ api::minimax/zai/deepseek)          — vendor + transport
 //   L5  lib, main, agent (+ runner/roster/tools/worker/cmd), workflow (+ exec), ui::plain, ui::tui (+ model/update/view)
 //                                                  — composition root + the loop + the port's adapters
-//   T   test_util                                  — test-only helpers
+//   T   test_util, mcp::stub                      — test-only helpers
 //
 // Rules:
 //   - L0..L5 may not import from any higher-numbered layer (no upward).
-//   - L5 may import anything — except the test-only helper, below.
+//   - L5 may import anything — except the test-only modules, below.
 //   - T is test-only: it may import anything (its symbols live behind
 //     `cfg(test)`), and no production module may import it — at any
 //     layer, L5 included. The compile error is not the point: the lib is
@@ -110,7 +110,6 @@ const LAYERS: &[(&str, Layer)] = &[
     ("mcp::stdio", Layer::L3),
     ("mcp::http", Layer::L3),
     ("mcp::inner", Layer::L3),
-    ("mcp::stub", Layer::L3),
     // L4 — the model boundary.
     ("api", Layer::L4),
     ("api::minimax", Layer::L4),
@@ -134,6 +133,8 @@ const LAYERS: &[(&str, Layer)] = &[
     ("ui::tui::view", Layer::L5),
     // T — test-only helpers.
     ("test_util", Layer::T),
+    ("mcp::stub", Layer::T),            // the protocol fixture: compiled
+                                        // only into the test build
 ];
 
 fn layer_of(mod_name: &str) -> Option<Layer> {
@@ -760,22 +761,24 @@ fn upward_edges(edges: &HashMap<String, Vec<String>>) -> Vec<(String, String, La
         let Some(lf) = layer_of(fr) else { continue };
         for to in deps {
             let Some(lt) = layer_of(to) else { continue };  // outside-project dep — skip
-            // The test-only helper is its own rule, and it has no
-            // exemption: no production module may import `test_util`, at
-            // any layer. (The general upward rule already catches L0..L4,
-            // because T's rank is 99; what it missed was L5, which the
-            // upward rule exempts.) The compile error is not the point:
-            // the lib is also built without `cfg(test)` — as the bin's and
-            // the integration tests' dependency — so a production import
-            // of `test_util` is a hard E0432 under every cargo command.
-            // The rule is what names it: `L5/"agent::runner" ->
-            // T/"test_util"` instead of an opaque error.
+            // The test-only modules are their own rule, and it has no
+            // exemption: no production module may import `test_util` or
+            // `mcp::stub`, at any layer. (The general upward rule already
+            // catches L0..L4, because T's rank is 99; what it missed was
+            // L5, which the upward rule exempts.) The compile error is not
+            // the point: the lib is also built without `cfg(test)` — as
+            // the bin's and the integration tests' dependency — so a
+            // production import of `test_util` is a hard E0432 under
+            // every cargo command. The rule is what names it:
+            // `L5/"agent::runner" -> T/"test_util"` instead of an opaque
+            // error.
             let into_test_only = lt == Layer::T && lf != Layer::T;
             // Upward = target strictly higher than source.
             // T → non-T is a different bug (test util leaking into production).
-            // T (test_util) is `cfg(test)`-only — it may use any production
-            // module, since the symbols it references are stripped from
-            // release binaries. The interesting check is upward between
+            // The T modules (`test_util`, `mcp::stub`) are `cfg(test)`-only
+            // — they may use any production module, since the symbols they
+            // reference are stripped from release binaries. The interesting
+            // check is upward between
             // production layers, with one carve-out: L3 may reach L4, and
             // only for one reason — the `config` family (`config`,
             // `config::settings`, `config::login`) needs the vendor table
@@ -954,6 +957,25 @@ fn a_production_module_may_not_import_the_test_helper() {
     assert!(
         violations.iter().any(|(fr, to, _, _)| fr == "ui::plain" && to == "test_util"),
         "an L5 module's production import of the test helper is a violation: {violations:?}"
+    );
+}
+
+#[test]
+fn a_production_module_may_not_import_the_test_fixture() {
+    // The stub is the second test-only module, and the rule has to
+    // cover it too: a production `use crate::mcp::stub::Stub;` is the
+    // same mistake as a production `use crate::test_util::…`, and the
+    // rule that names the first must name the second.
+    let mut mods = Modules::new();
+    mods.insert("mcp::stub".to_string(), "pub struct Stub;\n".to_string());
+    mods.insert("ui::plain".to_string(), "use crate::mcp::stub::Stub;\n".to_string());
+    let known = known_modules(&mods);
+    let aliases = build_aliases(&mods, &known);
+    let edges = edges_of(&mods, &known, &aliases);
+    let violations = upward_edges(&edges);
+    assert!(
+        violations.iter().any(|(fr, to, _, _)| fr == "ui::plain" && to == "mcp::stub"),
+        "an L5 module's production import of the test fixture is a violation: {violations:?}"
     );
 }
 

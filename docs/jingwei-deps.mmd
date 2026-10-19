@@ -50,7 +50,6 @@ flowchart TD
         mcp_http["mcp::http — the HTTP transport"]
         mcp_inner["mcp::inner — the hub's actor"]
         mcp_stdio["mcp::stdio — the stdio transport"]
-        mcp_stub["mcp::stub — the test fixture<br/>(test build only)"]
         mcp_wire["mcp::wire — the JSON-RPC vocabulary"]
         tools_edit["tools::edit — the exact-then-line edit"]
         tools_ledger["tools::ledger — the per-agent file ledger"]
@@ -79,6 +78,7 @@ flowchart TD
     end
     subgraph T["T — test-only"]
         test_util["test_util — test-only helpers"]
+        mcp_stub["mcp::stub — the test fixture"]
     end
 
     agent --> core_ids
