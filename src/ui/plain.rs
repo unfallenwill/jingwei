@@ -3,8 +3,9 @@
 //! TUI's sibling — same port, same vocabulary (`crate::ui`), none of
 //! the terminal machinery.
 
-use crate::ui::{self, Msg, Sev, Show};
+use crate::ui::{self, AgentId, AgentMsg, Msg, Sev, Show, TurnState};
 use crate::mcp::Hub;
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 
 /// Where a rendered plain line goes.
@@ -25,11 +26,92 @@ const PLAIN_TOOL_LINES: usize = 20;
 /// streamed text stays buffered until a newline closes it or the turn ends
 /// (`Done`/`TaskEnd` land the tail even without a trailing newline) —
 /// tests pin the exact output.
+///
+/// The fold is per agent: the conversation has a stream of its own, and
+/// every background agent has one of its own. A worker's lines carry the
+/// agent's tag (`[a1] `); the conversation's carry nothing.
 #[derive(Default)]
 pub struct Plain {
+    /// The conversation's own stream.
+    main: PlainStream,
+    /// The background agents' streams, by id.
+    workers: BTreeMap<AgentId, PlainStream>,
+}
+
+/// One stream's state — the conversation's, or one background agent's.
+/// The fold is the same for both; only the tag on the lines differs.
+#[derive(Default)]
+struct PlainStream {
+    /// Streamed text, not yet a line.
     text: String,
+    /// Reasoning, folded when the block closes.
     think: String,
+    /// How many reasoning blocks have been folded.
     thoughts: usize,
+    /// The label the fleet gave it.
+    label: String,
+    /// How many tools it has called.
+    tools: usize,
+    /// Its state.
+    state: TurnState,
+    /// Its report.
+    report: String,
+}
+
+impl PlainStream {
+    /// Land complete lines of streamed text; the partial tail stays buffered.
+    fn flush(&mut self, tag: &str, lines: &mut Vec<(Stream, String)>) {
+        while let Some(i) = self.text.find('\n') {
+            let line: String = self.text.drain(..=i).collect();
+            lines.push((Stream::Out, format!("{tag}{}", line.trim_end_matches('\n'))));
+        }
+    }
+
+    /// Close the streamed text: complete lines, then the unterminated
+    /// tail as one last line. The wire's final chunk owes us no newline.
+    fn end_of_text(&mut self, tag: &str, lines: &mut Vec<(Stream, String)>) {
+        self.flush(tag, lines);
+        if !self.text.is_empty() {
+            let rest = std::mem::take(&mut self.text);
+            lines.push((Stream::Out, format!("{tag}{rest}")));
+        }
+    }
+
+    /// A tool call: the head — tagged, for a worker — and the tail on
+    /// the shared gutter. The gutter is the fold's shape, not the
+    /// speaker's: the head directly above it already carries the tag.
+    fn tool(&mut self, tag: &str, name: &str, summary: &str, output: &str, lines: &mut Vec<(Stream, String)>) {
+        self.end_of_text(tag, lines);
+        lines.push((Stream::Out, format!("{tag}[{name}] {summary}")));
+        let all: Vec<&str> = output.lines().collect();
+        let shown = all.len().min(PLAIN_TOOL_LINES);
+        for l in &all[..shown] {
+            lines.push((Stream::Out, format!("│ {l}")));
+        }
+        if all.len() > shown {
+            lines.push((Stream::Out, format!("{}… +{} more lines", ui::FOLD_GUTTER, all.len() - shown)));
+        }
+    }
+
+    /// Fold accumulated reasoning into a marker line; interrupted thinking
+    /// still folds, so nothing reasoned is lost.
+    fn fold_think(&mut self, tag: &str, lines: &mut Vec<(Stream, String)>) {
+        if self.think.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.think);
+        self.thoughts += 1;
+        let mut all = text.lines();
+        let first = all.next().unwrap_or("");
+        lines.push((Stream::Out, format!("{tag}{}", ui::thought_folded(self.thoughts, first, all.count()))));
+    }
+
+    /// A turn ended: land the open text line (with or without its newline)
+    /// and fold whatever reasoning was still arriving.
+    fn end_of_turn(&mut self, tag: &str, lines: &mut Vec<(Stream, String)>) {
+        self.end_of_text(tag, lines);
+        self.fold_think(tag, lines);
+    }
 }
 
 impl Plain {
@@ -45,75 +127,72 @@ impl Plain {
             Msg::TaskBegin(t) => {
                 lines.push((Stream::Out, format!("{}{}{t}", ui::PROMPT_HEAD, ui::PROMPT_GUTTER)))
             }
-            Msg::TaskEnd => self.end_of_turn(&mut lines),
+            Msg::TaskEnd => self.main.end_of_turn("", &mut lines),
             Msg::Text(t) => {
-                self.text.push_str(&t);
-                self.flush(&mut lines);
+                self.main.text.push_str(&t);
+                self.main.flush("", &mut lines);
             }
-            Msg::Think(t) => self.think.push_str(&t),
-            Msg::ThinkEnd => self.fold_think(&mut lines),
+            Msg::Think(t) => self.main.think.push_str(&t),
+            Msg::ThinkEnd => self.main.fold_think("", &mut lines),
             Msg::Tool { name, summary, output } => {
-                self.end_of_text(&mut lines);
-                lines.push((Stream::Out, format!("[{name}] {summary}")));
-                let all: Vec<&str> = output.lines().collect();
-                let shown = all.len().min(PLAIN_TOOL_LINES);
-                for l in &all[..shown] {
-                    lines.push((Stream::Out, format!("│ {l}")));
-                }
-                if all.len() > shown {
-                    lines.push((Stream::Out, format!("{}… +{} more lines", ui::FOLD_GUTTER, all.len() - shown)));
-                }
+                self.main.tool("", &name, &summary, &output, &mut lines);
             }
             // both severities ride stderr: notes are asides to the answer,
             // and the answer itself is stdout
             Msg::Note { text, .. } => lines.push((Stream::Err, text)),
             // usage lives in the TUI's status bar; the plain log has none
             Msg::Usage(_) | Msg::OutTokens(_) => {}
-            Msg::Done => self.end_of_turn(&mut lines),
-            // A background agent's event. The frontends' agent rows land in the
-            // next slice; until then a worker's events are dropped rather than mixed
-            // into the main agent's stream.
-            Msg::FromAgent { .. } => {}
+            Msg::Done => self.main.end_of_turn("", &mut lines),
+            Msg::FromAgent { id, event } => self.agent_event(id, *event, &mut lines),
         }
         lines
     }
 
-    /// A turn ended: land the open text line (with or without its newline)
-    /// and fold whatever reasoning was still arriving.
-    fn end_of_turn(&mut self, lines: &mut Vec<(Stream, String)>) {
-        self.end_of_text(lines);
-        self.fold_think(lines);
-    }
-
-    /// Land complete lines of streamed text; the partial tail stays buffered.
-    fn flush(&mut self, lines: &mut Vec<(Stream, String)>) {
-        while let Some(i) = self.text.find('\n') {
-            let line: String = self.text.drain(..=i).collect();
-            lines.push((Stream::Out, line.trim_end_matches('\n').to_string()));
+    /// A background agent's event. Its lines carry the agent's tag; the
+    /// conversation's carry nothing.
+    ///
+    /// The plain log *streams* a worker's prose — a line lands when its
+    /// newline arrives, exactly as the conversation's does. (The TUI
+    /// defers a worker's prose to the agent's end, so two speakers'
+    /// prose never interleaves in its transcript.) The log has no live
+    /// pane to interleave with, and a log that showed nothing until the
+    /// worker ended would make a working agent look like an idle one.
+    fn agent_event(&mut self, id: AgentId, ev: AgentMsg, lines: &mut Vec<(Stream, String)>) {
+        let tag = ui::agent_tag(id);
+        let stream = self.workers.entry(id).or_default();
+        match ev {
+            // the start names the agent and nothing else
+            AgentMsg::Started { label } => {
+                stream.label = label;
+                stream.state = TurnState::InProgress;
+            }
+            AgentMsg::Text(t) => {
+                stream.text.push_str(&t);
+                stream.flush(&tag, lines);
+            }
+            AgentMsg::Think(t) => stream.think.push_str(&t),
+            AgentMsg::ThinkEnd => stream.fold_think(&tag, lines),
+            AgentMsg::Tool { name, summary, output } => {
+                stream.tools += 1;
+                stream.tool(&tag, &name, &summary, &output, lines);
+            }
+            // a note is an aside to the answer, and rides stderr as the
+            // conversation's own notes do
+            AgentMsg::Note { text, .. } => lines.push((Stream::Err, format!("{tag}{text}"))),
+            AgentMsg::Finished { state, report } => {
+                stream.state = state;
+                stream.report = report;
+                // the prose tail lands, then the reasoning folds
+                stream.end_of_turn(&tag, lines);
+                // the completion line: the tool count, but no elapsed
+                // time — the plain log has no clock and does not fake one
+                lines.push((Stream::Out, ui::agent_summary(id, stream.state, &stream.label, None, stream.tools)));
+                // the report's lines, tagged
+                for line in stream.report.lines() {
+                    lines.push((Stream::Out, format!("{tag}{line}")));
+                }
+            }
         }
-    }
-
-    /// Close the streamed text: complete lines, then the unterminated tail
-    /// as one last line. The wire's final chunk owes us no newline.
-    fn end_of_text(&mut self, lines: &mut Vec<(Stream, String)>) {
-        self.flush(lines);
-        if !self.text.is_empty() {
-            let rest = std::mem::take(&mut self.text);
-            lines.push((Stream::Out, rest));
-        }
-    }
-
-    /// Fold accumulated reasoning into a marker line; interrupted thinking
-    /// still folds, so nothing reasoned is lost.
-    fn fold_think(&mut self, lines: &mut Vec<(Stream, String)>) {
-        if self.think.is_empty() {
-            return;
-        }
-        let text = std::mem::take(&mut self.think);
-        self.thoughts += 1;
-        let mut all = text.lines();
-        let first = all.next().unwrap_or("");
-        lines.push((Stream::Out, ui::thought_folded(self.thoughts, first, all.count())));
     }
 }
 
@@ -382,13 +461,13 @@ mod tests {
     }
 
     #[test]
-    fn the_plain_log_drops_a_workers_events_without_touching_the_conversation() {
-        // the worker's prose, tool call and note print nothing at all —
-        // and the conversation's own line is exactly what it was
+    fn the_conversation_is_unchanged() {
+        // a mixed sequence: the conversation's own line is exactly what
+        // it was, and the worker's lines carry the worker's tag
         let id = ui::AgentId::next();
         let out = run(vec![
             Msg::TaskBegin("count files".into()),
-            Msg::FromAgent { id, event: Box::new(ui::AgentMsg::Text("a worker spoke".into())) },
+            Msg::FromAgent { id, event: Box::new(ui::AgentMsg::Text("a worker spoke\n".into())) },
             Msg::FromAgent { id, event: Box::new(ui::AgentMsg::Tool {
                 name: "bash".into(), summary: "$ ls".into(), output: "a\n".into() }) },
             Msg::FromAgent { id, event: Box::new(ui::AgentMsg::Note {
@@ -400,9 +479,66 @@ mod tests {
         let texts: Vec<String> = out.iter().map(|(_, l)| l.clone()).collect();
         assert_eq!(texts, vec![
             format!("{}{}count files", ui::PROMPT_HEAD, ui::PROMPT_GUTTER),
+            format!("[{id}] a worker spoke"),
+            format!("[{id}] [bash] $ ls"),
+            "│ a".to_string(),
+            format!("[{id}]  it failed "),
             "the conversation's answer".to_string(),
-        ], "the worker's events print nothing, and the conversation's line is unchanged: {texts:?}");
-        assert!(out.iter().all(|(s, _)| *s == Stream::Out), "no stderr line appears: {out:?}");
+        ], "the conversation's line is unchanged, the worker's lines are tagged: {texts:?}");
+    }
+
+    #[test]
+    fn a_workers_lines_carry_its_tag() {
+        let id = ui::AgentId::next();
+        let out = run(vec![
+            Msg::FromAgent { id, event: Box::new(ui::AgentMsg::Started { label: "build".into() }) },
+            Msg::FromAgent { id, event: Box::new(ui::AgentMsg::Text("the worker's prose\n".into())) },
+            Msg::FromAgent { id, event: Box::new(ui::AgentMsg::Tool {
+                name: "bash".into(), summary: "$ ls".into(), output: "a\n".into() }) },
+            Msg::FromAgent { id, event: Box::new(ui::AgentMsg::Finished {
+                state: ui::TurnState::Completed, report: "found three files".into() }) },
+        ]);
+        let texts: Vec<String> = out.iter().map(|(_, l)| l.clone()).collect();
+        assert_eq!(texts, vec![
+            format!("[{id}] the worker's prose"),
+            format!("[{id}] [bash] $ ls"),
+            "│ a".to_string(),
+            // the tool count, but no elapsed time: the plain log has no clock
+            format!("[{id}] ✓ build · 1 tool"),
+            format!("[{id}] found three files"),
+        ], "{texts:?}");
+    }
+
+    #[test]
+    fn a_workers_tool_tail_keeps_the_gutter() {
+        // the tag is on the head; the tail hangs from the fold's gutter
+        let id = ui::AgentId::next();
+        let out = run(vec![Msg::FromAgent { id, event: Box::new(ui::AgentMsg::Tool {
+            name: "bash".into(), summary: "$ ls".into(), output: "a\nb\n".into() }) }]);
+        let texts: Vec<String> = out.iter().map(|(_, l)| l.clone()).collect();
+        assert_eq!(texts, vec![
+            format!("[{id}] [bash] $ ls"),
+            "│ a".to_string(),
+            "│ b".to_string(),
+        ], "{texts:?}");
+    }
+
+    #[test]
+    fn two_workers_do_not_share_a_buffer() {
+        // a1's half-line and a2's half-line never merge: each stream
+        // keeps its own text
+        let a = ui::AgentId::next();
+        let b = ui::AgentId::next();
+        let out = run(vec![
+            Msg::FromAgent { id: a, event: Box::new(ui::AgentMsg::Text("hello".into())) },
+            Msg::FromAgent { id: b, event: Box::new(ui::AgentMsg::Text("world\n".into())) },
+            Msg::FromAgent { id: a, event: Box::new(ui::AgentMsg::Text(" there\n".into())) },
+        ]);
+        let texts: Vec<String> = out.iter().map(|(_, l)| l.clone()).collect();
+        assert_eq!(texts, vec![
+            format!("[{b}] world"),
+            format!("[{a}] hello there"),
+        ], "two streams, two buffers: {texts:?}");
     }
 
     #[test]
