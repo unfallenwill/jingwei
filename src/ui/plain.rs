@@ -476,15 +476,17 @@ mod tests {
             Msg::Done,
             Msg::TaskEnd,
         ]);
-        let texts: Vec<String> = out.iter().map(|(_, l)| l.clone()).collect();
-        assert_eq!(texts, vec![
-            format!("{}{}count files", ui::PROMPT_HEAD, ui::PROMPT_GUTTER),
-            format!("[{id}] a worker spoke"),
-            format!("[{id}] [bash] $ ls"),
-            "│ a".to_string(),
-            format!("[{id}]  it failed "),
-            "the conversation's answer".to_string(),
-        ], "the conversation's line is unchanged, the worker's lines are tagged: {texts:?}");
+        // the routing is part of the contract, not an accident of the
+        // fold: the worker's note is the only line that rides stderr,
+        // and the conversation's own answer rides stdout untagged
+        assert_eq!(out, vec![
+            (Stream::Out, format!("{}{}count files", ui::PROMPT_HEAD, ui::PROMPT_GUTTER)),
+            (Stream::Out, format!("[{id}] a worker spoke")),
+            (Stream::Out, format!("[{id}] [bash] $ ls")),
+            (Stream::Out, "│ a".to_string()),
+            (Stream::Err, format!("[{id}]  it failed ")),
+            (Stream::Out, "the conversation's answer".to_string()),
+        ], "the conversation's line is unchanged, the worker's lines are tagged: {out:?}");
     }
 
     #[test]
