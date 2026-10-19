@@ -74,6 +74,13 @@ pub(crate) enum ReminderId {
     /// cache hit rate of the closest AGENTS.md is unaffected by
     /// how many nested files exist.
     AgentsMdIndex { paths: Vec<PathBuf> },
+
+    /// The fleet's own instruction: that this session can start
+    /// background agents, and how to collect their reports. It rides
+    /// with the fleet's tools, and a worker that was shown both would
+    /// try to spawn agents of its own.
+    #[allow(dead_code)] // the fleet slice mints the reminder; until then only the tests do
+    AgentTools,
 }
 
 impl ReminderId {
@@ -97,6 +104,9 @@ impl ReminderId {
             // `read_file` when it wants them, which keeps the cached
             // prefix independent of how many nested files exist.
             Self::AgentsMdIndex { .. } => true,
+            // The fleet's instruction is written once at session start
+            // and does not change between requests.
+            Self::AgentTools => true,
         }
     }
 }

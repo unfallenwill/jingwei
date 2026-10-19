@@ -98,6 +98,10 @@ pub(crate) struct Context {
     /// comes from `--context-size`, and it is this agent's own — two
     /// contexts trim independently.
     budget: u64,
+    /// The tool names this agent must not be shown. Empty for the main
+    /// agent; a worker hides the fleet's own tools, because the fleet is
+    /// one level deep and a worker that could spawn agents would try.
+    hidden_tools: Vec<String>,
 }
 
 impl Context {
@@ -161,6 +165,7 @@ impl Context {
             tools: Vec::new(),
             history: Vec::new(),
             budget,
+            hidden_tools: Vec::new(),
         }
     }
 
@@ -169,8 +174,12 @@ impl Context {
     /// first, the servers' tools after them. The order and the bytes are a
     /// cache contract, so the list is taken as-is and never sorted,
     /// deduplicated or reworded here.
+    ///
+    /// The one exception is this agent's own hide list: a worker is shown
+    /// the router's list minus the tools it must not call. The order of
+    /// what survives is untouched, so the cache contract holds.
     pub(crate) fn set_tools(&mut self, tools: Vec<Value>) {
-        self.tools = tools;
+        self.tools = hide_tools(tools, &self.hidden_tools);
     }
 
     /// The transcript, as the model will see it.
@@ -208,6 +217,79 @@ impl Context {
     pub(crate) fn fit(&mut self) -> bool {
         fit_context(&mut self.history, self.budget)
     }
+
+    /// A seed of this context's shared state: everything a *second* agent
+    /// should see, and nothing it must not have.
+    ///
+    /// The transcript is the part that does not travel — a worker starts
+    /// with an empty one, because the conversation the human is having
+    /// is not the worker's conversation.
+    #[allow(dead_code)] // the fleet slice seeds a worker's context; until then only the tests do
+    pub(crate) fn seed(&self) -> ContextSeed {
+        ContextSeed {
+            system_text: self.system_text.clone(),
+            reminders: self.reminders.clone(),
+            tools: self.tools.clone(),
+            budget: self.budget,
+        }
+    }
+}
+
+/// A context's shared state, without its transcript.
+///
+/// The fleet hands one of these to every worker it spawns: the same
+/// system text, the same project reminders, the same trim budget — and
+/// a transcript of its own, empty. It is the one honest way to start a
+/// second agent off the first one's prompt without giving it the first
+/// one's conversation.
+#[allow(dead_code)] // the fleet slice seeds a worker's context; until then only the tests do
+#[derive(Clone)]
+pub(crate) struct ContextSeed {
+    system_text: String,
+    reminders: Vec<SystemReminder>,
+    tools: Vec<Value>,
+    budget: u64,
+}
+
+impl ContextSeed {
+    /// A fresh context for another agent.
+    ///
+    /// The tool list is the router's, minus the names this agent must not
+    /// be shown, and the agent-tools reminder goes with them: a worker
+    /// told it could spawn agents would try, and the fleet is one level
+    /// deep.
+    #[allow(dead_code)] // the fleet slice seeds a worker's context; until then only the tests do
+    pub(crate) fn context(&self, hidden_tools: &[&str]) -> Context {
+        let hidden: Vec<String> = hidden_tools.iter().map(|s| s.to_string()).collect();
+        Context {
+            system_text: self.system_text.clone(),
+            reminders: self
+                .reminders
+                .iter()
+                .filter(|r| !matches!(r.id, ReminderId::AgentTools))
+                .cloned()
+                .collect(),
+            tools: hide_tools(self.tools.clone(), &hidden),
+            history: Vec::new(),
+            budget: self.budget,
+            hidden_tools: hidden,
+        }
+    }
+}
+
+/// Drop the tools this agent must not see. The order of what survives is
+/// untouched — the list's byte order is a cache contract.
+fn hide_tools(tools: Vec<Value>, hidden: &[String]) -> Vec<Value> {
+    if hidden.is_empty() {
+        return tools;
+    }
+    tools
+        .into_iter()
+        .filter(|t| match t.get("name").and_then(|n| n.as_str()) {
+            Some(name) => !hidden.iter().any(|h| h == name),
+            None => true,
+        })
+        .collect()
 }
 
 // ---- history trim ----------------------------------------------------------
@@ -490,6 +572,58 @@ mod tests {
         ctx.set_tools(vec![json!({"name": "c"})]);
         let names: Vec<&str> = ctx.tools.iter().filter_map(|v| v["name"].as_str()).collect();
         assert_eq!(names, vec!["c"]);
+    }
+
+    // ---- the seed ---------------------------------------------------------
+
+    #[test]
+    fn a_seeded_context_has_no_transcript() {
+        // A second agent starts from the first one's prompt, not from the
+        // first one's conversation. The seed carries the shared state and
+        // leaves the transcript behind.
+        let mut ctx = bare(BUDGET);
+        ctx.push(Message::User("the human asked".into()));
+        ctx.push(Message::Assistant(vec![Block::Text("the answer".into())]));
+        let seed = ctx.seed();
+        let seeded = seed.context(&[]);
+        assert!(seeded.history().is_empty(), "a seeded context says nothing yet");
+        assert_eq!(seeded.system_text, ctx.system_text, "but it speaks the same prompt");
+        assert_eq!(seeded.budget, ctx.budget, "and trims to the same budget");
+    }
+
+    #[test]
+    fn a_context_hides_the_tools_it_is_told_to_hide() {
+        // The fleet's tools are hidden from a worker: the fleet is one
+        // level deep, and a worker that could spawn agents would try.
+        let mut ctx = bare(BUDGET);
+        ctx.set_tools(vec![
+            json!({"name": "bash"}),
+            json!({"name": "spawn_agent"}),
+            json!({"name": "read_file"}),
+        ]);
+        let worker = ctx.seed().context(&["spawn_agent"]);
+        let names: Vec<&str> = worker.tools.iter().filter_map(|v| v["name"].as_str()).collect();
+        assert_eq!(names, vec!["bash", "read_file"], "the hidden tool is gone, the order is not");
+        // and the hide list holds when the list is set again, turn by turn
+        let mut worker = worker;
+        worker.set_tools(vec![json!({"name": "spawn_agent"}), json!({"name": "wait_agents"})]);
+        let names: Vec<&str> = worker.tools.iter().filter_map(|v| v["name"].as_str()).collect();
+        assert_eq!(names, vec!["wait_agents"], "the hide list is the context's, not the list's");
+    }
+
+    #[test]
+    fn a_seeded_context_leaves_the_fleet_reminder_behind() {
+        // The reminder that tells the model about the fleet's tools goes
+        // with the tools: a worker shown one without the other is a
+        // worker told to do something it cannot do.
+        let mut ctx = bare(BUDGET);
+        ctx.reminders.push(SystemReminder {
+            id: ReminderId::AgentTools,
+            text: "\n\n# Background agents".into(),
+        });
+        let worker = ctx.seed().context(&["spawn_agent"]);
+        assert!(worker.reminders.is_empty(), "no agent-tools reminder for a worker");
+        assert_eq!(ctx.reminders.len(), 1, "the main agent keeps its own");
     }
 
     // ---- the transcript ---------------------------------------------------
