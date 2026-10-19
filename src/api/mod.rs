@@ -574,7 +574,7 @@ mod tests {
         let md = crate::core::agents_md::AgentsMdContext::load(&dir);
         let cx = crate::core::context::Context::new(&md, crate::config::DEFAULT_CONTEXT_SIZE);
         let s = chat_system_text(&cx);
-        assert!(s.starts_with(crate::core::context::SYSTEM),
+        assert!(s.starts_with(crate::core::prompt::SYSTEM),
             "system_text comes first");
         assert!(s.contains("# Project conventions"),
             "AGENTS.md section rides in");

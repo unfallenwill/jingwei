@@ -1,10 +1,11 @@
 //! The model-side context: every turn, jingwei renders one prompt and ships
 //! it down a wire. This module owns the parts of the prompt the model sees
-//! but the agent core doesn't think about — system text (just `SYSTEM`),
-//! the active reminder list (every non-static system-side instruction:
-//! AGENTS.md today, runtime context and compaction anchors tomorrow), the
-//! tool surface, the transcript the model is having, and the trim policy
-//! that keeps that transcript inside the configured budget.
+//! but the agent core doesn't think about — system text (just
+//! `prompt::SYSTEM`), the active reminder list (every non-static
+//! system-side instruction: AGENTS.md today, runtime context and compaction
+//! anchors tomorrow), the tool surface, the transcript the model is having,
+//! and the trim policy that keeps that transcript inside the configured
+//! budget.
 //!
 //! Why this is its own module: before, the same work was scattered across
 //! three places — `agents_md::system_prompt_extras` (now retired), the
@@ -42,24 +43,9 @@
 
 use crate::core::agents_md::AgentsMdContext;
 use crate::core::ir::{history_value, Block, Message};
+use crate::core::prompt::SYSTEM;
 use crate::core::reminder::{ReminderId, SystemReminder};
 use serde_json::Value;
-
-/// The static system prompt — the runtime contract with the model, shipped
-/// on every request. It lives here (not at the crate root) because context
-/// owns everything the model sees; every wire starts from this string.
-pub(crate) const SYSTEM: &str = "You are jingwei (精卫), a coding agent with these tools: \
-    bash (run a shell command), read_file, write_file, edit_file (search/replace; exact match with line-aligned indentation fallback). \
-    Pick the smallest tool that fits: read_file to inspect (not cat via bash); edit_file for a few lines; write_file only to create or wholesale-replace; bash for the rest — running tests, git, grep, ls. \
-    Read a file before you edit it — never guess its contents. \
-    Prefer small, targeted commands. \
-    Never start a command that waits for input or never returns (editors, pagers, watch or server modes) — everything you run must terminate. \
-    Never run destructive commands unless the user explicitly asks. \
-    Never run git commit, push, reset, checkout, clean, or rebase unless the user explicitly asks. \
-    Write for a terminal, not a Markdown renderer: plain text, no headings/tables/bold markers, short lines, with exact copy-pasteable paths and commands. And since your reasoning is folded away and unseen, put every conclusion in the visible answer. \
-    Don't stop until the task is actually delivered: make the change, then verify it by running the build, the tests, or the exact command, fix what fails, and repeat until it passes — only then summarize. If you cannot finish, say exactly what is done, what is left, and what blocked you. \
-    When asked your name, say you are jingwei (精卫). \
-    When finished, reply with a concise 1-3 sentence summary of what you did.";
 
 /// One agent's model-visible state: the prompt, the nudges, the tool
 /// surface, the transcript, and the budget that trims the transcript.

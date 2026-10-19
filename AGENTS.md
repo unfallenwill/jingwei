@@ -1,8 +1,8 @@
 # AGENTS.md — jingwei (精卫)
 
 This file is for **agents developing jingwei itself** — not for jingwei
-at runtime. The runtime prompt is the `SYSTEM` constant in `src/main.rs`,
-which is a separate contract (see [Don'ts](#donts)).
+at runtime. The runtime prompt is the `SYSTEM` constant in
+`src/core/prompt.rs`, which is a separate contract (see [Don'ts](#donts)).
 
 Keep this file to **rules and constraints that the code does not already
 encode**: build/test gates, what counts as a good commit, what not to
@@ -47,7 +47,7 @@ They look similar but are two unrelated contracts:
 
 | Audience | Lives in | Why it exists |
 | --- | --- | --- |
-| jingwei at runtime, given a task | `SYSTEM` in `src/main.rs` | Shipped with every API call; models weight it heavily; users tune behavior by editing it. |
+| jingwei at runtime, given a task | `SYSTEM` in `src/core/prompt.rs` | Shipped with every API call; models weight it heavily; users tune behavior by editing it. |
 | An agent developing jingwei itself | this file | Lets Cursor / Codex / Aider / etc. pick up the conventions without an internal monologue. |
 
 Editing one does not affect the other. Don't conflate them.

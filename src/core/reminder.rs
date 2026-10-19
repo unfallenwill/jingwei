@@ -1,12 +1,12 @@
 //! System-side reminders: extra instructions injected into the model
-//! request, distinct from the static `context::SYSTEM` constant. Every
+//! request, distinct from the static `prompt::SYSTEM` constant. Every
 //! non-static piece of system-side text rides here — AGENTS.md content
 //! (commit 1), runtime context, future runtime injections — and reaches
 //! the model as a system-role message.
 //!
 //! ## Why a separate type from `system_text`
 //!
-//! `Context.system_text: String` holds *only* `context::SYSTEM` — the
+//! `Context.system_text: String` holds *only* `prompt::SYSTEM` — the
 //! stable identity contract the model reads once per session. Every
 //! other piece of system-side text rides in `Context.reminders`, where
 //! every [`SystemReminder`] carries a stable [`id`] used for dedupe and

@@ -114,7 +114,7 @@ pub(crate) fn cfg(base: String, streaming: bool) -> crate::config::Config {
 /// A bare `Context` for tests that don't care about AGENTS.md or the
 /// tool list. Vendors take `&Context`; tests that exercise `body()` or
 /// `call_api()` need a handle, and wiring one by hand is noise. The empty
-/// AGENTS.md context gives us a system_text equal to `crate::core::context::SYSTEM`,
+/// AGENTS.md context gives us a system_text equal to `crate::core::prompt::SYSTEM`,
 /// which is what nearly every test wants anyway.
 #[cfg(test)]
 pub(crate) fn ctx() -> crate::core::context::Context {

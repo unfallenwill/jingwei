@@ -81,9 +81,9 @@ pub async fn run() -> Result<()> {
     // `--no-agents-md` short-circuits to an empty context so the rest of
     // the run is identical to "no AGENTS.md exists at all". The result
     // hands off to `Context::new`, which holds `system_text = SYSTEM`
-    // and enqueues an `AgentsMdClosest` reminder when an AGENTS.md was
-    // loaded; vendors consume both fields and never reach into
-    // AGENTS.md or the tool registry themselves.
+    // (`prompt::SYSTEM`, verbatim) and enqueues an `AgentsMdClosest`
+    // reminder when an AGENTS.md was loaded; vendors consume both fields
+    // and never reach into AGENTS.md or the tool registry themselves.
     let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let agents_ctx = if args.no_agents_md {
         AgentsMdContext::empty(&workspace)

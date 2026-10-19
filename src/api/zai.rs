@@ -117,7 +117,7 @@ mod tests {
         let msgs = vec![crate::core::ir::Message::User("task".into())];
         let b = super::body(&c, &cx, &msgs, false);
         let system = b["messages"][0]["content"].as_str().unwrap();
-        assert!(system.contains(crate::core::context::SYSTEM), "base SYSTEM stays in the wire");
+        assert!(system.contains(crate::core::prompt::SYSTEM), "base SYSTEM stays in the wire");
         assert!(system.contains("always use pnpm"), "AGENTS.md body rides in");
         assert!(system.contains("# Project conventions"), "extras are labelled");
         assert!(system.contains(&dir.display().to_string()),
