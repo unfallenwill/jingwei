@@ -96,7 +96,7 @@ mod tests {
     use crate::core::ir::Message;
     use crate::core::session::{Provenance, Session};
     use crate::mcp::Hub;
-    use crate::test_util::{block_on, cfg, mock_seq, mock_seq_with};
+    use crate::test_util::{block_on, cfg, mock_seq, mock_seq_with, Recorder};
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -106,19 +106,6 @@ mod tests {
         r#"{"content":[{"type":"text","text":"three files"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
     /// A model that refuses.
     const REFUSED: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"no"}}"#;
-
-    /// A sink that keeps every message: the tests assert on the run's own
-    /// sequence, not on what a frontend would draw.
-    #[derive(Clone, Default)]
-    struct Recorder(Arc<Mutex<Vec<Msg>>>);
-
-    impl Recorder {
-        fn msgs(&self) -> Vec<Msg> { self.0.lock().unwrap().clone() }
-    }
-
-    impl Show for Recorder {
-        fn show(&self, m: Msg) { self.0.lock().unwrap().push(m); }
-    }
 
     /// A mapper that says nothing: how a failure looks is the frontend's
     /// business, and these tests are about the run, not its face.

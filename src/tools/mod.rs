@@ -275,7 +275,7 @@ impl ToolProvider for Builtins {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::temp_dir;
+    use crate::test_util::{temp_dir, Recorder};
     use serde_json::json;
     use std::fs;
 
@@ -524,18 +524,11 @@ mod tests {
 
     // ---- print_tool_call: the channel through the display port ------------
 
-    /// A sink that captures every Msg handed to it: the tests assert on
-    /// the message the frontends would receive, not on a string.
-    struct CapturingSink(std::sync::Mutex<Vec<Msg>>);
-    impl crate::ui::Show for CapturingSink {
-        fn show(&self, m: Msg) { self.0.lock().unwrap().push(m); }
-    }
-
     #[test]
     fn print_tool_call_emits_a_tool_message_with_summary_and_output() {
-        let sink = CapturingSink(Default::default());
+        let sink = Recorder::default();
         print_tool_call("bash", &json!({"command": "echo hi"}), "out", &sink);
-        let got = sink.0.lock().unwrap().pop().unwrap();
+        let got = sink.pop().unwrap();
         match got {
             Msg::Tool { name, summary, output } => {
                 assert_eq!(name, "bash");

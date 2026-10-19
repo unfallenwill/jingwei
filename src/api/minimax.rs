@@ -167,23 +167,9 @@ mod tests {
     use crate::api::{call_api, Protocol};
     use crate::api::{Effort, Thinking as CThinking};
     use crate::core::ir::{Block, Message, ToolResult};
-    use crate::test_util::{block_on, cfg, ctx as make_ctx, mock, mock_seq, request_body, sink, BlockExt};
-    use crate::ui::{Msg, Show};
+    use crate::test_util::{block_on, cfg, ctx as make_ctx, mock, mock_seq, request_body, sink, BlockExt, Recorder};
+    use crate::ui::Msg;
     use serde_json::json;
-    use std::sync::{Arc, Mutex};
-
-    /// A sink that keeps every message: this test is about the sequence
-    /// the port receives, not about what a frontend would draw with it.
-    #[derive(Clone, Default)]
-    struct Recorder(Arc<Mutex<Vec<Msg>>>);
-
-    impl Recorder {
-        fn msgs(&self) -> Vec<Msg> { self.0.lock().unwrap().clone() }
-    }
-
-    impl Show for Recorder {
-        fn show(&self, m: Msg) { self.0.lock().unwrap().push(m); }
-    }
 
     #[test]
     fn body_thinking_toggle_and_verbatim_echo() {

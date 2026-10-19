@@ -458,33 +458,22 @@ mod tests {
 
     // ---- /mcp command handling: same path the REPL takes ------------------
 
-    use crate::ui::Show;
-
-    /// Capture sink that records banner / note messages verbatim.
-    struct BagSink(std::sync::Mutex<Vec<Msg>>);
-    impl Show for BagSink {
-        fn show(&self, m: Msg) {
-            self.0.lock().unwrap().push(m);
-        }
-    }
+    use crate::test_util::Recorder;
 
     /// The bare `/mcp` on an empty hub surfaces the "no MCP servers"
     /// message — the only thing the report function returns.
     #[tokio::test]
     async fn mcp_bare_lists_the_default_message_when_nothing_is_configured() {
         let hub = crate::mcp::Hub::empty();
-        let sink = BagSink(Default::default());
+        let sink = Recorder::default();
         handle_mcp_command("", &hub, &sink).await;
-        {
-            // Scope the guard: clippy::await_holding_lock, and the rule is
-            // right — `hub.shutdown()` does not reach into the sink today,
-            // but a future change that does would deadlock behind this lock.
-            let msgs = sink.0.lock().unwrap();
-            assert_eq!(msgs.len(), 1, "got: {msgs:?}");
-            match &msgs[0] {
-                Msg::Banner(s) => assert!(s.contains("no MCP servers"), "{s}"),
-                other => panic!("expected a banner, got {other:?}"),
-            }
+        // The recorder hands back a copy, so no lock is held across the
+        // await — `hub.shutdown()` cannot deadlock behind one.
+        let msgs = sink.msgs();
+        assert_eq!(msgs.len(), 1, "got: {msgs:?}");
+        match &msgs[0] {
+            Msg::Banner(s) => assert!(s.contains("no MCP servers"), "{s}"),
+            other => panic!("expected a banner, got {other:?}"),
         }
         hub.shutdown().await;
     }
@@ -493,10 +482,10 @@ mod tests {
     #[tokio::test]
     async fn mcp_list_on_an_empty_hub_emits_nothing_visible() {
         let hub = crate::mcp::Hub::empty();
-        let sink = BagSink(Default::default());
+        let sink = Recorder::default();
         handle_mcp_command("list", &hub, &sink).await;
         // empty hub → empty list → no banners
-        assert!(sink.0.lock().unwrap().is_empty());
+        assert!(sink.msgs().is_empty());
         hub.shutdown().await;
     }
 
@@ -504,15 +493,13 @@ mod tests {
     #[tokio::test]
     async fn mcp_unknown_subcommand_emits_a_warning() {
         let hub = crate::mcp::Hub::empty();
-        let sink = BagSink(Default::default());
+        let sink = Recorder::default();
         handle_mcp_command("frobnicate", &hub, &sink).await;
-        {
-            let msgs = sink.0.lock().unwrap();
-            assert_eq!(msgs.len(), 1);
-            match &msgs[0] {
-                Msg::Note { text, .. } => assert!(text.contains("unknown subcommand"), "{text}"),
-                other => panic!("expected a note, got {other:?}"),
-            }
+        let msgs = sink.msgs();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            Msg::Note { text, .. } => assert!(text.contains("unknown subcommand"), "{text}"),
+            other => panic!("expected a note, got {other:?}"),
         }
         hub.shutdown().await;
     }
@@ -521,18 +508,16 @@ mod tests {
     #[tokio::test]
     async fn mcp_enable_without_a_name_is_an_error() {
         let hub = crate::mcp::Hub::empty();
-        let sink = BagSink(Default::default());
+        let sink = Recorder::default();
         handle_mcp_command("enable", &hub, &sink).await;
-        {
-            let msgs = sink.0.lock().unwrap();
-            assert_eq!(msgs.len(), 1);
-            match &msgs[0] {
-                Msg::Note { sev, text } => {
-                    assert_eq!(*sev, Sev::Err);
-                    assert!(text.contains("missing server name"), "{text}");
-                }
-                other => panic!("expected a note, got {other:?}"),
+        let msgs = sink.msgs();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            Msg::Note { sev, text } => {
+                assert_eq!(*sev, Sev::Err);
+                assert!(text.contains("missing server name"), "{text}");
             }
+            other => panic!("expected a note, got {other:?}"),
         }
         hub.shutdown().await;
     }

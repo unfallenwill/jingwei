@@ -64,6 +64,35 @@ pub(crate) fn sink() -> NullSink {
     NullSink
 }
 
+/// A sink that keeps every message: the tests assert on the sequence the
+/// port received, not on what a frontend would draw with it.
+///
+/// One recorder for the whole crate. The api layer, the run boundary, the
+/// tool tier and the plain frontend each wanted one, and four copies of
+/// the same ten lines is four places to fix the same bug.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct Recorder(Arc<Mutex<Vec<crate::ui::Msg>>>);
+
+#[cfg(test)]
+impl Recorder {
+    /// Every message, in the order it arrived.
+    pub(crate) fn msgs(&self) -> Vec<crate::ui::Msg> {
+        self.0.lock().unwrap().clone()
+    }
+    /// The last message — and it leaves the record.
+    pub(crate) fn pop(&self) -> Option<crate::ui::Msg> {
+        self.0.lock().unwrap().pop()
+    }
+}
+
+#[cfg(test)]
+impl crate::ui::Show for Recorder {
+    fn show(&self, m: crate::ui::Msg) {
+        self.0.lock().unwrap().push(m);
+    }
+}
+
 /// The agent's resolved config used by the tests: `test-key` is the api_key,
 /// `model` is a placeholder, and `minimax` is the protocol because every
 /// history/value assertion the tests make has Messages-wire semantics — the
