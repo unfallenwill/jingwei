@@ -318,16 +318,22 @@ disabled; enable it with /mcp enable <name>`.
 A command takes effect on the registry at once — the tool list changes at
 once, so the model stops seeing a disabled server's tools on the next turn
 — and on the server's connection at that server's next safe point. A call
-already running on that server is allowed to finish: the command neither
-cancels it nor waits for it. Calls to different servers overlap; calls to
-one server are one at a time, because one connection is a request/response
-protocol.
+already running on that server is allowed to finish: the command does not
+cancel it. Calls to different servers overlap; calls to one server are one
+at a time, because the hub serializes a server's calls on purpose, so one
+server's calls keep one order.
 
-Two commands on one server do not wait for each other, so they can land in
-either order. The later one is the one that stands — the registry's view
-is the later command's — and the earlier one is told it was superseded: a
-connection that comes up after the server was taken offline does not bring
-it back.
+`/mcp disable` and `/mcp disconnect` need no new connection, so they are
+answered at once — whatever that server is doing. `/mcp enable` and
+`/mcp reconnect` do need one, so they are answered when it is up, which is
+behind anything that server was already doing.
+
+Two commands on one server never wait on each other's effect on the
+registry — that happens as soon as the command is handled — so their
+connections can come up in either order. The later command is the one that
+stands — the registry's view is the later command's — and the earlier one
+is told it was superseded: a connection that comes up after the server was
+taken offline does not bring it back.
 
 1. POST `{base}/v1/messages` (minimax — base defaulting to
    `https://api.minimax.cn/anthropic`, model to `MiniMax-M3`) or

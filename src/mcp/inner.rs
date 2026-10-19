@@ -513,7 +513,9 @@ impl HubInner {
     /// and the tool list changes with it. The connection's half is handed to
     /// the server's task, which does it at the server's next safe point: a
     /// call already running on that server finishes, and the operation does
-    /// not cancel it and does not wait for it.
+    /// not cancel it. An operation that needs a *new* connection is answered
+    /// when that connection is up, and a server's queue is serial — so that
+    /// answer comes behind whatever the server was already doing.
     pub(super) fn server_op(
         &mut self,
         op: ServerOp,
@@ -851,8 +853,8 @@ fn spawn_server(
 /// The task that owns one server's connection.
 ///
 /// One message at a time, until `Stop`. A call is awaited where it is
-/// found, so the messages behind it wait: one connection is a
-/// request/response protocol and cannot be driven by two callers at once.
+/// found, so the messages behind it wait: the hub serializes a server's
+/// calls on purpose, so one server's calls keep one order.
 /// The server's next safe point — where a retire, a reconnect or a shutdown
 /// lands — is therefore wherever this loop is between two messages.
 async fn server_task(

@@ -11,8 +11,9 @@
 //! ## Why the futures are boxed
 //!
 //! The built-in tools are synchronous; the MCP path is asynchronous (the
-//! hub's actor task owns the connection and answers a call). A provider
-//! list is therefore heterogeneous — `Vec<Box<dyn ToolProvider>>` — and
+//! hub routes a call to the server's own task and answers it when that
+//! server does). A provider list is therefore heterogeneous —
+//! `Vec<Box<dyn ToolProvider>>` — and
 //! `async fn` in a trait is **not** dyn-compatible. The trait hands back a
 //! boxed future instead, which keeps the list heterogeneous without
 //! giving up the ability to await a call. A provider whose work is

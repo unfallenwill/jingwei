@@ -42,9 +42,9 @@
 //! The answer comes back later, on the caller's own channel.
 //!
 //! Each server's connection is owned by its own task, with its own queue.
-//! That task runs that server's calls one at a time — one connection is a
-//! request/response protocol and cannot be driven by two callers at once —
-//! while different servers run concurrently. So a slow server delays its own
+//! That task runs that server's calls one at a time — the hub serializes a
+//! server's calls on purpose, so one server's calls keep one order — while
+//! different servers run concurrently. So a slow server delays its own
 //! calls and nothing else: the tool list the agent asks for at the start of
 //! every turn, and every `/mcp` command, are answered while it is busy.
 //!
@@ -52,24 +52,35 @@
 //!
 //! A server op applies to the registry at once, and to the server's
 //! connection at its next safe point. A call already in flight on that
-//! server completes; the op does not cancel it and does not wait for it.
+//! server completes; the op does not cancel it.
 //!
 //! - `enable` / `disable`: the registry's view changes at once — so the tool
 //!   list changes at once, and the model stops seeing a disabled server's
 //!   tools on the next turn. A call already running on that server finishes.
 //! - `reconnect`: the old connection is retired at the next safe point and
-//!   the new one takes over. A call on the old connection finishes.
+//!   the new one takes over. A call on the old connection finishes. The
+//!   registry forgets the server's tools at once, so the model is never
+//!   offered a tool whose server is in the middle of a change.
 //! - `disconnect`: as `reconnect`, and the server's tools leave the offered
 //!   list at once.
 //!
-//! Two operations on one server do not wait for each other, so they can
-//! land in either order. The later one is the one that stands: the
-//! registry's view is the later operation's, and the earlier one is told
-//! it was superseded. A connection that comes up after the server was
-//! taken offline is not that server's any more, and does not bring it
-//! back.
+//! **When the command is answered** depends on what it needs. `disable` and
+//! `disconnect` need no connection — they only change the registry and ask
+//! for the connection to be closed later — so they are answered at once,
+//! whatever the server is doing. `enable` and `reconnect` need a *new*
+//! connection, so they are answered when that connection is up, and a
+//! server's queue is serial: that answer comes behind whatever the server
+//! was already doing, a call in flight included.
 //!
-//! The old behaviour — the op waited behind the in-flight call — was an
+//! Two operations on one server never wait on each other's *registry*
+//! half — that half happens as soon as the actor handles the command — so
+//! their connection halves can complete in either order. The later one is
+//! the one that stands: the registry's view is the later operation's, and
+//! the earlier one is told it was superseded. A connection that comes up
+//! after the server was taken offline is not that server's any more, and
+//! does not bring it back.
+//!
+//! The old behaviour — every op waiting behind the in-flight call — was an
 //! accident of the actor's loop, not a contract, and it is not described as
 //! one.
 
@@ -328,7 +339,7 @@ impl Hub {
 ///
 /// The hub owns every `mcp__` name — the prefix is what keeps the
 /// servers' tools apart from the built-ins — offers the schemas the
-/// connected servers report, and runs a call through the actor task.
+/// connected servers report, and routes a call to the server that owns it.
 /// The router asks it for both, and never learns what is behind them.
 impl ToolProvider for Hub {
     fn owns(&self, name: &str) -> bool {
@@ -350,8 +361,8 @@ impl ToolProvider for Hub {
         token: &'a CancelToken,
     ) -> BoxFuture<'a, String> {
         Box::pin(async move {
-            // An MCP call is not cancellable mid-flight: the actor task
-            // owns the connection, and the call's own timeout is what
+            // An MCP call is not cancellable mid-flight: the server's own
+            // task owns the connection, and the call's own timeout is what
             // bounds it. What a fired token cancels is the *wait* for
             // the reply — the turn is over and the answer is no longer
             // wanted.
@@ -915,8 +926,8 @@ mod tests {
         hub.shutdown().await;
     }
 
-    /// Two calls to one server do not overlap: one connection is a
-    /// request/response protocol, so the second waits its turn — and each
+    /// Two calls to one server do not overlap: the hub serializes a
+    /// server's calls on purpose, so the second waits its turn — and each
     /// answer comes back with its own arguments.
     #[tokio::test]
     async fn two_calls_to_one_server_do_not_overlap() {
