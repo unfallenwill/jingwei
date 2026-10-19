@@ -38,11 +38,6 @@
 //! | `noise` | a banner where a message belongs, then an answer |
 //! | `ping` | a request of its own to answer first, then the result |
 
-// The fixture is a public-API affordance for tests in the binary crate and
-// in this module's own unit tests; the production binary never constructs a
-// stub. `dead_code` allows silence for the parts production does not reach.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 

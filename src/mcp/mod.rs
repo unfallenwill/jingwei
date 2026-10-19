@@ -90,10 +90,10 @@ mod health;
 mod http;
 mod inner;
 mod stdio;
-/// Test fixture: a bash script that speaks the protocol. Always compiled
-/// (not gated behind `#[cfg(test)]`) so a binary test that constructs a stub
-/// can reach it through this module's public surface; the module is
-/// `#[doc(hidden)]` so it does not appear in the rendered docs.
+/// Test fixture: a bash script that speaks the protocol. Compiled only into
+/// the test build of the crate: the production build never constructs a
+/// stub, and never compiles the script.
+#[cfg(test)]
 #[doc(hidden)]
 pub mod stub;
 mod wire;
