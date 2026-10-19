@@ -733,6 +733,33 @@ mod tests {
     }
 
     #[test]
+    fn the_four_tools_drive_the_fleet() {
+        // The acceptance in one test: the main agent starts a worker,
+        // waits for it, reads its report, lists the workers and stops
+        // one — through the tools, the way the model reaches them.
+        let (port, _reqs) = mock_seq(vec![(200, ANSWER.into())]);
+        block_on(async {
+            let h = Harness::new(port, AgentCfg { max_agents: 4, wait_ms: 2_000 });
+            let tools = AgentTools::new(h.fleet.clone());
+            let token = CancelToken::new();
+            let started = tools
+                .call("spawn_agent", &json!({"task": "count the files"}), &token, AgentId::MAIN)
+                .await;
+            assert!(started.ends_with("started: count the files"), "got: {started}");
+            let id = AgentId::parse(started.split_whitespace().next().expect("an id"))
+                .expect("the id the tool handed back");
+            let waited = tools.call("wait_agents", &json!({}), &token, AgentId::MAIN).await;
+            assert!(waited.contains("the report"), "the report came back: {waited}");
+            let listed = tools.call("list_agents", &json!({}), &token, AgentId::MAIN).await;
+            assert!(listed.contains(&id.to_string()), "the worker is on the list: {listed}");
+            let stopped = tools
+                .call("stop_agent", &json!({"id": id.to_string()}), &token, AgentId::MAIN)
+                .await;
+            assert!(stopped.contains("is not running"), "it had already finished: {stopped}");
+        });
+    }
+
+    #[test]
     fn a_worker_may_not_spawn_a_worker() {
         let port = mock_late(LATE, ANSWER);
         block_on(async {

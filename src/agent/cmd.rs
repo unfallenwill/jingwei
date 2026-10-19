@@ -170,6 +170,23 @@ mod tests {
     }
 
     #[test]
+    fn the_stop_verb_stops_one_worker() {
+        let fleet = Fleet::new(crate::workflow::exec::AgentCfg::default());
+        // an id the fleet never handed out
+        let msgs = handle("stop a9", &fleet).expect("a command");
+        assert!(
+            matches!(&msgs[0], Msg::Banner(t) if t.contains("is not running")),
+            "got: {msgs:?}"
+        );
+        // and a verb the command does not have
+        let msgs = handle("spawn a worker", &fleet).expect("a command");
+        assert!(
+            matches!(&msgs[0], Msg::Banner(t) if t.contains("unknown /agents verb")),
+            "got: {msgs:?}"
+        );
+    }
+
+    #[test]
     fn the_table_comes_back_one_banner_per_line() {
         // A banner is a line: a row that wrapped into two is a row
         // nobody can read.
