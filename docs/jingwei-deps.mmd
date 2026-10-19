@@ -6,13 +6,16 @@
 %% Rule: dependencies point downward only. The ui port sits at the bottom
 %% (everything emits through it); its adapters sit at the top (nothing may
 %% depend on a frontend).
-%% The one upward edge in the picture is the carve-out: the `config` family
-%% (config, config::settings, config::login) may reach `api` (L4) for the
-%% vendor table and the policy enums. It is drawn dashed, and it is the
-%% only dashed edge here. A new L3 module that reaches for L4 is a
-%% violation, not a carve-out.
+%% The only upward edges in the picture are the carve-out: the `config`
+%% family (config, config::settings, config::login) may reach `api` (L4)
+%% for the vendor table and the policy enums. It is drawn dashed, on three
+%% arrows. A new L3 module that reaches for L4 is a violation, not a
+%% carve-out.
 %% `mcp::stub` and `test_util` are compiled only into the test build, so
 %% their edges are not production edges and are not drawn.
+%% One edge is drawn by hand rather than by the resolver: `main --> lib`.
+%% The resolver only sees `crate::` paths, and `src/main.rs` imports the
+%% library by its crate name.
 
 flowchart TD
     subgraph L5["L5 — composition and the frontends"]
