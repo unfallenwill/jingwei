@@ -16,7 +16,7 @@ endpoint too). Every other Messages- or Chat-Completions-compatible
 endpoint still works by pointing `--base-url` at it.
 
 Model/view/update TUI on ratatui + crossterm; agent core speaks the wire.
-Cross-platform (Linux / macOS / Windows). Release binary ~2 MB.
+Cross-platform (Linux / macOS / Windows). Release binary ~3 MB.
 
 ## Setup
 
@@ -44,6 +44,8 @@ Other knobs:
 --max-tokens 131072           # per-turn output cap
 --context-size 1000000        # trim history when the estimate exceeds this
 --max-turns 100               # stop the agent loop after N turns
+--max-agents 4                # how many background agents may run at once (0 disables spawning)
+--agent-wait-ms 120000        # how long wait_agents waits before it reports "still running"
 NO_COLOR=1                    # disable colors (both frontends honor the industry standard)
 ```
 
@@ -94,6 +96,13 @@ plain log (pipes, one-shots) has no editor, so it keeps
 your shell's own line editing and history instead. Each answer (including the
 final text turn of an agent run) stays in the conversation, so follow-ups keep
 context.
+
+`/agents` lists the session's background agents — one row each: id, label,
+state, elapsed, tools called, and the report of any agent that has
+finished and not been read yet. `/agents stop <id>` stops one. Both
+frontends share one implementation (`src/agent/cmd.rs`), the way `/mcp`
+does, so the human can see and stop a runaway worker without going
+through the model.
 
 The interactive UI is an inline TUI (crossterm, with ratatui only for the
 review overlay) that owns a small framed pane — separator rules above and
@@ -167,17 +176,21 @@ namespace (the old files stay where they were).
 
 ## Architecture
 
-The agent core never touches a terminal: it emits `Msg`s through a display
-port (`src/display.rs`), and a frontend interprets them —
+The crate is a library plus a thin binary: `src/lib.rs` composes, and
+`src/main.rs` is 37 lines — the tokio runtime, the exit codes, the error
+banner, nothing else.
 
-- **TUI** (`src/tui/`, on a terminal): an Elm-style single state tree.
+The agent core never touches a terminal: it emits `Msg`s through a display
+port (`src/ui/mod.rs`), and a frontend interprets them —
+
+- **TUI** (`src/ui/tui/`, on a terminal): an Elm-style single state tree.
   `model.rs` is plain data (no clocks, no I/O), `update.rs` is a pure
   event→state function, `view.rs` is a pure state→screen function, and
   `mod.rs` is the only impure shell — raw mode, the event loop, the blit.
   Every UI rule (grapheme-safe editing, history recall, scroll clamping,
   follow-the-tail, the fold ratchet) is a unit-tested fact about pure
   functions; no terminal needed to test the UI.
-- **plain** (`src/plain.rs`; pipes, one-shot runs):
+- **plain** (`src/ui/plain.rs`; pipes, one-shot runs):
   a pure fold over the same messages into a line-oriented log, plus the
   dumb line reader that drives it.
 
@@ -191,6 +204,39 @@ process-global sink, so a run's frontend is a detail the composition root
 plugs in: the terminal TUI, the plain log, or (one day) a web socket that
 ships the same `Msg`s as JSON. The port imports no frontend; the frontends
 import the port.
+
+Under the port the agent became a value, and the run became a function. An
+**agent** (`src/agent/`) is a plain value — id, name, role, task,
+lifecycle, report, the tools it called, what it spent — with no I/O and
+no handles, so the frontends can clone and render it, the file ledger and
+the cancel scope can key on it, and two callers can finally be told apart.
+Its **role** is `Main` (the conversation the human is talking to) or
+`Worker` (one the fleet spawned). A **context**
+(`src/core/context.rs`) is one agent's model-visible state: the system
+text, the in-band reminders, the tool surface, the transcript it owns,
+and the trim budget that trims it — so two agents can never trim each
+other's messages. A **run** is one function, `workflow::run_task`
+(`src/workflow/mod.rs`): the task goes on disk before the first model
+call, the run is bracketed by exactly one begin and one end, and the
+fleet is opened and closed with the run. The one-shot, the plain REPL and
+the TUI no longer each spell that sequence out.
+
+The **fleet** (`src/workflow/exec.rs`) is the one runtime capability the
+round added: the main agent can start background agents that work in
+parallel, each with its own transcript, its own context budget, its own
+cancel token and its own sink. They run the *same* turn code with the
+*same* tools; what makes them safe is not a smaller toolbox but the
+ledger (each agent keeps its own view of the files it has seen) and the
+bounds the fleet puts on the fan-out. The main agent collects the
+reports itself, with `wait_agents` — nothing is slipped into its
+transcript behind its back — and a run that ends with workers still live
+stops them and lets them go.
+
+The port grew exactly one variant for this: `Msg::FromAgent { id, event }`
+carries a background agent's events **wrapped**. The wrapper is the
+attribution — the inner usage and the inner end-of-turn belong to that
+agent and never to the session's totals, so a worker's spending cannot
+inflate the bar, and a worker can never end the human's turn.
 
 Providers sit behind a port of their own. The core speaks one internal
 history and asks the composition root which wire to hand it to; each wire
@@ -232,6 +278,17 @@ caching decides how the server bills and accelerates that context.
 | `read_file`  | Reads a file.                                            |
 | `write_file` | Writes a file, creating parent dirs.                     |
 | `edit_file`  | Replaces `old` with `new` — exactly, then line by line ignoring indentation. Names the line numbers when `old` is ambiguous; `replace_all` replaces every occurrence; `edits` applies several pairs in one all-or-nothing call. |
+
+Those four are the whole built-in registry, and it stays four. The fleet
+adds four more, in their own table, and they are a *separate provider*:
+only the main agent sees them, and a worker never does.
+
+| Tool          | What it does                                             |
+| ------------- | -------------------------------------------------------- |
+| `spawn_agent` | Starts a background agent on one self-contained task and returns its id. The agent has its own conversation, its own context window and its own cancel token, and shares this session's workspace, shell and file ledger. |
+| `wait_agents` | Waits for background agents to finish and takes their reports. A report is delivered once; an agent that is still running comes back as still running. |
+| `stop_agent`  | Stops one background agent. Whatever it already produced is kept and reported back. |
+| `list_agents` | Lists this session's background agents: id, label, state, elapsed, tools called — and a finished agent's report, if it has not been taken yet. |
 
 jingwei also speaks the **Model Context Protocol** — external servers can
 expose their own tools, and jingwei offers them to the model with the same
@@ -355,9 +412,16 @@ taken offline does not bring it back.
 ## Tests
 
 ```sh
-cargo test            # 433 unit tests + 8 integration tests
-cargo clippy --all-targets
+cargo check --tests    # the gate: cheap, catches signature drift
+cargo test             # 638 unit tests + 22 integration tests
+cargo build            # the production binary — the gates do not build it
 ```
+
+`cargo build` earns its line because a production import of the test-only
+helper is invisible to the other two gates: `test_util` lives behind
+`#[cfg(test)]`, so such an import compiles under `cargo check --tests`
+and `cargo test` and breaks only `cargo build`. The architecture test
+forbids it.
 
 ## License
 

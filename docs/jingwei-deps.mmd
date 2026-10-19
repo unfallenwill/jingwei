@@ -1,81 +1,286 @@
-%% jingwei's module dependency graph, after the cluster regrouping.
+%% jingwei's module dependency graph, after the round that made the
+%% agent, the context and the run first-class.
 %% Render me: paste into https://mermaid.live (or `mmdc -i jingwei-deps.mmd`).
 %% The enforced contract is tests/architecture.rs; this picture is the tour.
+%% One node per row of that test's LAYERS table, in the same seven groups.
 %% Rule: dependencies point downward only. The ui port sits at the bottom
 %% (everything emits through it); its adapters sit at the top (nothing may
 %% depend on a frontend).
+%% The one upward edge in the picture is the carve-out: the `config` family
+%% (config, config::settings, config::login) may reach `api` (L4) for the
+%% vendor table and the policy enums. It is drawn dashed, and it is the
+%% only dashed edge here. A new L3 module that reaches for L4 is a
+%% violation, not a carve-out.
+%% `mcp::stub` and `test_util` are compiled only into the test build, so
+%% their edges are not production edges and are not drawn.
 
 flowchart TD
-    subgraph L5["L5 — composition"]
-        bin["main.rs — the thin binary"]
-        lib["lib.rs — run, Error, the composition root"]
+    subgraph L5["L5 — composition and the frontends"]
+        agent["agent — the agent as a value"]
+        lib["lib — the composition root"]
+        main["main — the thin binary"]
         workflow["workflow — the run boundary"]
-        loop_["agent::runner — the turn loop"]
-        plain["ui::plain — the log adapter"]
-        tui["ui::tui — the terminal adapter"]
+        agent_cmd["agent::cmd — the /agents verb"]
+        agent_roster["agent::roster — the live agents"]
+        agent_runner["agent::runner — the turn loop"]
+        agent_tools["agent::tools — the fleet's four tools"]
+        agent_worker["agent::worker — a background agent"]
+        ui_plain["ui::plain — the log adapter"]
+        ui_tui["ui::tui — the terminal adapter"]
+        workflow_exec["workflow::exec — the fleet"]
+        ui_tui_model["ui::tui::model — plain data"]
+        ui_tui_update["ui::tui::update — pure event→state"]
+        ui_tui_view["ui::tui::view — pure state→screen"]
     end
-
-    subgraph L4["L4 — the model port"]
+    subgraph L4["L4 — the model boundary"]
         api["api — transport, retry, policy<br/>(minimax · zai · deepseek)"]
+        api_deepseek["api::deepseek — Chat Completions, thinking toggle"]
+        api_minimax["api::minimax — the Messages wire"]
+        api_zai["api::zai — Chat Completions, preserved thinking"]
     end
-
-    subgraph L3["L3 — wishes & effects"]
-        config["config — argv grammar, resolver<br/>(settings · login)"]
-        context["core::context — system text,<br/>reminders, tool list, trim"]
-        tools["tools — the registry<br/>(edit · ledger · runtime)"]
-        mcp["mcp — external servers' tools<br/>(client · http · stdio · wire · config · health)"]
+    subgraph L3["L3 — the tool/config tier"]
+        config["config — argv grammar, resolver"]
+        mcp["mcp — external servers' tools"]
+        tools["tools — the registry"]
+        config_login["config::login — the setup wizard"]
+        config_settings["config::settings — persisted preferences"]
+        mcp_client["mcp::client — one connection"]
+        mcp_config["mcp::config — the server list"]
+        mcp_health["mcp::health — is it up?"]
+        mcp_http["mcp::http — the HTTP transport"]
+        mcp_inner["mcp::inner — the hub's actor"]
+        mcp_stdio["mcp::stdio — the stdio transport"]
+        mcp_stub["mcp::stub — the test fixture<br/>(test build only)"]
+        mcp_wire["mcp::wire — the JSON-RPC vocabulary"]
+        tools_edit["tools::edit — the exact-then-line edit"]
+        tools_ledger["tools::ledger — the per-agent file ledger"]
+        tools_runtime["tools::runtime — the tool runtime"]
     end
-
+    subgraph L2["L2 — per-agent state and the ports"]
+        core_context["core::context — the per-agent model state"]
+        core_ports["core::ports — the tool boundary"]
+        core_prompt["core::prompt — the prompt's own module"]
+    end
     subgraph L1["L1 — infra primitives"]
-        cancel["cancel — the Ctrl-C token"]
-        fileio["file_io — atomic writes"]
-        agentsmd["core::agents_md —<br/>convention discovery"]
-        reminder["core::reminder —<br/>in-band system reminders"]
+        cancel["cancel — the cancel tree"]
+        file_io["file_io — atomic writes"]
+        core_agents_md["core::agents_md —<br/>convention discovery"]
+        core_reminder["core::reminder —<br/>in-band system reminders"]
     end
-
-    subgraph L0["L0 — data & ports"]
-        ir["core::ir — the conversation<br/>language + user_message"]
-        session["core::session — persistence"]
-        turn["core::turn — run state machine"]
-        uip["ui — the output port<br/>(Msg · Sev · Show · paint)"]
+    subgraph L0["L0 — pure data, state machines, and the display port"]
+        core["core — the cluster's root"]
         format["format — bytes & width"]
+        ui["ui — the output port<br/>(Msg · Sev · Show · paint)"]
+        core_error["core::error — Error and Result"]
+        core_ids["core::ids — the agent identity"]
+        core_ir["core::ir — the conversation<br/>language + user_message"]
+        core_session["core::session — persistence"]
+        core_turn["core::turn — run state machine"]
+    end
+    subgraph T["T — test-only"]
+        test_util["test_util — test-only helpers"]
     end
 
-    bin --> lib
-    lib --> workflow
-    lib --> plain
-    lib --> tui
-    lib --> config
-    lib --> mcp
-    plain --> workflow
-    tui --> workflow
-
-    workflow --> loop_
-    workflow --> session
-
-    loop_ --> api
-    loop_ --> tools
-    loop_ --> context
-    loop_ --> uip
-    tui --> api
-    tui --> config
-
-    api --> context
+    agent --> core_ids
+    agent --> core_turn
+    agent --> ui
+    agent_cmd --> core_ids
+    agent_cmd --> ui
+    agent_cmd --> workflow_exec
+    agent_roster --> cancel
+    agent_roster --> core_ids
+    agent_runner --> agent
+    agent_runner --> agent_roster
+    agent_runner --> api
+    agent_runner --> cancel
+    agent_runner --> config
+    agent_runner --> core_context
+    agent_runner --> core_error
+    agent_runner --> core_ir
+    agent_runner --> core_ports
+    agent_runner --> core_turn
+    agent_runner --> tools
+    agent_runner --> ui
+    agent_tools --> cancel
+    agent_tools --> core_ids
+    agent_tools --> core_ports
+    agent_tools --> core_reminder
+    agent_tools --> workflow_exec
+    agent_worker --> agent
+    agent_worker --> agent_roster
+    agent_worker --> agent_runner
+    agent_worker --> agent_tools
+    agent_worker --> cancel
+    agent_worker --> config
+    agent_worker --> core_context
+    agent_worker --> core_ids
+    agent_worker --> core_ir
+    agent_worker --> core_ports
+    agent_worker --> core_turn
+    agent_worker --> ui
+    agent_worker --> workflow_exec
+    api --> cancel
     api --> config
-    api --> uip
-    api --> ir
-
-    context --> ir
-    context --> tools
-    context --> mcp
-    context --> reminder
-    context --> agentsmd
-
-    tools --> uip
-    tools --> fileio
+    api --> core_context
+    api --> core_error
+    api --> core_ir
+    api --> ui
+    api_deepseek --> api
+    api_deepseek --> cancel
+    api_deepseek --> config
+    api_deepseek --> core_context
+    api_deepseek --> core_error
+    api_deepseek --> core_ir
+    api_deepseek --> ui
+    api_minimax --> api
+    api_minimax --> cancel
+    api_minimax --> config
+    api_minimax --> core_context
+    api_minimax --> core_error
+    api_minimax --> core_ir
+    api_minimax --> ui
+    api_zai --> api
+    api_zai --> cancel
+    api_zai --> config
+    api_zai --> core_context
+    api_zai --> core_error
+    api_zai --> core_ir
+    api_zai --> ui
+    cancel --> core_error
+    config --> config_login
+    config --> core_error
+    config_login --> config_settings
+    config_login --> core_error
+    config_settings --> core_error
+    config_settings --> file_io
+    core_context --> core_agents_md
+    core_context --> core_ir
+    core_context --> core_prompt
+    core_context --> core_reminder
+    core_ports --> cancel
+    core_ports --> core_ids
+    core_session --> core_error
+    core_session --> core_ir
+    core_session --> format
+    lib --> agent_tools
+    lib --> cancel
+    lib --> config
+    lib --> config_settings
+    lib --> core_agents_md
+    lib --> core_context
+    lib --> core_error
+    lib --> core_ir
+    lib --> core_ports
+    lib --> core_session
+    lib --> mcp
+    lib --> tools
+    lib --> ui
+    lib --> workflow
+    lib --> workflow_exec
+    main --> lib
     mcp --> cancel
+    mcp --> core_ids
+    mcp --> core_ports
+    mcp --> mcp_config
+    mcp --> mcp_inner
+    mcp_client --> mcp_config
+    mcp_client --> mcp_http
+    mcp_client --> mcp_stdio
+    mcp_client --> mcp_wire
+    mcp_http --> mcp_config
+    mcp_http --> mcp_health
+    mcp_http --> mcp_wire
+    mcp_inner --> mcp
+    mcp_inner --> mcp_client
+    mcp_inner --> mcp_config
+    mcp_stdio --> mcp_config
+    mcp_stdio --> mcp_health
+    mcp_stdio --> mcp_wire
+    tools --> cancel
+    tools --> core_ids
+    tools --> core_ports
+    tools --> file_io
+    tools --> tools_edit
+    tools --> tools_ledger
+    tools --> tools_runtime
+    tools --> ui
+    tools_edit --> core_ids
+    tools_edit --> file_io
+    tools_edit --> tools_ledger
+    tools_ledger --> core_ids
+    tools_runtime --> cancel
+    tools_runtime --> tools
+    ui --> core_error
+    ui --> core_ids
+    ui --> core_turn
+    ui --> format
+    ui_plain --> agent_cmd
+    ui_plain --> cancel
+    ui_plain --> config
+    ui_plain --> core_context
+    ui_plain --> core_error
+    ui_plain --> core_ids
+    ui_plain --> core_ports
+    ui_plain --> core_session
+    ui_plain --> core_turn
+    ui_plain --> mcp
+    ui_plain --> mcp_inner
+    ui_plain --> ui
+    ui_plain --> workflow
+    ui_plain --> workflow_exec
+    ui_tui --> agent_cmd
+    ui_tui --> api
+    ui_tui --> cancel
+    ui_tui --> config
+    ui_tui --> config_settings
+    ui_tui --> core_context
+    ui_tui --> core_error
+    ui_tui --> core_ports
+    ui_tui --> core_session
+    ui_tui --> mcp
+    ui_tui --> ui
+    ui_tui --> ui_plain
+    ui_tui --> ui_tui_model
+    ui_tui --> ui_tui_update
+    ui_tui --> workflow
+    ui_tui --> workflow_exec
+    ui_tui_model --> core_ids
+    ui_tui_model --> core_turn
+    ui_tui_model --> ui
+    ui_tui_model --> workflow_exec
+    ui_tui_update --> core_ids
+    ui_tui_update --> core_turn
+    ui_tui_update --> ui
+    ui_tui_update --> ui_tui_model
+    ui_tui_view --> format
+    ui_tui_view --> ui
+    ui_tui_view --> ui_tui_model
+    workflow --> agent
+    workflow --> agent_runner
+    workflow --> cancel
+    workflow --> config
+    workflow --> core_context
+    workflow --> core_error
+    workflow --> core_ir
+    workflow --> core_ports
+    workflow --> core_session
+    workflow --> ui
+    workflow --> workflow_exec
+    workflow_exec --> agent
+    workflow_exec --> agent_cmd
+    workflow_exec --> agent_roster
+    workflow_exec --> agent_worker
+    workflow_exec --> cancel
+    workflow_exec --> config
+    workflow_exec --> core_context
+    workflow_exec --> core_ids
+    workflow_exec --> core_ports
+    workflow_exec --> core_turn
+    workflow_exec --> ui
+    config -.-> api
+    config_login -.-> api
+    config_settings -.-> api
 
-    session --> ir
-    session --> format
-    turn --> session
-    agentsmd --> ir
+    %% The three dashed arrows are the carve-out: L3 -> L4 for the
+    %% `config` family alone, named module by module so that a new L3
+    %% module reaching for L4 is a violation rather than a silent pass.
