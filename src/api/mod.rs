@@ -14,7 +14,7 @@
 // and the messages the model sees cannot drift apart.
 
 use crate::config::Config;
-use crate::cancel::CancelToken;
+use crate::cancel::{blocking, CancelToken};
 use crate::core::context::Context;
 use crate::ui::{Msg, Show};
 use crate::core::ir::{Block, Message, Response};
@@ -262,21 +262,6 @@ pub(crate) fn sse_channel(resp: ureq::Response) -> mpsc::Receiver<String> {
         }
     });
     rx
-}
-
-/// Run a synchronous closure on the blocking pool with the same
-/// cancellation shape the streaming callers already use: the work
-/// runs on a worker thread, the await is a real suspension point, and
-/// the token races it so a Ctrl-C mid-reap returns `Interrupted`.
-/// Shared between the api transport (every HTTP body) and the bash tool
-/// (reaping the killed child).
-pub(crate) async fn blocking<T, F>(token: &CancelToken, f: F) -> Result<T>
-where F: FnOnce() -> Result<T> + Send + 'static, T: Send + 'static,
-{
-    tokio::select! {
-        res = tokio::task::spawn_blocking(f) => res.unwrap_or_else(|e| Err(Error::Msg(format!("worker: {e}")))),
-        _ = token.cancelled() => Err(Error::Interrupted),
-    }
 }
 
 pub(crate) fn empty_usage() -> Value {

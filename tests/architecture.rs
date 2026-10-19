@@ -745,12 +745,14 @@ fn upward_edges(edges: &HashMap<String, Vec<String>>) -> Vec<(String, String, La
             // module, since the symbols it references are stripped from
             // release binaries. The interesting check is upward between
             // production layers, with one carve-out: L3 may reach L4, and
-            // only for two reasons — the vendor table and the policy enums.
-            // `config`, `config::settings` and `config::login` need
-            // `api::Protocol`, `api::VENDORS`, `api::CacheMode`,
-            // `api::Thinking` and `api::Effort`; `tools::runtime` needs
-            // `api::blocking`, which is a *function*, not a type. Nothing
-            // else in L3 may name anything in L4.
+            // only for one reason — the `config` family (`config`,
+            // `config::settings`, `config::login`) needs the vendor table
+            // (`api::Protocol`, `api::VENDORS`) and the policy enums
+            // (`api::CacheMode`, `api::Thinking`, `api::Effort`).
+            // `tools::runtime` no longer reaches `api` at all:
+            // `api::blocking` moved down into `cancel` (L1), where the
+            // cancellation helpers live. Nothing else in L3 may name
+            // anything in L4.
             let lf_n = lf.rank();
             let lt_n = lt.rank();
             let upward = lt_n > lf_n

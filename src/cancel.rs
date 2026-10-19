@@ -17,10 +17,17 @@
 // under it; cancelling a leaf leaves its siblings alone. A leaf minted
 // under an already-cancelled scope is born cancelled — the race a bare
 // token cannot cover.
+//
+// The cancellable call onto the blocking pool lives here too: it is a
+// cancellation helper, not a transport concern, and it is shared by the
+// api transport (every HTTP body) and the bash tool (reaping the killed
+// child).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
+
+use crate::{Error, Result};
 
 #[derive(Debug, Clone)]
 pub(crate) struct CancelToken {
@@ -145,6 +152,21 @@ impl CancelScope {
     #[allow(dead_code)] // the fleet slice reads the scope's own bit
     pub(crate) fn is_cancelled(&self) -> bool {
         self.inner.flag.load(Ordering::Acquire)
+    }
+}
+
+/// Run a synchronous closure on the blocking pool with the same
+/// cancellation shape the streaming callers already use: the work
+/// runs on a worker thread, the await is a real suspension point, and
+/// the token races it so a Ctrl-C mid-reap returns `Interrupted`.
+/// Shared between the api transport (every HTTP body) and the bash tool
+/// (reaping the killed child).
+pub(crate) async fn blocking<T, F>(token: &CancelToken, f: F) -> Result<T>
+where F: FnOnce() -> Result<T> + Send + 'static, T: Send + 'static,
+{
+    tokio::select! {
+        res = tokio::task::spawn_blocking(f) => res.unwrap_or_else(|e| Err(Error::Msg(format!("worker: {e}")))),
+        _ = token.cancelled() => Err(Error::Interrupted),
     }
 }
 

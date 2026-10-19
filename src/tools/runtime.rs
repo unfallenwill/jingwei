@@ -14,8 +14,7 @@
 // (`core::ports`) owns that, and the providers ask it. What is here is the
 // one thing a provider cannot do for itself — bash's own child process.
 
-use crate::api::blocking;
-use crate::cancel::CancelToken;
+use crate::cancel::{blocking, CancelToken};
 use crate::tools::bash_output;
 use std::io::Read;
 use std::process::{Command, Stdio};
