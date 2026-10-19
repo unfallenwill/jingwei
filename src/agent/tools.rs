@@ -122,10 +122,9 @@ impl AgentTools {
         let label = input.get("label").and_then(|v| v.as_str());
         match self.fleet.spawn(task, label) {
             Ok(id) => {
-                let shown = match label {
-                    Some(l) if !l.trim().is_empty() => l.trim().to_string(),
-                    _ => crate::workflow::exec::default_label(task),
-                };
+                // the same rule the fleet named the worker with: the
+                // model hears the name the human will read
+                let shown = crate::workflow::exec::label_for(task, label);
                 format!("{id} started: {shown}")
             }
             Err(e) => format!("error: {e}"),

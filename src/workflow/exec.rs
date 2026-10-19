@@ -225,10 +225,7 @@ impl Fleet {
             ));
         }
         let id = AgentId::next();
-        let label = match label {
-            Some(l) if !l.trim().is_empty() => l.trim().to_string(),
-            _ => default_label(task),
-        };
+        let label = label_for(task, label);
         // The run's bits and the run's scope: without a run there is
         // nothing for a worker to be a child of.
         let (scope, run) = {
@@ -560,6 +557,20 @@ pub(crate) fn default_label(task: &str) -> String {
         "agent".into()
     } else {
         label
+    }
+}
+
+/// The name a worker goes by: the one it was given, or the first words
+/// of its task.
+///
+/// One rule, one place. The fleet names the worker and the tool tells
+/// the model the name the fleet chose; two copies of this rule would be
+/// two answers to "what is it called", and the model would hear one of
+/// them while the human reads the other.
+pub(crate) fn label_for(task: &str, label: Option<&str>) -> String {
+    match label {
+        Some(l) if !l.trim().is_empty() => l.trim().to_string(),
+        _ => default_label(task),
     }
 }
 
@@ -1045,5 +1056,38 @@ mod tests {
         assert_eq!(default_label("  "), "agent");
         let long = "a very long task description that goes on and on and on";
         assert!(default_label(long).chars().count() <= 25, "the label is short: {}", default_label(long));
+    }
+
+    #[test]
+    fn the_tool_and_the_fleet_name_a_worker_the_same() {
+        // The model hears the name the fleet chose. Two copies of the
+        // naming rule would be two names: one the model repeats, one the
+        // human reads in `/agents`.
+        let (port, _reqs) = mock_seq(vec![(200, ANSWER.into()), (200, ANSWER.into())]);
+        let h = block_on(async {
+            let h = Harness::new(port, AgentCfg { max_agents: 4, wait_ms: 2_000 });
+            let tools = AgentTools::new(h.fleet.clone());
+            let token = CancelToken::new();
+            // a name the caller gave
+            let said = tools
+                .call(
+                    "spawn_agent",
+                    &json!({"task": "count the files", "label": "count"}),
+                    &token,
+                    AgentId::MAIN,
+                )
+                .await;
+            assert!(said.ends_with("started: count"), "got: {said}");
+            // and no name: the first words of the task
+            let said = tools
+                .call("spawn_agent", &json!({"task": "count the files"}), &token, AgentId::MAIN)
+                .await;
+            assert!(said.ends_with("started: count the files"), "got: {said}");
+            h.fleet.wait(&[], &CancelToken::new()).await;
+            h
+        });
+        let rows = h.fleet.rows();
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, vec!["count", "count the files"], "the fleet named them the same: {rows:?}");
     }
 }
