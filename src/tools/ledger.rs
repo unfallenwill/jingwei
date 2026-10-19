@@ -6,6 +6,14 @@
 // allowed to write over content they have never seen, because that is how
 // someone's uncommitted work disappears.
 //
+// The ledger keeps **two views** of every file: what *this agent* has seen,
+// and what *this process* has seen. A write is checked against the writing
+// agent's own view — the bytes on disk must still be the bytes that agent
+// last saw or wrote — and falls back to the process's view only for an
+// agent that has never touched the file. With one agent the two views hold
+// the same value, so the fallback never fires and the ledger behaves
+// exactly as it always has.
+//
 // It is deliberately *not* a read-before-edit gate. opencode removed theirs,
 // and the reasons hold here too: the gate burned a turn on every workflow
 // that read a file through bash, and it protected nothing — the edit still
@@ -14,17 +22,81 @@
 // read it, go ahead). The honest limit: a file jingwei has never seen has
 // nothing to compare against, and is written as before.
 
+use crate::core::ids::AgentId;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-/// The ledger: path → fingerprint of the content last seen there by this
-/// process. A session is long-lived and one file is re-read rarely, so this
-/// stays small; it never leaves the process.
-pub(crate) fn ledger() -> MutexGuard<'static, HashMap<PathBuf, u64>> {
-    static LEDGER: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
-    LEDGER.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner())
+/// What the ledger knows. Two views of every file: what this process has
+/// seen, and what each agent has seen.
+pub(crate) struct Ledger {
+    /// (agent, path) → the fingerprint of the bytes that agent last saw or
+    /// wrote. This is the view a write is checked against.
+    seen: HashMap<(AgentId, PathBuf), u64>,
+    /// path → the fingerprint of the bytes this process last saw or wrote.
+    /// The fallback for a writer that has never touched the file.
+    any: HashMap<PathBuf, u64>,
+}
+
+impl Ledger {
+    /// Record the bytes an agent has just seen or written.
+    ///
+    /// Both views move: the agent's own, and the process's. The process's
+    /// view is the fallback for a writer that has never touched the file,
+    /// so it has to track whatever any agent last saw.
+    pub(crate) fn note(&mut self, agent: AgentId, p: &str, bytes: &[u8]) {
+        let key = ledger_key(p);
+        let fp = fingerprint(bytes);
+        self.seen.insert((agent, key.clone()), fp);
+        self.any.insert(key, fp);
+    }
+
+    /// Has the file moved since *this agent* last saw it? `None` — never
+    /// seen, or not readable, so not ours to judge; `Some(error)` — the
+    /// bytes are not the bytes we read, and the message says what to do
+    /// about it.
+    ///
+    /// The agent's own view wins. The process's view is the fallback, for
+    /// the writer that has never touched the file at all.
+    pub(crate) fn stale(&self, agent: AgentId, p: &str) -> Option<String> {
+        let key = ledger_key(p);
+        let seen = self
+            .seen
+            .get(&(agent, key.clone()))
+            .or_else(|| self.any.get(&key))
+            .copied()?;
+        let now = fs::read(p).ok()?;
+        (fingerprint(&now) != seen).then(|| format!(
+            "error: {p} changed on disk since jingwei last read or wrote it — re-read it, then make \
+             the change again against what it actually says (writing over content you have not seen \
+             is how someone's uncommitted work disappears)"))
+    }
+}
+
+/// The ledger, locked.
+///
+/// The lock is the ledger's whole discipline: a check that compares the disk
+/// against a view has to read the disk at a moment when nobody else can be
+/// writing, so the check and the write that follows it belong in **one**
+/// critical section.
+fn ledger() -> MutexGuard<'static, Ledger> {
+    static LEDGER: OnceLock<Mutex<Ledger>> = OnceLock::new();
+    LEDGER
+        .get_or_init(|| Mutex::new(Ledger { seen: HashMap::new(), any: HashMap::new() }))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Run `f` with the ledger locked.
+///
+/// The lock is the ledger's whole discipline: a check that compares the
+/// disk against a view has to read the disk at a moment when nobody else
+/// can be writing, so the check and the write that follows it belong under
+/// this one lock.
+pub(crate) fn with_ledger<R>(f: impl FnOnce(&mut Ledger) -> R) -> R {
+    let mut led = ledger();
+    f(&mut led)
 }
 
 /// FNV-1a over the bytes: not a security hash, a change detector — cheap, no
@@ -48,25 +120,10 @@ pub(crate) fn ledger_key(p: &str) -> PathBuf {
     }
 }
 
-pub(crate) fn ledger_note(p: &str, bytes: &[u8]) {
-    ledger().insert(ledger_key(p), fingerprint(bytes));
-}
-
-/// Has this file moved since we last saw it? `None` — never seen, or not
-/// readable, so not ours to judge; `Some(error)` — the bytes are not the bytes
-/// we read, and the message says what to do about it.
-pub(crate) fn stale(p: &str) -> Option<String> {
-    let seen = *ledger().get(&ledger_key(p))?;
-    let now = fs::read(p).ok()?;
-    (fingerprint(&now) != seen).then(|| format!(
-        "error: {p} changed on disk since jingwei last read or wrote it — re-read it, then make \
-         the change again against what it actually says (writing over content you have not seen \
-         is how someone's uncommitted work disappears)"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ids::AgentId;
     use crate::test_util::temp_dir;
 
     /// The ledger is process-global; tests that touch it must serialize
@@ -81,17 +138,27 @@ mod tests {
         let _g = ledger_lock();
         // a path we know nothing about: the ledger has never seen it
         let path = temp_dir("fresh").join("never_seen.txt");
-        assert!(ledger().get(&path).is_none());
+        let key = ledger_key(path.to_str().unwrap());
+        with_ledger(|led| {
+            assert!(led.any.get(&key).is_none(), "the process has no view of it");
+            assert!(led.seen.get(&(AgentId::MAIN, key)).is_none(),
+                "and the main agent has no view of it either");
+        });
     }
 
     #[test]
     fn ledger_note_stores_and_recalls_fingerprints() {
         let _g = ledger_lock();
         let path = temp_dir("note").join("f.txt");
-        ledger_note(path.to_str().unwrap(), b"hello world");
-        let got = ledger().get(&ledger_key(path.to_str().unwrap())).copied();
-        assert!(got.is_some(), "the path now maps to a fingerprint");
-        assert_eq!(got.unwrap(), fingerprint(b"hello world"));
+        let p = path.to_str().unwrap();
+        with_ledger(|led| led.note(AgentId::MAIN, p, b"hello world"));
+        with_ledger(|led| {
+            let key = ledger_key(p);
+            assert_eq!(led.any.get(&key).copied(), Some(fingerprint(b"hello world")),
+                "the process remembers the bytes it saw");
+            assert_eq!(led.seen.get(&(AgentId::MAIN, key)).copied(), Some(fingerprint(b"hello world")),
+                "and so does the agent that saw them");
+        });
     }
 
     #[test]
@@ -134,7 +201,7 @@ mod tests {
         let p = dir.join("fresh.txt");
         std::fs::write(&p, "v").unwrap();
         // the ledger has no entry for this path
-        assert!(stale(p.to_str().unwrap()).is_none());
+        assert!(with_ledger(|led| led.stale(AgentId::MAIN, p.to_str().unwrap())).is_none());
     }
 
     #[test]
@@ -145,10 +212,10 @@ mod tests {
         let dir = temp_dir("stale_missing");
         let p = dir.join("never_existed.txt");
         // the read call here is the one the agent makes
-        assert!(crate::tools::dispatch("read_file", &serde_json::json!({"path": p.to_str().unwrap()})).starts_with("error:"));
-        assert!(stale(p.to_str().unwrap()).is_none(),
+        assert!(crate::tools::dispatch("read_file", &serde_json::json!({"path": p.to_str().unwrap()}), AgentId::MAIN).starts_with("error:"));
+        assert!(with_ledger(|led| led.stale(AgentId::MAIN, p.to_str().unwrap())).is_none(),
             "a file we never saw has nothing to check: {:?}",
-            stale(p.to_str().unwrap()));
+            with_ledger(|led| led.stale(AgentId::MAIN, p.to_str().unwrap())));
     }
 
     #[test]
@@ -158,10 +225,10 @@ mod tests {
         let p = dir.join("f.txt");
         std::fs::write(&p, "first version").unwrap();
         // the ledger now remembers the bytes
-        ledger_note(p.to_str().unwrap(), b"first version");
+        with_ledger(|led| led.note(AgentId::MAIN, p.to_str().unwrap(), b"first version"));
         // the file moves under us
         std::fs::write(&p, "second version").unwrap();
-        let msg = stale(p.to_str().unwrap());
+        let msg = with_ledger(|led| led.stale(AgentId::MAIN, p.to_str().unwrap()));
         assert!(msg.is_some(), "the file changed: {msg:?}");
         let s = msg.unwrap();
         assert!(s.starts_with("error:"));
@@ -174,8 +241,8 @@ mod tests {
         let dir = temp_dir("stale_same");
         let p = dir.join("f.txt");
         std::fs::write(&p, "stable").unwrap();
-        ledger_note(p.to_str().unwrap(), b"stable");
-        assert!(stale(p.to_str().unwrap()).is_none(),
+        with_ledger(|led| led.note(AgentId::MAIN, p.to_str().unwrap(), b"stable"));
+        assert!(with_ledger(|led| led.stale(AgentId::MAIN, p.to_str().unwrap())).is_none(),
             "the bytes match what we read: stable has not moved");
     }
 
@@ -187,9 +254,92 @@ mod tests {
         let b = dir.join("b.txt");
         std::fs::write(&a, "alpha").unwrap();
         std::fs::write(&b, "beta").unwrap();
-        ledger_note(a.to_str().unwrap(), b"alpha");
-        ledger_note(b.to_str().unwrap(), b"beta");
-        assert_eq!(ledger().get(&ledger_key(a.to_str().unwrap())).copied(), Some(fingerprint(b"alpha")));
-        assert_eq!(ledger().get(&ledger_key(b.to_str().unwrap())).copied(), Some(fingerprint(b"beta")));
+        with_ledger(|led| led.note(AgentId::MAIN, a.to_str().unwrap(), b"alpha"));
+        with_ledger(|led| led.note(AgentId::MAIN, b.to_str().unwrap(), b"beta"));
+        with_ledger(|led| {
+            assert_eq!(led.any.get(&ledger_key(a.to_str().unwrap())).copied(), Some(fingerprint(b"alpha")));
+            assert_eq!(led.any.get(&ledger_key(b.to_str().unwrap())).copied(), Some(fingerprint(b"beta")));
+        });
+    }
+
+    // ---- two agents, one file ---------------------------------------------
+
+    /// The bug this slice exists to fix: the ledger compared the disk
+    /// against the *most recent* entry for the path, so one agent's write
+    /// told another agent's check that the file was fine — and the second
+    /// write clobbered the first without anybody finding out.
+    #[test]
+    fn two_agents_cannot_overwrite_each_other() {
+        let _g = ledger_lock();
+        let dir = temp_dir("two_agents");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "original").unwrap();
+        let p = path.to_str().unwrap();
+        let a = AgentId::next();
+        let b = AgentId::next();
+        // both agents read the file
+        crate::tools::dispatch("read_file", &serde_json::json!({"path": p}), a);
+        crate::tools::dispatch("read_file", &serde_json::json!({"path": p}), b);
+        // A writes: its own view matches the disk, so the write lands
+        let out = crate::tools::dispatch("write_file", &serde_json::json!({"path": p, "content": "A"}), a);
+        assert!(out.starts_with("ok:"), "A's write lands: {out}");
+        // B writes the same file: the disk is not the bytes B saw
+        let out = crate::tools::dispatch("write_file", &serde_json::json!({"path": p, "content": "B"}), b);
+        assert!(out.contains("changed on disk"), "B is refused: {out}");
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "A", "A's bytes are still there");
+    }
+
+    /// An agent's own write moves its own view: the second write is
+    /// against the bytes it just wrote, not against the bytes it read.
+    #[test]
+    fn an_agents_own_write_does_not_stale_itself() {
+        let _g = ledger_lock();
+        let dir = temp_dir("own_write");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "original").unwrap();
+        let p = path.to_str().unwrap();
+        let a = AgentId::next();
+        crate::tools::dispatch("read_file", &serde_json::json!({"path": p}), a);
+        let out = crate::tools::dispatch("write_file", &serde_json::json!({"path": p, "content": "v1"}), a);
+        assert!(out.starts_with("ok:"), "the first write lands: {out}");
+        let out = crate::tools::dispatch("write_file", &serde_json::json!({"path": p, "content": "v2"}), a);
+        assert!(out.starts_with("ok:"), "an agent's own write does not stale it: {out}");
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "v2");
+    }
+
+    /// The limit, pinned deliberately: an agent that has never touched a
+    /// file is not stopped by the ledger. This is the documented policy —
+    /// "never read it, go ahead" — and the per-agent view does not change
+    /// it. Pinning it here makes changing it a decision rather than an
+    /// accident.
+    #[test]
+    fn a_writer_that_never_read_the_file_still_writes_it() {
+        let _g = ledger_lock();
+        let dir = temp_dir("never_read");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "original").unwrap();
+        let p = path.to_str().unwrap();
+        let a = AgentId::next();
+        let out = crate::tools::dispatch("write_file", &serde_json::json!({"path": p, "content": "written"}), a);
+        assert!(out.starts_with("ok:"), "never read it, go ahead: {out}");
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "written");
+    }
+
+    /// The refusal is model-visible text: one shape, one message. This
+    /// pins the bytes, so a change to them is a decision and not an
+    /// accident. (The message does not say "another agent" — the mover
+    /// may be the user's editor.)
+    #[test]
+    fn the_refusal_message_is_byte_identical() {
+        let _g = ledger_lock();
+        let dir = temp_dir("refusal_bytes");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "first").unwrap();
+        let p = path.to_str().unwrap();
+        let a = AgentId::next();
+        crate::tools::dispatch("read_file", &serde_json::json!({"path": p}), a);
+        std::fs::write(&path, "second").unwrap();
+        let expected = format!("error: {p} changed on disk since jingwei last read or wrote it — re-read it, then make the change again against what it actually says (writing over content you have not seen is how someone's uncommitted work disappears)");
+        assert_eq!(with_ledger(|led| led.stale(a, p)), Some(expected));
     }
 }

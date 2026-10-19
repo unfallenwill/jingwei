@@ -16,10 +16,11 @@ pub(crate) mod runtime;
 
 use crate::ui::{Msg, Show};
 use crate::cancel::CancelToken;
+use crate::core::ids::AgentId;
 use crate::core::ports::{BoxFuture, ToolProvider};
 use crate::file_io::write_atomic;
 use crate::tools::edit::edit_tool;
-use crate::tools::ledger::{ledger_note, stale};
+use crate::tools::ledger::with_ledger;
 use serde_json::{json, Value};
 use std::fs;
 use std::process::{Command, ExitStatus};
@@ -53,11 +54,13 @@ pub(crate) fn print_tool_call(name: &str, input: &Value, output: &str, sink: &dy
 
 /// The one tool type — `name`, `desc`, `schema` go to the model; `run` is
 /// the synchronous body that the coroutine runtime hands the blocking pool.
+/// `run` also takes the calling agent's id: the ledger keys its per-agent
+/// view of every file on it, so two agents are told apart.
 pub(crate) struct Tool {
     pub(crate) name: &'static str,
     pub(crate) desc: &'static str,
     pub(crate) schema: Value,
-    pub(crate) run: fn(&Value) -> String,
+    pub(crate) run: fn(&Value, AgentId) -> String,
 }
 
 pub(crate) fn tools() -> Vec<Tool> {
@@ -76,7 +79,9 @@ pub(crate) fn tools() -> Vec<Tool> {
             schema: json!({"type":"object","properties":{
                 "command":{"type":"string","description":"Shell command string; passed to `sh -c` on Unix or `cmd /C` on Windows. Multi-line commands use `;` or `&&`."}
             },"required":["command"]}),
-            run: |i| {
+            run: |i, _agent| {
+                // A shell command is not ledgered: the ledger governs the
+                // file tools, and a shell is a shell.
                 let prog_flag = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
                 match Command::new(prog_flag.0).args([prog_flag.1, i["command"].as_str().unwrap_or("")]).output() {
                     Ok(o) => bash_output(Some(&o.status),
@@ -95,13 +100,19 @@ pub(crate) fn tools() -> Vec<Tool> {
             schema: json!({"type":"object","properties":{
                 "path":{"type":"string","description":"Absolute or relative path; resolves against the agent's current working directory."}
             },"required":["path"]}),
-            run: |i| {
+            run: |i, agent| {
                 let p = i["path"].as_str().unwrap_or("");
                 match fs::read(p) {
                     // Reading a file is what makes it editable: the ledger
                     // remembers these bytes, so an edit that later finds
                     // different ones refuses instead of writing over them.
-                    Ok(b) => { ledger_note(p, &b); String::from_utf8_lossy(&b).into_owned() }
+                    // The read stays outside the lock — a read is an
+                    // observation, and a note that lands after somebody
+                    // else's write is the safe direction.
+                    Ok(b) => {
+                        with_ledger(|led| led.note(agent, p, &b));
+                        String::from_utf8_lossy(&b).into_owned()
+                    }
                     Err(e) => format!("error: {e}"),
                 }
             },
@@ -117,17 +128,20 @@ pub(crate) fn tools() -> Vec<Tool> {
                 "path":{"type":"string","description":"Absolute or relative path; resolves against the agent's current working directory. Parent dirs are created if they do not exist."},
                 "content":{"type":"string","description":"Full file contents — the tool always overwrites. For a small or targeted change, use edit_file instead."}
             },"required":["path","content"]}),
-            run: |i| {
+            run: |i, agent| {
                 let p = i["path"].as_str().unwrap_or("");
                 let c = i["content"].as_str().unwrap_or("");
                 // The blunt tool gets the guard too — overwriting a file that
                 // moved under us is the most expensive thing this agent can do.
-                if let Some(e) = stale(p) { return e; }
+                if let Some(e) = with_ledger(|led| led.stale(agent, p)) { return e; }
                 if let Some(dir) = std::path::Path::new(p).parent().filter(|d| !d.as_os_str().is_empty()) {
                     let _ = fs::create_dir_all(dir);
                 }
                 match write_atomic(p, c) {
-                    Ok(()) => { ledger_note(p, c.as_bytes()); format!("ok: wrote {} bytes to {p}", c.len()) }
+                    Ok(()) => {
+                        with_ledger(|led| led.note(agent, p, c.as_bytes()));
+                        format!("ok: wrote {} bytes to {p}", c.len())
+                    }
                     Err(e) => format!("error: {e}"),
                 }
             },
@@ -153,7 +167,7 @@ pub(crate) fn tools() -> Vec<Tool> {
                 },"required":["old"]}},
                 "replace_all":{"type":"boolean","description":"replace every occurrence, instead of refusing when `old` is not unique"}},
                 "required":["path"]}),
-            run: |i| edit_tool(i),
+            run: |i, agent| edit_tool(i, agent),
         },
     ]
 }
@@ -182,9 +196,9 @@ pub(crate) fn find(name: &str) -> Option<Tool> {
     tools().into_iter().find(|t| t.name == name)
 }
 
-pub(crate) fn dispatch(name: &str, input: &Value) -> String {
+pub(crate) fn dispatch(name: &str, input: &Value, agent: AgentId) -> String {
     find(name)
-        .map(|t| (t.run)(input))
+        .map(|t| (t.run)(input, agent))
         .unwrap_or_else(|| format!("error: unknown tool '{name}'"))
 }
 
@@ -232,6 +246,7 @@ impl ToolProvider for Builtins {
         name: &'a str,
         input: &'a Value,
         token: &'a CancelToken,
+        agent: AgentId,
     ) -> BoxFuture<'a, String> {
         Box::pin(async move {
             if name == "bash" {
@@ -243,7 +258,7 @@ impl ToolProvider for Builtins {
             }
             let name = name.to_string();
             let input = input.clone();
-            let job = tokio::task::spawn_blocking(move || dispatch(&name, &input));
+            let job = tokio::task::spawn_blocking(move || dispatch(&name, &input, agent));
             tokio::select! {
                 out = job => out.unwrap_or_else(|e| format!("error: {e}")),
                 _ = token.cancelled() => "[interrupted by user]".into(),
@@ -272,9 +287,9 @@ mod tests {
 
     #[test]
     fn bash_tool_returns_exit_code_and_output() {
-        let ok = dispatch("bash", &json!({"command": "echo hi"}));
+        let ok = dispatch("bash", &json!({"command": "echo hi"}), AgentId::MAIN);
         assert!(ok.starts_with("exit=0") && ok.contains("hi"), "got: {ok}");
-        let bad = dispatch("bash", &json!({"command": if cfg!(windows) { "exit 1" } else { "false" }}));
+        let bad = dispatch("bash", &json!({"command": if cfg!(windows) { "exit 1" } else { "false" }}), AgentId::MAIN);
         assert!(!bad.starts_with("exit=0") && bad.contains("exit="), "got: {bad}");
     }
 
@@ -283,24 +298,24 @@ mod tests {
         let dir = temp_dir("files");
         let p = dir.join("f.txt");
         // write (with missing parent dirs) + read roundtrip
-        assert!(dispatch("write_file", &json!({"path": dir.join("a/b.txt").to_str().unwrap(), "content": "v1"})).starts_with("ok:"));
-        assert_eq!(dispatch("read_file", &json!({"path": dir.join("a/b.txt").to_str().unwrap()})), "v1");
+        assert!(dispatch("write_file", &json!({"path": dir.join("a/b.txt").to_str().unwrap(), "content": "v1"}), AgentId::MAIN).starts_with("ok:"));
+        assert_eq!(dispatch("read_file", &json!({"path": dir.join("a/b.txt").to_str().unwrap()}), AgentId::MAIN), "v1");
         // edit unique
         fs::write(&p, "hello world").unwrap();
-        assert!(dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "hello", "new": "hi"})).starts_with("ok:"));
+        assert!(dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "hello", "new": "hi"}), AgentId::MAIN).starts_with("ok:"));
         assert_eq!(fs::read_to_string(&p).unwrap(), "hi world");
         // edit missing
-        assert!(dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "zzz", "new": "x"})).contains("not found"));
+        assert!(dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "zzz", "new": "x"}), AgentId::MAIN).contains("not found"));
         // edit ambiguous — re-read so the ledger knows the current bytes,
         // and the ambiguity message is the one we test (the ledger check
         // fires first and would otherwise steal the message).
         fs::write(&p, "ab ab").unwrap();
-        dispatch("read_file", &json!({"path": p.to_str().unwrap()}));
-        assert!(dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "ab", "new": "cd"})).contains("appears 2 times"));
+        dispatch("read_file", &json!({"path": p.to_str().unwrap()}), AgentId::MAIN);
+        assert!(dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "ab", "new": "cd"}), AgentId::MAIN).contains("appears 2 times"));
         // read missing
-        assert!(dispatch("read_file", &json!({"path": dir.join("nope").to_str().unwrap()})).starts_with("error:"));
+        assert!(dispatch("read_file", &json!({"path": dir.join("nope").to_str().unwrap()}), AgentId::MAIN).starts_with("error:"));
         // unknown tool
-        assert!(dispatch("nope", &json!({})).starts_with("error: unknown tool"));
+        assert!(dispatch("nope", &json!({}), AgentId::MAIN).starts_with("error: unknown tool"));
     }
 
     // ---- the built-in provider: the four shipped tools --------------------
@@ -356,7 +371,7 @@ mod tests {
         std::fs::write(&p, "hello").unwrap();
         let out = crate::test_util::block_on(
             Builtins.call("read_file", &json!({"path": p.to_str().unwrap()}),
-                          &crate::cancel::CancelToken::new()),
+                          &crate::cancel::CancelToken::new(), AgentId::MAIN),
         );
         assert_eq!(out, "hello", "got: {out}");
     }
@@ -367,7 +382,7 @@ mod tests {
     fn the_built_in_provider_runs_bash_through_the_cancellable_path() {
         let out = crate::test_util::block_on(
             Builtins.call("bash", &json!({"command": "echo hi"}),
-                          &crate::cancel::CancelToken::new()),
+                          &crate::cancel::CancelToken::new(), AgentId::MAIN),
         );
         assert!(out.starts_with("exit=0"), "got: {out}");
         assert!(out.contains("hi"), "got: {out}");
@@ -386,7 +401,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(200));
                 t.cancel();
             });
-            Builtins.call("bash", &json!({"command": "sleep 30"}), &token).await
+            Builtins.call("bash", &json!({"command": "sleep 30"}), &token, AgentId::MAIN).await
         });
         assert!(out.contains("[interrupted by user]"), "got: {out}");
     }
@@ -403,7 +418,7 @@ mod tests {
         let out = crate::test_util::block_on(
             Builtins.call("write_file",
                           &json!({"path": dir.join("f.txt").to_str().unwrap(), "content": "x"}),
-                          &token),
+                          &token, AgentId::MAIN),
         );
         assert_eq!(out, "[interrupted by user]",
             "non-bash cancellation uses the bash marker: {out}");
@@ -423,7 +438,8 @@ mod tests {
                 Box::pin(std::future::ready(vec![json!({"name": "mcp__fake__tool"})]))
             }
             fn call<'a>(&'a self, name: &'a str, _input: &'a Value,
-                        _token: &'a crate::cancel::CancelToken)
+                        _token: &'a crate::cancel::CancelToken,
+                        _agent: AgentId)
                 -> crate::core::ports::BoxFuture<'a, String> {
                 Box::pin(std::future::ready(format!("mcp:{name}")))
             }
@@ -569,7 +585,7 @@ mod tests {
 
     #[test]
     fn dispatch_unknown_tool_returns_an_error_message() {
-        let out = dispatch("nope", &json!({}));
+        let out = dispatch("nope", &json!({}), AgentId::MAIN);
         assert!(out.starts_with("error: unknown tool"), "got: {out}");
     }
 
@@ -579,7 +595,7 @@ mod tests {
     fn read_file_returns_error_with_path_wrapped_when_missing() {
         let dir = temp_dir("read_missing");
         let missing = dir.join("nope.txt");
-        let result = dispatch("read_file", &json!({"path": missing.to_str().unwrap()}));
+        let result = dispatch("read_file", &json!({"path": missing.to_str().unwrap()}), AgentId::MAIN);
         assert!(result.starts_with("error:"), "got: {result}");
     }
 
@@ -587,7 +603,7 @@ mod tests {
     fn write_file_returns_error_when_path_is_a_directory() {
         // a path the runtime can't write to: a directory.
         let dir = temp_dir("write_dir");
-        let result = dispatch("write_file", &json!({"path": dir.to_str().unwrap(), "content": "x"}));
+        let result = dispatch("write_file", &json!({"path": dir.to_str().unwrap(), "content": "x"}), AgentId::MAIN);
         // the io error is whatever the OS returns — we just verify the
         // tool formatted it as an error string instead of panicking
         assert!(result.starts_with("error:") || result.starts_with("ok: wrote"),
@@ -603,7 +619,7 @@ mod tests {
         std::fs::write(&target, "").unwrap(); // an empty file to symlink at
         let link = dir.join("link.txt");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let result = dispatch("write_file", &json!({"path": link.to_str().unwrap(), "content": "v"}));
+        let result = dispatch("write_file", &json!({"path": link.to_str().unwrap(), "content": "v"}), AgentId::MAIN);
         assert!(result.starts_with("ok: wrote"), "got: {result}");
         // both paths now point at content
         let on_target = std::fs::read_to_string(&target).unwrap();

@@ -26,7 +26,7 @@ impl AgentId {
     pub(crate) const MAIN: AgentId = AgentId(0);
 
     /// A fresh id, distinct from every other id this process has handed out.
-    #[allow(dead_code)] // the fleet slice mints worker ids; this round only MAIN exists
+    #[allow(dead_code)] // the fleet slice mints worker ids; until then only the tests do
     pub(crate) fn next() -> AgentId {
         AgentId(NEXT.fetch_add(1, Ordering::Relaxed))
     }

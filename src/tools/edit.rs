@@ -31,12 +31,11 @@
 // K calls and K chances to fall back to the whole-file overwrite, which is the
 // blunt tool this one exists to keep out of the conversation.
 //
-// The read ledger that backs the "file changed on disk" refusal lives in the
-// crate root for now (it is shared with `read_file` and `write_file`); once
-// the tool registry moves to its own module this file will import it from
-// there.
+// The read ledger that backs the "file changed on disk" refusal lives in
+// `tools::ledger`, and it is shared with `read_file` and `write_file`.
 
-use crate::tools::ledger::{ledger_note, stale};
+use crate::core::ids::AgentId;
+use crate::tools::ledger::with_ledger;
 use serde_json::Value;
 
 /// The most diff lines one replacement may print before the report falls back
@@ -49,7 +48,7 @@ const DIFF_TOTAL: usize = 40;
 /// then hand the batch to `apply_edits`. Two ways to say the same thing and
 /// saying both at once is a mistake worth naming rather than silently
 /// preferring one.
-pub(crate) fn edit_tool(i: &Value) -> String {
+pub(crate) fn edit_tool(i: &Value, agent: AgentId) -> String {
     let p = i["path"].as_str().unwrap_or("");
     let replace_all = i["replace_all"].as_bool().unwrap_or(false);
     let edits: Vec<(String, String)> = match &i["edits"] {
@@ -76,14 +75,14 @@ pub(crate) fn edit_tool(i: &Value) -> String {
             None => return format!("error: send `old`/`new` or `edits` — there is nothing to apply (in {p})"),
         },
     };
-    apply_edits(p, &edits, replace_all)
+    apply_edits(p, &edits, replace_all, agent)
 }
 
 /// The whole edit tool: read once, resolve every pair against the buffer (each
 /// seeing what the ones before it wrote), write once. All or nothing — a batch
 /// that fails at pair 3 writes nothing at all and says which pair failed and
 /// why, so the model re-plans instead of discovering a half-applied file.
-fn apply_edits(p: &str, edits: &[(String, String)], replace_all: bool) -> String {
+fn apply_edits(p: &str, edits: &[(String, String)], replace_all: bool, agent: AgentId) -> String {
     let content = match std::fs::read_to_string(p) {
         Ok(c) => c,
         Err(e) => return format!("error: {e} (in {p})"),
@@ -91,7 +90,7 @@ fn apply_edits(p: &str, edits: &[(String, String)], replace_all: bool) -> String
     // The bytes just read are the ones the edit is written against — if they
     // are not the bytes we last saw, this file moved under us and the edit is
     // not ours to make.
-    if let Some(e) = stale(p) { return e; }
+    if let Some(e) = with_ledger(|led| led.stale(agent, p)) { return e; }
     let mut buffer = content;
     let mut marks: Vec<(usize, usize)> = Vec::new();
     let mut body = String::new();
@@ -117,7 +116,7 @@ fn apply_edits(p: &str, edits: &[(String, String)], replace_all: bool) -> String
         buffer = updated;
     }
     if let Err(e) = crate::file_io::write_atomic(p, &buffer) { return format!("error: {e} (in {p})"); }
-    ledger_note(p, buffer.as_bytes());
+    with_ledger(|led| led.note(agent, p, buffer.as_bytes()));
     let mut out = edit_header(p, &marks, edits.len());
     out.push_str(&body);
     out
@@ -335,6 +334,7 @@ fn line_bounds(content: &str, from: usize, to: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::ids::AgentId;
     use crate::test_util::temp_dir;
     use crate::tools::dispatch;
     use serde_json::json;
@@ -345,7 +345,7 @@ mod tests {
         let dir = temp_dir("edit_report");
         let p = dir.join("f.rs");
         fs::write(&p, "fn main() {\n    let a = 1;\n    let b = 2;\n}\n").unwrap();
-        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "let b = 2;", "new": "let b = 3;"}));
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "let b = 2;", "new": "let b = 3;"}), AgentId::MAIN);
         assert!(out.contains("line 3"), "report names the line: {out}");
         assert!(out.contains("-    let b = 2;") && out.contains("+    let b = 3;"), "report carries a diff: {out}");
         assert_eq!(fs::read_to_string(&p).unwrap(), "fn main() {\n    let a = 1;\n    let b = 3;\n}\n");
@@ -363,14 +363,14 @@ mod tests {
         // `old` copied without the file's indentation — the tolerant pass lands
         // it and shifts `new` to where the lines actually sit
         fs::write(&p, file).unwrap();
-        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "if ready {\n    go();\n}", "new": "if ready {\n    run();\n}"}));
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "if ready {\n    go();\n}", "new": "if ready {\n    run();\n}"}), AgentId::MAIN);
         assert!(out.starts_with("ok:"), "got: {out}");
         assert!(out.contains("ignoring indentation"), "says why it matched: {out}");
         assert_eq!(fs::read_to_string(&p).unwrap(), "fn main() {\n    if ready {\n        run();\n    }\n}\n");
         // the tolerant pass still refuses to guess between two placements
         fs::write(&p, "go();\n\ngo();\n").unwrap();
-        dispatch("read_file", &json!({"path": p.to_str().unwrap()})); // the bytes above are not the ones we saw
-        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "  go();", "new": "run();"}));
+        dispatch("read_file", &json!({"path": p.to_str().unwrap()}), AgentId::MAIN); // the bytes above are not the ones we saw
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "  go();", "new": "run();"}), AgentId::MAIN);
         assert!(out.contains("appears 2 times") && out.contains("lines 1, 3"), "got: {out}");
         assert_eq!(fs::read_to_string(&p).unwrap(), "go();\n\ngo();\n", "an ambiguous edit writes nothing");
     }
@@ -380,11 +380,11 @@ mod tests {
         let dir = temp_dir("edit_all");
         let p = dir.join("f.rs");
         fs::write(&p, "let a = old(\"x\");\nlet b = old(\"x\");\nlet c = old(\"x\");\n").unwrap();
-        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "old(\"x\")", "new": "new(\"x\")", "replace_all": true}));
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "old(\"x\")", "new": "new(\"x\")", "replace_all": true}), AgentId::MAIN);
         assert!(out.contains("3 replacements at lines 1, 2, 3"), "got: {out}");
         assert!(!fs::read_to_string(&p).unwrap().contains("old("), "every occurrence replaced");
         // and the two-arg form still refuses, naming the lines
-        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "new(\"x\")", "new": "z"}));
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "new(\"x\")", "new": "z"}), AgentId::MAIN);
         assert!(out.contains("replace_all: true"), "the refusal offers the way out: {out}");
     }
 
@@ -393,7 +393,7 @@ mod tests {
         let dir = temp_dir("edit_empty");
         let p = dir.join("f.txt");
         fs::write(&p, "x").unwrap();
-        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "", "new": "y"}));
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "", "new": "y"}), AgentId::MAIN);
         assert!(out.contains("write_file"), "points at the right tool: {out}");
         assert_eq!(fs::read_to_string(&p).unwrap(), "x");
     }
@@ -404,29 +404,29 @@ mod tests {
         let p = dir.join("f.rs");
         fs::write(&p, "old_a();\nkeep();\nold_b();\n").unwrap();
         let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "edits": [
-            {"old": "old_a()", "new": "new_a()"}, {"old": "old_b()", "new": "new_b()"}]}));
+            {"old": "old_a()", "new": "new_a()"}, {"old": "old_b()", "new": "new_b()"}]}), AgentId::MAIN);
         assert!(out.contains("2 edits, 2 replacements"), "got: {out}");
         assert_eq!(fs::read_to_string(&p).unwrap(), "new_a();\nkeep();\nnew_b();\n");
         // a pair may edit what an earlier pair wrote: the batch is in order
         let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "edits": [
-            {"old": "new_a()", "new": "tmp_a()"}, {"old": "tmp_a()", "new": "final_a()"}]}));
+            {"old": "new_a()", "new": "tmp_a()"}, {"old": "tmp_a()", "new": "final_a()"}]}), AgentId::MAIN);
         assert!(out.starts_with("ok:"), "got: {out}");
         assert_eq!(fs::read_to_string(&p).unwrap(), "final_a();\nkeep();\nnew_b();\n");
         // one pair that cannot be placed takes the whole call down, names
         // itself, and writes nothing
         let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "edits": [
-            {"old": "keep()", "new": "gone()"}, {"old": "missing()", "new": "x"}]}));
+            {"old": "keep()", "new": "gone()"}, {"old": "missing()", "new": "x"}]}), AgentId::MAIN);
         assert!(out.contains("edit 2/2") && out.contains("nothing was written"), "got: {out}");
         assert_eq!(fs::read_to_string(&p).unwrap(), "final_a();\nkeep();\nnew_b();\n", "all or nothing");
         // the two spellings do not mix, an empty batch is rejected, and
         // an item that omits `old` is still malformed (`new` may be omitted
         // — that's a deletion; see the test below)
         let both = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "a", "new": "b",
-            "edits": [{"old": "a", "new": "b"}]}));
+            "edits": [{"old": "a", "new": "b"}]}), AgentId::MAIN);
         assert!(both.contains("not both"), "got: {both}");
-        let none = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "edits": []}));
+        let none = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "edits": []}), AgentId::MAIN);
         assert!(none.contains("`edits` is empty"), "got: {none}");
-        let malformed = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "edits": [{"new": "y"}]}));
+        let malformed = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "edits": [{"new": "y"}]}), AgentId::MAIN);
         assert!(malformed.contains("edits[1] needs `old`"), "got: {malformed}");
     }
 
@@ -442,12 +442,12 @@ mod tests {
         let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "edits": [
             {"old": "let a = old_call();\n"},
             {"old": "let c = old_call();\n"},
-        ]}));
+        ]}), AgentId::MAIN);
         assert!(out.starts_with("ok:"), "got: {out}");
         assert_eq!(fs::read_to_string(&p).unwrap(), "let b = keep();\n");
         // the same omission in the single-pair form has always worked —
         // this is the contract both spellings share.
-        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "let b = keep();\n"}));
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "let b = keep();\n"}), AgentId::MAIN);
         assert!(out.starts_with("ok:"), "got: {out}");
         assert_eq!(fs::read_to_string(&p).unwrap(), "");
     }
@@ -457,26 +457,26 @@ mod tests {
         let dir = temp_dir("edit_stale");
         let p = dir.join("f.txt");
         fs::write(&p, "one\ntwo\n").unwrap();
-        assert!(dispatch("read_file", &json!({"path": p.to_str().unwrap()})).starts_with("one"));
+        assert!(dispatch("read_file", &json!({"path": p.to_str().unwrap()}), AgentId::MAIN).starts_with("one"));
         // someone else's write — the user's editor, a formatter — lands after
         // our read: the ledger knows these are not the bytes we saw
         fs::write(&p, "one\nTWO\n").unwrap();
-        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "two", "new": "three"}));
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "two", "new": "three"}), AgentId::MAIN);
         assert!(out.contains("changed on disk"), "got: {out}");
         assert_eq!(fs::read_to_string(&p).unwrap(), "one\nTWO\n", "nothing was written");
         // the same guard covers the blunt tool
-        let out = dispatch("write_file", &json!({"path": p.to_str().unwrap(), "content": "clobbered"}));
+        let out = dispatch("write_file", &json!({"path": p.to_str().unwrap(), "content": "clobbered"}), AgentId::MAIN);
         assert!(out.contains("changed on disk"), "got: {out}");
         assert_eq!(fs::read_to_string(&p).unwrap(), "one\nTWO\n");
         // re-reading is the whole fix — now the edit lands
-        assert!(dispatch("read_file", &json!({"path": p.to_str().unwrap()})).contains("TWO"));
-        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "TWO", "new": "three"}));
+        assert!(dispatch("read_file", &json!({"path": p.to_str().unwrap()}), AgentId::MAIN).contains("TWO"));
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "old": "TWO", "new": "three"}), AgentId::MAIN);
         assert!(out.starts_with("ok:"), "got: {out}");
         assert_eq!(fs::read_to_string(&p).unwrap(), "one\nthree\n");
         // a file jingwei has never seen has nothing to compare against, and is
         // written as before — this is a change detector, not a read-first gate
         let fresh = dir.join("fresh.txt");
         fs::write(&fresh, "hello").unwrap();
-        assert!(dispatch("edit_file", &json!({"path": fresh.to_str().unwrap(), "old": "hello", "new": "bye"})).starts_with("ok:"));
+        assert!(dispatch("edit_file", &json!({"path": fresh.to_str().unwrap(), "old": "hello", "new": "bye"}), AgentId::MAIN).starts_with("ok:"));
     }
 }

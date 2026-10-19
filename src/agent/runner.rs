@@ -14,6 +14,7 @@ use crate::api::call_api as api_call_api;
 use crate::cancel::{CancelScope, CancelToken};
 use crate::config::Config;
 use crate::core::context::Context;
+use crate::core::ids::AgentId;
 use crate::core::ir::{Block, Message, ToolResult};
 use crate::core::ports::ToolRouter;
 use crate::core::turn::{TurnOutcome, TurnState};
@@ -99,7 +100,7 @@ async fn agent_loop(agent: &mut Agent, cfg: &Config, ctx: &mut Context, router: 
     agent.lifecycle.transition(TurnState::InProgress, None)
         .map_err(|e| Error::Msg(e.to_string()))?;
 
-    let result = run_turn(cfg, ctx, router, token, sink).await;
+    let result = run_turn(cfg, ctx, router, token, sink, agent.id).await;
     // The Result → TurnOutcome translation lives here because `core::turn`
     // deliberately keeps no dependency on the error vocabulary: the turn
     // carries a failure as a `String`, and turning the error type into
@@ -117,7 +118,11 @@ async fn agent_loop(agent: &mut Agent, cfg: &Config, ctx: &mut Context, router: 
 /// Drive one turn's worth of API calls and tool runs. Pure mechanics — the
 /// agent's lifecycle is owned by the caller. Returns whatever happened;
 /// the caller maps it onto a terminal state via `Turn::finish`.
-async fn run_turn(cfg: &Config, ctx: &mut Context, router: &ToolRouter, token: &CancelToken, sink: &dyn Show) -> crate::Result<()> {
+///
+/// `agent` is the identity the tools run under: the ledger keys its
+/// per-agent view of every file on it, so two agents cannot overwrite each
+/// other's work without either of them finding out.
+async fn run_turn(cfg: &Config, ctx: &mut Context, router: &ToolRouter, token: &CancelToken, sink: &dyn Show, agent: AgentId) -> crate::Result<()> {
     for step in 0..cfg.max_turns {
         if token.is_cancelled() { return Err(Error::Interrupted); }
         // The tool list the model sees is whatever the providers say right
@@ -158,7 +163,7 @@ async fn run_turn(cfg: &Config, ctx: &mut Context, router: &ToolRouter, token: &
             let out = if stopped {
                 "skipped: this run was interrupted before the tool ran".into()
             } else {
-                router.call(name, input, token).await
+                router.call(name, input, token, agent).await
             };
             let out = truncate(&out);
             print_tool_call(name, input, &out, sink);

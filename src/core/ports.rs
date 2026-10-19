@@ -20,11 +20,21 @@
 //! synchronous returns a ready future; that is the honest shape for it,
 //! and it costs one allocation.
 //!
-//! The router is L2: it knows the trait, the cancel token and the JSON
-//! value, and nothing else. It may not name `tools` or `mcp` — that is
-//! the whole point of the seam.
+//! The router is L2: it knows the trait, the cancel token, the JSON
+//! value, and the agent id, and nothing else. It may not name `tools` or
+//! `mcp` — that is the whole point of the seam.
+//!
+//! ## Who is calling
+//!
+//! A call carries the caller's identity: `AgentId` rides on the call, not
+//! on the provider. "Who is calling" is per-call context, not per-instance
+//! configuration, and the trait is where it belongs — a provider that needs
+//! the caller later (the ledger's per-agent view, an audit log, a per-agent
+//! quota) can have it without the port changing again. A provider that does
+//! not care about the caller takes the parameter and says so.
 
 use crate::cancel::CancelToken;
+use crate::core::ids::AgentId;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -44,11 +54,17 @@ pub(crate) trait ToolProvider: Send + Sync {
 
     /// Run one of this provider's tools. The result is text: a failure is
     /// text that starts with `error:` — the shape the model already reads.
+    ///
+    /// `agent` is who is calling. It is per-call context: the ledger keys
+    /// its per-agent view of every file on it, so two callers are told
+    /// apart. A provider that does not care about the caller takes the
+    /// parameter and says so.
     fn call<'a>(
         &'a self,
         name: &'a str,
         input: &'a Value,
         token: &'a CancelToken,
+        agent: AgentId,
     ) -> BoxFuture<'a, String>;
 }
 
@@ -93,11 +109,12 @@ impl ToolRouter {
         name: &'a str,
         input: &'a Value,
         token: &'a CancelToken,
+        agent: AgentId,
     ) -> BoxFuture<'a, String> {
         Box::pin(async move {
             for p in &self.providers {
                 if p.owns(name) {
-                    return p.call(name, input, token).await;
+                    return p.call(name, input, token, agent).await;
                 }
             }
             format!("error: unknown tool '{name}'")
@@ -141,6 +158,7 @@ mod tests {
             name: &'a str,
             _input: &'a Value,
             _token: &'a CancelToken,
+            _agent: AgentId,
         ) -> BoxFuture<'a, String> {
             let out = format!("{}:{}", self.schema, name);
             Box::pin(std::future::ready(out))
@@ -170,7 +188,7 @@ mod tests {
         let (b, _) = Stub::new(&["y"], "b");
         let r = router(vec![Box::new(a), Box::new(b)]);
         let token = CancelToken::new();
-        let out = crate::test_util::block_on(r.call("y", &serde_json::json!({}), &token));
+        let out = crate::test_util::block_on(r.call("y", &serde_json::json!({}), &token, AgentId::MAIN));
         assert_eq!(out, "b:y", "the call reached the owner of the name");
     }
 
@@ -179,7 +197,7 @@ mod tests {
         let (a, _) = Stub::new(&["x"], "a");
         let r = router(vec![Box::new(a)]);
         let token = CancelToken::new();
-        let out = crate::test_util::block_on(r.call("nope", &serde_json::json!({}), &token));
+        let out = crate::test_util::block_on(r.call("nope", &serde_json::json!({}), &token, AgentId::MAIN));
         assert_eq!(out, "error: unknown tool 'nope'");
     }
 
@@ -199,6 +217,7 @@ mod tests {
                 name: &'a str,
                 _input: &'a Value,
                 _token: &'a CancelToken,
+                _agent: AgentId,
             ) -> BoxFuture<'a, String> {
                 Box::pin(std::future::ready(format!("never:{name}")))
             }
@@ -206,7 +225,7 @@ mod tests {
         let (a, _) = Stub::new(&["x"], "a");
         let r = router(vec![Box::new(Never), Box::new(a)]);
         let token = CancelToken::new();
-        let out = crate::test_util::block_on(r.call("nope", &serde_json::json!({}), &token));
+        let out = crate::test_util::block_on(r.call("nope", &serde_json::json!({}), &token, AgentId::MAIN));
         assert_eq!(out, "error: unknown tool 'nope'", "the provider that owns nothing was not called");
     }
 }

@@ -101,6 +101,7 @@ mod wire;
 use std::path::Path;
 
 use crate::cancel::CancelToken;
+use crate::core::ids::AgentId;
 use crate::core::ports::{BoxFuture, ToolProvider};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -359,6 +360,10 @@ impl ToolProvider for Hub {
         name: &'a str,
         input: &'a Value,
         token: &'a CancelToken,
+        // An MCP tool is the server's business, not the ledger's: the hub
+        // keeps no view of any file, so it has no use for the caller's
+        // identity.
+        _agent: AgentId,
     ) -> BoxFuture<'a, String> {
         Box::pin(async move {
             // An MCP call is not cancellable mid-flight: the server's own
@@ -781,6 +786,7 @@ mod tests {
             "mcp__stub__echo",
             &serde_json::json!({"text": "hello"}),
             &CancelToken::new(),
+            AgentId::MAIN,
         ).await;
         assert_eq!(out, "called with {text:hello}", "got: {out}");
         hub.shutdown().await;
@@ -794,7 +800,7 @@ mod tests {
         let hub = Hub::empty();
         let token = CancelToken::new();
         token.cancel();
-        let out = ToolProvider::call(&hub, "mcp__anyone__anything", &serde_json::json!({}), &token).await;
+        let out = ToolProvider::call(&hub, "mcp__anyone__anything", &serde_json::json!({}), &token, AgentId::MAIN).await;
         assert_eq!(out, "[interrupted by user]");
         hub.shutdown().await;
     }
@@ -810,6 +816,7 @@ mod tests {
             "mcp__nobody__nothing",
             &serde_json::json!({}),
             &CancelToken::new(),
+            AgentId::MAIN,
         ).await;
         assert!(out.starts_with("error: no MCP tool named"), "got: {out}");
         hub.shutdown().await;
