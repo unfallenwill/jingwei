@@ -189,7 +189,8 @@ BEHAVIOR:
     --context-size <N>  trim history when estimated tokens exceed N (default 1000000)
     --max-agents <N>    how many background agents may run at once (default 4;
                         0 disables spawning)
-    --agent-wait-ms <MS> how long wait_agents waits before reporting \"still running\"
+    --agent-wait-ms <MS>
+                        how long wait_agents waits before reporting \"still running\"
                         (default 120000)
     --cache <MODE>      auto (default, passive server cache) | active (cache_control
                         breakpoints on the Messages wire — minimax's own)
