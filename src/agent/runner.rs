@@ -368,7 +368,7 @@ mod tests {
 
     // ---- coroutine cancellation ----
 
-    // bash kill/cancel tests live in tool_runtime::tests (the natural
+    // bash kill/cancel tests live in `tools::runtime`'s tests (the natural
     // home for them) with tighter timing ceilings.
 
     #[test]
@@ -507,8 +507,8 @@ mod tests {
         assert!(agent.started_at().is_some() && agent.ended_at().is_some(), "timestamps stamp both ends");
     }
 
-    // bash+grandchild test lives in tool_runtime::tests; see cmd/conn
-    // there for a deeper timeout note.
+    // bash+grandchild test lives in `tools::runtime`'s tests, under
+    // `bash_cancel_with_grandchild_holding_pipe`.
 
     /// The wrapper owns the cancel select; the loop-level tests above
     /// exercise the mechanics without it. This one drives the wrapper

@@ -78,7 +78,6 @@ impl Settings {
 
     /// Persist to `~/.jingwei/settings.json` via the atomic write
     /// primitive — a half-written settings file would lock the user out.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn save(&self) -> Result<()> {
         let Some(path) = Self::path() else {
             return Err(Error::Msg("no home directory — cannot save ~/.jingwei/settings.json".into()));
@@ -129,7 +128,6 @@ impl Settings {
     /// `~/.jingwei/settings.json`, formatted for humans. Bumping
     /// `$schema_version` does not change the formatter — every valid
     /// version emits a v2-shaped file.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn to_json_string(&self) -> String {
         let mut providers = serde_json::Map::new();
         for (k, p) in &self.providers {

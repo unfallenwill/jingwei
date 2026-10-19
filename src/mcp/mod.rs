@@ -225,8 +225,9 @@ impl Hub {
     ///
     /// `#[allow(dead_code)]`: the production binary uses [`Hub::spawn`] to
     /// read configuration; this empty form is the test affordance — the
-    /// wiring test in `tool_runtime` and the per-test setup in the TUI /
-    /// plain frontends all start from a hub that has nothing configured.
+    /// per-test setup in the TUI / plain frontends, in `workflow`, and in
+    /// this module's own tests, all start from a hub that has nothing
+    /// configured.
     #[allow(dead_code)]
     pub fn empty() -> Self {
         spawn_with(|_actor| async move { HubInner::empty() })

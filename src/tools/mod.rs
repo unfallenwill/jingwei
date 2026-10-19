@@ -1,7 +1,7 @@
 // The four tools, as the registry knows them. Each entry is the plain
 // description the agent hands to the model — name, what it does, the
 // JSON-schema shape — plus a synchronous `run` that the coroutine runtime
-// calls on the blocking pool. `bash` is special-cased in `tool_runtime`
+// calls on the blocking pool. `bash` is special-cased in `tools::runtime`
 // because a runaway shell is the one tool whose execution has to be
 // cancellable; everything else is fast enough that "abandon the in-flight
 // task on Ctrl-C" is the right answer.
@@ -179,7 +179,7 @@ pub(crate) fn tools() -> Vec<Tool> {
 
 /// Combined-output shape for the bash tool — shared by the synchronous
 /// registry entry (below) and the cancellable coroutine path in
-/// `tool_runtime`, so the tool's output is the same shape whichever
+/// `tools::runtime`, so the tool's output is the same shape whichever
 /// path the call lands on. The async caller can hand `Some(&status)`
 /// after reaping the child; the sync one hands `Some(&output.status)`
 /// from the std `Command::output` it just consumed.

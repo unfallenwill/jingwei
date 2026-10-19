@@ -10,8 +10,9 @@
 //! Why this is its own module: before, the same work was scattered across
 //! three places — `agents_md::system_prompt_extras` (now retired), the
 //! per-vendor `body()` functions (each running its own composition), and
-//! a clump of trim helpers in `main::run_turn` that read tool schemas and
-//! called `fit_context` inline. Three call sites, three implicit
+//! a clump of trim helpers in the old `main::run_turn` (now
+//! `agent::runner::run_turn`) that read tool schemas and called
+//! `fit_context` inline. Three call sites, three implicit
 //! contracts, no name. Here the work has one home and one name
 //! (`Context`); vendors consume what the agent loop has already assembled
 //! and never reach into AGENTS.md or the tool registry themselves.

@@ -1,7 +1,7 @@
 //! The fleet's four tools: `spawn_agent`, `wait_agents`, `stop_agent`,
 //! `list_agents`.
 //!
-//! The schemas live in their own table, not in `src/tools.rs`: the
+//! The schemas live in their own table, not in `src/tools/mod.rs`: the
 //! built-in registry is pinned at four tools and the pin stays honest.
 //! These are a **third provider** in the router, after the built-ins and
 //! the MCP provider, so the tool list reads: the four built-ins, the
