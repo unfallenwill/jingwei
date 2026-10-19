@@ -414,14 +414,15 @@ taken offline does not bring it back.
 ```sh
 cargo check --tests    # the gate: cheap, catches signature drift
 cargo test             # 638 unit tests + 22 integration tests
-cargo build            # the production binary — the gates do not build it
 ```
 
-`cargo build` earns its line because a production import of the test-only
-helper is invisible to the other two gates: `test_util` lives behind
-`#[cfg(test)]`, so such an import compiles under `cargo check --tests`
-and `cargo test` and breaks only `cargo build`. The architecture test
-forbids it.
+The architecture test (`tests/architecture.rs`) checks the layering: it
+resolves every crate-internal import in `src/` to the module that owns
+it and fails on an upward edge. The compile error is not what it is for:
+a production import of the test-only helper is a hard `E0432` under every
+cargo command — `test_util` lives behind `#[cfg(test)]`, and the lib is
+also built without it, as the bin's and the integration tests' dependency.
+The rule is what names it: `L5/"agent::runner" -> T/"test_util"`.
 
 ## License
 

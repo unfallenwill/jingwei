@@ -22,9 +22,11 @@
 //   - L5 may import anything — except the test-only helper, below.
 //   - T is test-only: it may import anything (its symbols live behind
 //     `cfg(test)`), and no production module may import it — at any
-//     layer, L5 included. `test_util` is declared `#[cfg(test)]`, so a
-//     production import of it compiles under `cargo check --tests` and
-//     `cargo test` — both gates — and breaks `cargo build`.
+//     layer, L5 included. The compile error is not the point: the lib is
+//     also built without `cfg(test)` — as the bin's and the integration
+//     tests' dependency — so a production import of `test_util` is a
+//     hard E0432 under every cargo command. The rule is what names it:
+//     `L5/"agent::runner" -> T/"test_util"` instead of an opaque error.
 //
 // The resolver: every `use` item is expanded (brace groups, nested
 // groups, `self`, renames, globs), every inline `crate::…` path counts
@@ -760,12 +762,14 @@ fn upward_edges(edges: &HashMap<String, Vec<String>>) -> Vec<(String, String, La
             let Some(lt) = layer_of(to) else { continue };  // outside-project dep — skip
             // The test-only helper is its own rule, and it has no
             // exemption: no production module may import `test_util`, at
-            // any layer. `test_util` is declared `#[cfg(test)]`, so a
-            // production import of it compiles under `cargo check --tests`
-            // and `cargo test` — both gates — and breaks `cargo build`.
-            // (The general upward rule already catches L0..L4, because T's
-            // rank is 99; what it missed was L5, which the upward rule
-            // exempts.)
+            // any layer. (The general upward rule already catches L0..L4,
+            // because T's rank is 99; what it missed was L5, which the
+            // upward rule exempts.) The compile error is not the point:
+            // the lib is also built without `cfg(test)` — as the bin's and
+            // the integration tests' dependency — so a production import
+            // of `test_util` is a hard E0432 under every cargo command.
+            // The rule is what names it: `L5/"agent::runner" ->
+            // T/"test_util"` instead of an opaque error.
             let into_test_only = lt == Layer::T && lf != Layer::T;
             // Upward = target strictly higher than source.
             // T → non-T is a different bug (test util leaking into production).
@@ -936,9 +940,10 @@ fn the_l3_to_l4_carve_out_covers_the_config_family_and_nothing_else() {
 fn a_production_module_may_not_import_the_test_helper() {
     // The rules block says no production module may import `test_util`,
     // and L5 was exempt from the upward rule — so an L5 production import
-    // was never flagged. It compiles under `cargo check --tests` and
-    // `cargo test` (both gates) and breaks `cargo build`, which no gate
-    // runs. The rule has no exemption now.
+    // was never flagged. The compile error was never the point (the lib
+    // is also built without `cfg(test)`, so such an import is a hard
+    // E0432 under every cargo command); the rule is what names it. The
+    // rule has no exemption now.
     let mut mods = Modules::new();
     mods.insert("test_util".to_string(), "pub(crate) fn block_on() {}\n".to_string());
     mods.insert("ui::plain".to_string(), "use crate::test_util::block_on;\n".to_string());
