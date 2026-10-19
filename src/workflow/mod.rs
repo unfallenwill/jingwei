@@ -146,10 +146,12 @@ mod tests {
     }
 
     /// Point the home variable at a fresh temp dir and hand back the
-    /// guard that puts it back. The override lasts only as long as the
-    /// guard lives, and the guard lives only as long as the test needs
-    /// the path to be *computed* — a session's path is fixed when the
-    /// session is made, so the run itself never looks at home again.
+    /// guard that puts it back. The guard owns the dir as well: the
+    /// session's path points into it, so the dir has to outlive the
+    /// writes that use that path and be removed once they are done. A
+    /// test that takes the guard also takes the env lock, so a sibling
+    /// test that moves the same variable at the same time cannot see
+    /// the wrong home.
     struct HomeOverride {
         prev: Option<OsString>,
         dir: PathBuf,
@@ -162,41 +164,27 @@ mod tests {
             std::env::set_var(home_var(), &dir);
             Self { prev, dir }
         }
-
-        /// Put the home variable back. The session's path is already
-        /// fixed, so the rest of the test does not need the sandbox to
-        /// stay in place — and the shorter the window, the smaller the
-        /// chance of colliding with another test that moves the same
-        /// variable.
-        fn release(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var(home_var(), v),
-                None => std::env::remove_var(home_var()),
-            }
-        }
     }
 
     impl Drop for HomeOverride {
         fn drop(&mut self) {
-            if self.prev.is_some() {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var(home_var(), v),
-                    None => std::env::remove_var(home_var()),
-                }
+            match self.prev.take() {
+                Some(v) => std::env::set_var(home_var(), v),
+                None => std::env::remove_var(home_var()),
             }
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
-    /// The session the run saves into, made under a sandboxed home and
-    /// then released: the path is fixed, the home variable is not needed
-    /// again.
-    fn sandboxed_session(tag: &str) -> (Session, PathBuf) {
-        let mut home = HomeOverride::new(tag);
+    /// The session the run saves into, made under a sandboxed home. The
+    /// guard comes back with it: the session's path points into the
+    /// sandbox, so the sandbox has to stay until the test is done
+    /// writing through that path — and not a moment longer.
+    fn sandboxed_session(tag: &str) -> (Session, PathBuf, HomeOverride) {
+        let home = HomeOverride::new(tag);
         let session = Session::new(&provenance(), crate::config::HISTORY_FORMAT);
-        home.release();
         let path = session.path().expect("a session path under the sandbox home").to_path_buf();
-        (session, path)
+        (session, path, home)
     }
 
     // ---- the ordering ----------------------------------------------------
@@ -223,7 +211,7 @@ mod tests {
     #[test]
     fn the_task_is_on_disk_before_the_first_model_call() {
         let _lock = crate::test_util::env_lock();
-        let (session, path) = sandboxed_session("ordering");
+        let (session, path, _home) = sandboxed_session("ordering");
         let mut convo = Convo::persistent(session);
         // What the file held at the moment the request hit the wire.
         let on_disk = Arc::new(Mutex::new(String::new()));
@@ -250,10 +238,9 @@ mod tests {
         let _lock = crate::test_util::env_lock();
         // A *file* where the session directory wants to be: the save
         // cannot make its directory, so the save fails.
-        let mut home = HomeOverride::new("save_fails");
+        let home = HomeOverride::new("save_fails");
         std::fs::write(home.dir.join(".jingwei"), b"not a directory").unwrap();
         let session = Session::new(&provenance(), crate::config::HISTORY_FORMAT);
-        home.release();
         let mut convo = Convo::persistent(session);
         let (port, _reqs) = mock_seq(vec![(200, ANSWER.into())]);
         let sink = Recorder::default();
