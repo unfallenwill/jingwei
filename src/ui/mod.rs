@@ -353,6 +353,20 @@ pub trait Show: Send + Sync {
     fn show(&self, m: Msg);
 }
 
+/// An `Arc` of a sink is a sink.
+///
+/// The fleet hands the same sink to the main run and to every worker it
+/// spawns, and it has to keep that sink alive while the run it owns is
+/// gone. An `Arc` is the shape that does both: one allocation, any number
+/// of owners, no clone of the sink's own state. `PlainSink` is not
+/// `Clone` — its state is a folded log — so this is the only way a
+/// frontend can hand the same log to a worker.
+impl<T: Show + ?Sized> Show for Arc<T> {
+    fn show(&self, m: Msg) {
+        (**self).show(m)
+    }
+}
+
 /// The common sink: hand each message to a channel another task drains. The
 /// terminal TUI and any remote frontend (a web socket, say) work this way —
 /// the adapter owns the receiver and the transport, the core owns neither.
@@ -776,5 +790,13 @@ mod tests {
             agent_summary(id, TurnState::Failed, "", None, 1),
             format!("[{id}] ✗ · 1 tool"),
         );
+    }
+
+    #[test]
+    fn an_arc_of_a_sink_is_a_sink() {
+        let rec = crate::test_util::Recorder::default();
+        let sink: Arc<dyn Show> = Arc::new(rec.clone());
+        sink.show(Msg::Text("through the arc".into()));
+        assert_eq!(rec.msgs().len(), 1, "the arc carried the message to the sink under it");
     }
 }
