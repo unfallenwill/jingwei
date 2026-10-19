@@ -61,15 +61,41 @@ impl Roster {
         self.live().into_iter().map(|(id, _)| id).collect()
     }
 
-    /// The ids of the live agents, for the tests that need to see the
-    /// roster from the outside.
+    /// The live *background* agents, in the order the ids were minted.
     ///
-    /// Test-only on purpose: the production API is `new` / `register` /
-    /// `remove`, and the fleet slice grows the readers the frontends
-    /// need.
-    #[cfg(test)]
-    pub(crate) fn live_ids(&self) -> Vec<AgentId> {
-        self.ids()
+    /// The main agent is not one of them: the conversation the human is
+    /// talking to is not a background agent, and the fleet's limits and
+    /// its listing both talk about workers.
+    #[allow(dead_code)] // the fleet slice reads the roster; until then only the tests do
+    pub(crate) fn list(&self) -> Vec<AgentId> {
+        self.ids().into_iter().filter(|id| *id != AgentId::MAIN).collect()
+    }
+
+    /// Stop one agent, and say whether it was live.
+    ///
+    /// The scope the roster holds is cancelled, so the agent's own leaf
+    /// is born cancelled and the run under it unwinds. The main agent is
+    /// never stopped this way — the human ends the conversation, not a
+    /// stop request.
+    #[allow(dead_code)] // the fleet slice reads the roster; until then only the tests do
+    pub(crate) fn stop(&self, id: AgentId) -> bool {
+        if id == AgentId::MAIN { return false; }
+        let scope = {
+            let live = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            live.get(&id).cloned()
+        };
+        match scope {
+            Some(scope) => { scope.cancel(); true }
+            None => false,
+        }
+    }
+
+    /// Stop every background agent, and leave the main one alone.
+    #[allow(dead_code)] // the fleet slice reads the roster; until then only the tests do
+    pub(crate) fn stop_all(&self) {
+        for (id, scope) in self.live() {
+            if id != AgentId::MAIN { scope.cancel(); }
+        }
     }
 
     /// The scope the roster holds for one agent — the handle a stop
@@ -108,7 +134,7 @@ mod tests {
         let id = AgentId::next();
         let scope = CancelScope::new();
         roster.register(id, scope.clone());
-        assert_eq!(roster.live_ids(), vec![id], "the agent is live");
+        assert_eq!(roster.list(), vec![id], "the agent is live");
         // The roster holds the *scope*, not a snapshot of it: cancelling
         // the scope that was registered reaches the one the roster holds
         // — a leaf minted under the held scope is born cancelled, which
@@ -126,13 +152,13 @@ mod tests {
         let roster = Roster::new();
         let id = AgentId::next();
         roster.register(id, CancelScope::new());
-        assert_eq!(roster.live_ids().len(), 1);
+        assert_eq!(roster.list().len(), 1);
         roster.remove(id);
-        assert!(roster.live_ids().is_empty(), "the agent is gone");
+        assert!(roster.list().is_empty(), "the agent is gone");
         // removing an agent that is not there is a no-op, not a panic
         roster.remove(id);
         roster.remove(AgentId::next());
-        assert!(roster.live_ids().is_empty());
+        assert!(roster.list().is_empty());
     }
 
     #[test]
@@ -142,11 +168,54 @@ mod tests {
         let b = AgentId::next();
         roster.register(a, CancelScope::new());
         roster.register(b, CancelScope::new());
-        let ids = roster.live_ids();
+        let ids = roster.list();
         assert_eq!(ids.len(), 2, "ids do not collide: {ids:?}");
         assert!(ids.contains(&a) && ids.contains(&b), "both are there: {ids:?}");
         // and one agent leaving does not take the other with it
         roster.remove(a);
-        assert_eq!(roster.live_ids(), vec![b]);
+        assert_eq!(roster.list(), vec![b]);
+    }
+
+    #[test]
+    fn the_roster_lists_the_live_agents() {
+        let roster = Roster::new();
+        let a = AgentId::next();
+        let b = AgentId::next();
+        // the main agent registers itself for the length of its run, and
+        // it is the conversation - not a background agent
+        roster.register(AgentId::MAIN, CancelScope::new());
+        roster.register(a, CancelScope::new());
+        roster.register(b, CancelScope::new());
+        assert_eq!(roster.list(), vec![a, b], "the main agent is not on the list");
+    }
+
+    #[test]
+    fn stopping_one_agent_leaves_the_others() {
+        let roster = Roster::new();
+        let a = AgentId::next();
+        let b = AgentId::next();
+        let scope_a = CancelScope::new();
+        roster.register(a, scope_a.clone());
+        roster.register(b, CancelScope::new());
+        assert!(roster.stop(a), "a live agent can be stopped");
+        assert!(scope_a.is_cancelled(), "and the scope that stops it is cancelled");
+        assert!(!roster.scope_of(b).expect("b is live").is_cancelled(), "b is untouched");
+        // an agent that is not there cannot be stopped
+        assert!(!roster.stop(AgentId::next()), "an id the roster never held cannot be stopped");
+        // and the main agent is the conversation's, not the fleet's
+        roster.register(AgentId::MAIN, CancelScope::new());
+        assert!(!roster.stop(AgentId::MAIN), "the main agent is never stopped this way");
+    }
+
+    #[test]
+    fn stop_all_leaves_the_main_alone() {
+        let roster = Roster::new();
+        let main_scope = CancelScope::new();
+        let worker_scope = CancelScope::new();
+        roster.register(AgentId::MAIN, main_scope.clone());
+        roster.register(AgentId::next(), worker_scope.clone());
+        roster.stop_all();
+        assert!(worker_scope.is_cancelled(), "the background agent is stopped");
+        assert!(!main_scope.is_cancelled(), "the conversation is not the fleet's to stop");
     }
 }

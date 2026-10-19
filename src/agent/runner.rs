@@ -155,7 +155,8 @@ async fn agent_loop(agent: &mut Agent, cfg: &Config, ctx: &mut Context, router: 
 ///
 /// `agent` is the identity the tools run under: the ledger keys its
 /// per-agent view of every file on it, so two agents cannot overwrite each
-/// other's work without either of them finding out.
+/// other's work without either of them finding out. It is the agent's own
+/// value, so the tools it called are recorded on it as they happen.
 async fn run_turn(cfg: &Config, ctx: &mut Context, router: &ToolRouter, token: &CancelToken, sink: &dyn Show, agent: AgentId) -> crate::Result<()> {
     for step in 0..cfg.max_turns {
         if token.is_cancelled() { return Err(Error::Interrupted); }
@@ -561,9 +562,17 @@ mod tests {
         let seen = during.clone();
         let watch = roster.clone();
         let (port, _) = mock_seq_with(vec![(200, done.into())], move || {
-            seen.lock().unwrap().extend(watch.live_ids());
+            seen.lock().unwrap().extend(watch.list());
         });
-        let mut agent = Agent::main("say hi");
+        // a worker, not the main agent: the roster's listing is the
+        // background agents', and the main agent is the conversation
+        let mut agent = Agent::new(
+            AgentId::next(),
+            "w1".into(),
+            AgentRole::Worker,
+            "say hi".into(),
+            crate::core::turn::Turn::new(0),
+        );
         let mut cx = ctx_with("say hi");
         block_on(async {
             let (router, hub) = router();
@@ -576,9 +585,9 @@ mod tests {
             "the agent was registered while it ran"
         );
         assert!(
-            roster.live_ids().is_empty(),
+            roster.list().is_empty(),
             "and it let the roster go when the run ended: {:?}",
-            roster.live_ids()
+            roster.list()
         );
     }
 }
