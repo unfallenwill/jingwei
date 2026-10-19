@@ -142,10 +142,16 @@ mod tests {
 
     #[test]
     fn the_prompt_names_jingwei() {
-        // The identity question has an answer in the prompt — a cheap
-        // guard against a paragraph being dropped by accident.
-        assert!(SYSTEM.contains("jingwei (精卫)"), "the prompt names jingwei");
-        assert!(SYSTEM.contains("say you are jingwei (精卫)"),
-            "the prompt answers the name question");
+        // Two claims, two paragraphs: the identity says who jingwei
+        // is, the tail answers the name question. Each is asserted
+        // against the paragraph that carries it — asserted against
+        // `SYSTEM` instead, the first would be subsumed by the
+        // second, because the tail's sentence contains the first
+        // sentence's words, and a guard that cannot fail is not a
+        // guard.
+        assert!(IDENTITY.contains("jingwei (精卫)"),
+            "the identity paragraph names jingwei");
+        assert!(TAIL.contains("say you are jingwei (精卫)"),
+            "the tail answers the name question");
     }
 }
