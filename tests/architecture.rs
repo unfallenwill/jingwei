@@ -732,6 +732,17 @@ fn edges_of(mods: &Modules, known: &HashSet<String>, aliases: &Aliases) -> HashM
     out
 }
 
+/// The one carve-out in the layering rule: the `config` family may reach
+/// the api tier (L4) for the vendor table and the policy enums.
+///
+/// The carve-out names the modules it covers, so a *new* L3 module that
+/// reaches for L4 is a violation rather than a silent pass. `tools::runtime`
+/// used to be in this list; it no longer reaches `api` at all — `api::blocking`
+/// moved down into `cancel` (L1), where the cancellation helpers live.
+fn is_config_family(m: &str) -> bool {
+    matches!(m, "config" | "config::settings" | "config::login")
+}
+
 /// The upward edges in a tree.
 fn upward_edges(edges: &HashMap<String, Vec<String>>) -> Vec<(String, String, Layer, Layer)> {
     let mut violations = Vec::new();
@@ -749,16 +760,13 @@ fn upward_edges(edges: &HashMap<String, Vec<String>>) -> Vec<(String, String, La
             // `config::settings`, `config::login`) needs the vendor table
             // (`api::Protocol`, `api::VENDORS`) and the policy enums
             // (`api::CacheMode`, `api::Thinking`, `api::Effort`).
-            // `tools::runtime` no longer reaches `api` at all:
-            // `api::blocking` moved down into `cancel` (L1), where the
-            // cancellation helpers live. Nothing else in L3 may name
-            // anything in L4.
+            // Nothing else in L3 may name anything in L4.
             let lf_n = lf.rank();
             let lt_n = lt.rank();
             let upward = lt_n > lf_n
                 && lf != Layer::L5
                 && lf != Layer::T
-                && !(lf == Layer::L3 && lt == Layer::L4);
+                && !(lf == Layer::L3 && lt == Layer::L4 && is_config_family(fr));
             if upward {
                 violations.push((fr.clone(), to.clone(), lf, lt));
             }
@@ -878,6 +886,32 @@ fn a_violation_in_an_inline_path_is_seen() {
 #[test]
 fn a_violation_in_a_function_body_is_seen() {
     assert_eq!(targets("fn f() { use crate::api::VENDORS; }\n"), vec!["api"]);
+}
+
+#[test]
+fn the_l3_to_l4_carve_out_covers_the_config_family_and_nothing_else() {
+    // The carve-out names the modules it covers, so a *new* L3 module that
+    // reaches for L4 is a violation rather than a silent pass. A comment
+    // that says "nothing else in L3 may name anything in L4" is worth
+    // nothing if the check exempts every L3 module — so the check has to
+    // agree with the comment.
+    let mut mods = Modules::new();
+    mods.insert("api".to_string(), "pub(crate) const VENDORS: &[&str] = &[];\n".to_string());
+    mods.insert("config".to_string(), "use crate::api::VENDORS;\n".to_string());
+    mods.insert("config::settings".to_string(), "use crate::api::VENDORS;\n".to_string());
+    mods.insert("tools::runtime".to_string(), "use crate::api::VENDORS;\n".to_string());
+    let known = known_modules(&mods);
+    let aliases = build_aliases(&mods, &known);
+    let edges = edges_of(&mods, &known, &aliases);
+    let violations = upward_edges(&edges);
+    assert!(
+        !violations.iter().any(|(fr, _, _, _)| fr.starts_with("config")),
+        "the config family may reach the api tier: {violations:?}"
+    );
+    assert!(
+        violations.iter().any(|(fr, to, _, _)| fr == "tools::runtime" && to == "api"),
+        "any other L3 module reaching L4 is a violation: {violations:?}"
+    );
 }
 
 #[test]
