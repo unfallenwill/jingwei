@@ -104,6 +104,13 @@ frontends share one implementation (`src/agent/cmd.rs`), the way `/mcp`
 does, so the human can see and stop a runaway worker without going
 through the model.
 
+Today the table is empty whenever the human can reach the command. A
+worker lives inside a run, and the run holds the input — the TUI locks
+the editor while it works, the plain reader waits on the model — so
+`/agents` is read between runs, and the fleet is closed when the run
+ends. Reaching a live fleet is a named follow-up, not something this
+README claims.
+
 The interactive UI is an inline TUI (crossterm, with ratatui only for the
 review overlay) that owns a small framed pane — separator rules above and
 below the input row, a live status bar underneath — at the bottom of the
@@ -413,7 +420,7 @@ taken offline does not bring it back.
 
 ```sh
 cargo check --tests    # the gate: cheap, catches signature drift
-cargo test             # 638 unit tests + 22 integration tests
+cargo test             # 638 unit tests + 23 integration tests
 ```
 
 The architecture test (`tests/architecture.rs`) checks the layering: it
