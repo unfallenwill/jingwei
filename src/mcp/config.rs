@@ -554,6 +554,22 @@ mod tests {
         std::fs::remove_dir_all(&workspace).unwrap();
     }
 
+    /// A `.mcp.json` that cannot be read at all — because the path is a
+    /// directory rather than a file — is a warning that names the path, the
+    /// same as a file that is not JSON.
+    #[test]
+    fn a_workspace_mcp_json_that_cannot_be_read_at_all_is_a_warning() {
+        let _g = crate::test_util::env_lock();
+        let workspace = workspace();
+        std::fs::create_dir_all(workspace.join(".mcp.json")).unwrap();
+        let (found, warnings) = entries(&workspace, None);
+        assert!(found.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(".mcp.json"), "{warnings:?}");
+        assert!(warnings[0].contains("cannot be read"), "{warnings:?}");
+        std::fs::remove_dir_all(&workspace).unwrap();
+    }
+
     #[test]
     fn a_table_that_is_not_a_table_is_a_warning() {
         let _g = crate::test_util::env_lock();

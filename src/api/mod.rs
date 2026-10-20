@@ -457,7 +457,7 @@ pub(crate) mod deepseek;
 mod tests {
     use super::*;
     use crate::core::ir::{Block, Message};
-    use crate::test_util::{block_on, cfg, mock_seq, sink};
+    use crate::test_util::{block_on, cfg, mock, mock_seq, sink};
     use serde_json::json;
 
     // ---- Protocol: the dispatcher's typed handle --------------------------
@@ -858,5 +858,308 @@ mod tests {
         )).unwrap_err();
         assert!(err.to_string().contains("bad model"), "got: {err}");
         assert_eq!(reqs.lock().unwrap().len(), 1, "no second request");
+    }
+
+    // ---- the transport: what the wire says, and how it is read ------------
+
+    use crate::test_util::{BlockExt, Recorder};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// One turn's worth of blocks, as the transport shows them.
+    fn turn(blocks: Vec<Block>) -> Response {
+        Response { blocks, usage: json!({"input_tokens": 1, "output_tokens": 2}) }
+    }
+
+    /// A chat stream served by `events`, and what it produced.
+    fn chat_stream(events: &str) -> (Response, bool, Vec<crate::ui::Msg>) {
+        let port = mock(events, 200, true);
+        let mut c = cfg(format!("http://127.0.0.1:{port}"), true);
+        c.protocol = Protocol::ZAI;
+        let rec = Recorder::default();
+        let (resp, interrupted, _) =
+            block_on(chat_streaming(&c, json!({}), super::zai::usage, &CancelToken::new(), &rec)).unwrap();
+        (resp, interrupted, rec.msgs())
+    }
+
+    #[test]
+    fn a_thinking_block_is_shown_as_a_think_and_a_think_end() {
+        let rec = Recorder::default();
+        show_turn(&turn(vec![Block::Thinking { text: "thought".into(), signature: None }]), &rec);
+        let msgs = rec.msgs();
+        assert!(msgs.iter().any(|m| matches!(m, Msg::Think(t) if t == "thought")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| matches!(m, Msg::ThinkEnd)), "{msgs:?}");
+    }
+
+    #[test]
+    fn a_block_the_turn_does_not_show_is_skipped() {
+        let rec = Recorder::default();
+        show_turn(&turn(vec![Block::ToolUse { id: "t1".into(), name: "bash".into(), input: json!({}) }]), &rec);
+        let msgs = rec.msgs();
+        assert!(!msgs.iter().any(|m| matches!(m, Msg::Text(_))), "a tool call is not text: {msgs:?}");
+        assert!(!msgs.iter().any(|m| matches!(m, Msg::Think(_))), "{msgs:?}");
+        assert!(msgs.iter().any(|m| matches!(m, Msg::Done)), "the turn still closes: {msgs:?}");
+    }
+
+    #[test]
+    fn a_chat_wire_error_is_reported_in_the_wires_own_words() {
+        let (port, reqs) = mock_seq(vec![
+            (200, r#"{"error":{"message":"model not found"}}"#.into()),
+        ]);
+        let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
+        c.protocol = Protocol::ZAI;
+        let err = block_on(chat_blocking(&c, json!({}), |v| chat_to_internal(v, super::zai::usage),
+                                        &CancelToken::new(), &sink())).unwrap_err();
+        assert!(err.to_string().contains("model not found"), "the wire's own words: {err}");
+        assert_eq!(reqs.lock().unwrap().len(), 1, "a wire error is the request's own: no resend");
+    }
+
+    #[test]
+    fn a_chat_answer_that_is_not_json_says_so() {
+        let (port, _) = mock_seq(vec![(200, "this is not json at all".into())]);
+        let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
+        c.protocol = Protocol::ZAI;
+        let err = block_on(chat_blocking(&c, json!({}), |v| chat_to_internal(v, super::zai::usage),
+                                        &CancelToken::new(), &sink())).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "the body was not json: {err:?}");
+        assert!(err.to_string().contains("JSON"), "the parser says why: {err}");
+    }
+
+    #[test]
+    fn a_chat_answer_with_only_tool_calls_has_no_text() {
+        let v = json!({"choices": [{"message": {"tool_calls": [
+            {"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}
+        ]}}], "usage": {}});
+        let r = chat_to_internal(&v, |_: &Value| (Value::Null, Usage::default()));
+        assert_eq!(r.blocks.len(), 1, "the tool call is the whole answer");
+        assert!(matches!(&r.blocks[0], Block::ToolUse { name, .. } if name == "bash"));
+    }
+
+    #[test]
+    fn a_chat_stream_the_server_refuses_says_so() {
+        let (port, _) = mock_seq(vec![(400, r#"{"error":{"message":"bad model"}}"#.into())]);
+        let mut c = cfg(format!("http://127.0.0.1:{port}"), true);
+        c.protocol = Protocol::ZAI;
+        let err = block_on(chat_streaming(&c, json!({}), super::zai::usage,
+                                          &CancelToken::new(), &sink())).unwrap_err();
+        assert!(err.to_string().contains("bad model"), "got: {err}");
+    }
+
+    #[test]
+    fn a_chat_stream_ignores_a_line_that_is_not_json() {
+        let (resp, _, _) = chat_stream(concat!(
+            "data: not json at all\n\n",
+            r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#, "\n\n",
+            "data: [DONE]\n\n"));
+        assert_eq!(resp.blocks.len(), 1);
+        assert_eq!(resp.blocks[0].text().unwrap(), "hi");
+    }
+
+    #[test]
+    fn a_reasoning_block_closes_when_the_text_arrives() {
+        let (resp, _, msgs) = chat_stream(concat!(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}"#, "\n\n",
+            r#"data: {"choices":[{"delta":{"content":"answer"}}]}"#, "\n\n",
+            "data: [DONE]\n\n"));
+        let shape: Vec<&str> = msgs.iter().map(|m| match m {
+            Msg::Think(_) => "think", Msg::ThinkEnd => "think_end", Msg::Text(_) => "text", Msg::Done => "done",
+            _ => "other",
+        }).collect();
+        assert_eq!(shape, vec!["think", "think_end", "text", "done"],
+            "the reasoning closes before the answer: {msgs:?}");
+        assert_eq!(resp.blocks.len(), 2, "the thinking and the text");
+    }
+
+    #[test]
+    fn a_reasoning_block_closes_when_a_tool_call_arrives() {
+        let (resp, _, msgs) = chat_stream(concat!(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}"#, "\n\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","function":{"name":"bash","arguments":"{}"}}]}}]}"#, "\n\n",
+            "data: [DONE]\n\n"));
+        let shape: Vec<&str> = msgs.iter().map(|m| match m {
+            Msg::Think(_) => "think", Msg::ThinkEnd => "think_end", Msg::Done => "done", _ => "other",
+        }).collect();
+        assert_eq!(shape, vec!["think", "think_end", "done"],
+            "the tool call closed the reasoning: {msgs:?}");
+        assert_eq!(resp.blocks.len(), 2, "the reasoning and the tool call");
+        assert!(matches!(&resp.blocks[1], Block::ToolUse { name, .. } if name == "bash"));
+    }
+
+    #[test]
+    fn a_tool_call_delta_with_an_empty_id_or_name_is_ignored() {
+        let (resp, _, _) = chat_stream(concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{"name":""}}]}}]}"#, "\n\n",
+            "data: [DONE]\n\n"));
+        assert_eq!(resp.blocks.len(), 1);
+        match &resp.blocks[0] {
+            Block::ToolUse { id, name, input } => {
+                assert_eq!(id, "", "an empty id is not an id");
+                assert_eq!(name, "", "an empty name is not a name");
+                assert_eq!(input, &json!({}), "no arguments arrived");
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_chat_stream_with_only_tool_calls_has_no_text() {
+        let (resp, _, _) = chat_stream(concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","function":{"name":"bash","arguments":"{}"}}]}}]}"#, "\n\n",
+            "data: [DONE]\n\n"));
+        assert_eq!(resp.blocks.len(), 1, "the tool call is the whole answer");
+        assert!(matches!(&resp.blocks[0], Block::ToolUse { name, .. } if name == "bash"));
+    }
+
+    /// An event stream that never ends: the head, the given events, and
+    /// then the connection held open. The consumer waits for content that
+    /// never arrives — which is what a cancellation interrupts.
+    fn mock_open_stream(events: &str) -> (u16, Arc<AtomicBool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let written = Arc::new(AtomicBool::new(false));
+        let flag = written.clone();
+        let events = events.to_owned();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else { return };
+            let mut buf = [0u8; 8192];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+            let _ = s.write_all(events.as_bytes());
+            let _ = s.flush();
+            flag.store(true, Ordering::SeqCst);
+            // The connection is held open: the stream never ends.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        (port, written)
+    }
+
+    #[test]
+    fn a_cancelled_chat_stream_says_it_was_interrupted() {
+        let (port, written) = mock_open_stream(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n");
+        let mut c = cfg(format!("http://127.0.0.1:{port}"), true);
+        c.protocol = Protocol::ZAI;
+        let token = CancelToken::new();
+        let rec = Recorder::default();
+        let (resp, interrupted, _) = block_on(async {
+            let t = token.clone();
+            let seen = rec.clone();
+            let flag = written.clone();
+            // The cancel lands after the client *delivered* the text: the
+            // sink has seen it, so the interruption cannot cut the answer
+            // short of what the model already said. (Waiting for the
+            // bytes on the wire alone is not enough — the client may not
+            // have read them yet.)
+            tokio::task::spawn_blocking(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !flag.load(Ordering::SeqCst) {
+                    if Instant::now() > deadline { panic!("the mock never wrote the stream"); }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                while !seen.msgs().iter().any(|m| matches!(m, Msg::Text(t) if t.contains("partial"))) {
+                    if Instant::now() > deadline { panic!("the client never delivered the text"); }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                t.cancel();
+            });
+            chat_streaming(&c, json!({}), super::zai::usage, &token, &rec).await
+        }).unwrap();
+        assert!(interrupted, "the stream was cut short by the cancellation");
+        assert_eq!(resp.blocks[0].text().unwrap(), "partial", "what the model said before the cut");
+    }
+
+    /// A stream with no end: the server keeps writing until the client
+    /// goes away. The write failing is how the server learns that the
+    /// reader let go of the connection.
+    fn mock_endless_stream() -> (u16, Arc<AtomicBool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let gone = Arc::new(AtomicBool::new(false));
+        let flag = gone.clone();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else { return };
+            let mut buf = [0u8; 8192];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+            let line = b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n";
+            let mut written = 0usize;
+            while written < 64 * 1024 * 1024 {
+                match s.write_all(line) {
+                    Ok(()) => written += line.len(),
+                    Err(_) => { flag.store(true, Ordering::SeqCst); return; }
+                }
+            }
+        });
+        (port, gone)
+    }
+
+    #[test]
+    fn the_sse_reader_stops_when_nobody_is_listening() {
+        let (port, gone) = mock_endless_stream();
+        let resp = post("k", format!("http://127.0.0.1:{port}/stream"), json!({}), false).unwrap();
+        let rx = sse_channel(resp);
+        drop(rx);   // nobody is listening any more
+        // The reader lets go of the connection instead of reading the rest
+        // of the stream — the server sees the client go away.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !gone.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the reader kept reading the stream");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_cancellation_during_the_backoff_stops_the_retry() {
+        // A 500 is transient: the transport would send the request again.
+        // The cancel lands inside the backoff window instead, so the
+        // retry never goes out and the first failure is what comes back.
+        let token = CancelToken::new();
+        let (port, reqs) = mock_seq(vec![
+            (500, r#"{"error":{"message":"the server is on fire"}}"#.into()),
+            (200, r#"{"choices":[{"message":{"content":"never reached"}}],"usage":{}}"#.into()),
+        ]);
+        let t = token.clone();
+        let seen = reqs.clone();
+        let gave_up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = gave_up.clone();
+        let mut c = cfg(format!("http://127.0.0.1:{port}"), false);
+        c.protocol = Protocol::ZAI;
+        let err = block_on(async move {
+            tokio::spawn(async move {
+                // The request went out (the mock has it), so the answer is
+                // on its way and the client is about to sleep in the
+                // backoff. The wait is for the fact, not the clock — and
+                // it is bounded: a mock that never sees the request must
+                // fail this test, not hang it.
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while seen.lock().unwrap().is_empty() {
+                    if std::time::Instant::now() > deadline {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        t.cancel();
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                // The 500 is on the wire by the time the mock logs the
+                // request, so the client is a moment away from reading it
+                // and falling into the 500 ms backoff. The cancel has to
+                // land in that window: before it the request is
+                // interrupted instead, after it the retry goes out.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                t.cancel();
+            });
+            chat_blocking(&c, json!({}), |v| chat_to_internal(v, super::zai::usage), &token, &sink()).await
+        }).unwrap_err();
+        assert!(!gave_up.load(std::sync::atomic::Ordering::SeqCst),
+            "the mock never saw the request — the test's premise is gone");
+        assert_eq!(err.to_string(), r#"api 500: {"error":{"message":"the server is on fire"}}"#,
+            "the first failure is what comes back, in the wire's own words");
+        assert_eq!(reqs.lock().unwrap().len(), 1, "the retry never went out");
     }
 }

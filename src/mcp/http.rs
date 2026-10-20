@@ -400,7 +400,7 @@ impl Sse {
 mod tests {
     use super::*;
     use serde_json::json;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const BUDGET: Duration = Duration::from_secs(5);
@@ -738,5 +738,305 @@ mod tests {
         assert_eq!(first_line(""), "with no explanation");
         let long = first_line(&"x".repeat(500));
         assert_eq!(long.chars().count(), 201, "cut with a mark: {long}");
+    }
+
+    /// An endpoint says where it calls in a test's own output: the url and
+    /// the header names, rather than the header values.
+    #[test]
+    fn an_endpoint_says_where_it_calls_in_a_test_output() {
+        let config: ServerConfig = serde_json::from_value(json!({
+            "url": "https://example.test/mcp",
+            "headers": {"authorization": "Bearer t"}
+        }))
+        .unwrap();
+        let http = Http::new(&config).unwrap();
+        let shown = format!("{http:?}");
+        assert!(shown.contains("https://example.test/mcp"), "{shown}");
+        assert!(shown.contains("authorization"), "{shown}");
+        assert!(!shown.contains("Bearer t"), "the value is not shown: {shown}");
+    }
+
+    /// An endpoint nobody is listening on is an endpoint that cannot be
+    /// called, and the client says so in its own words.
+    #[tokio::test]
+    async fn a_request_to_an_endpoint_that_is_not_there_says_so() {
+        // Port 1: nothing listens on it, and nothing can.
+        let config: ServerConfig =
+            serde_json::from_value(json!({"url": "http://127.0.0.1:1/mcp"})).unwrap();
+        let http = Http::new(&config).unwrap();
+        let failed = http.ask("tools/list", json!({}), BUDGET).await.unwrap_err();
+        assert!(failed.contains("the request failed"), "{failed}");
+    }
+
+    /// The answer to a server's own question is a message like any other:
+    /// when it cannot be sent, the failure is a sentence.
+    #[tokio::test]
+    async fn a_reply_to_a_server_that_asked_cannot_be_sent_says_so() {
+        let config: ServerConfig =
+            serde_json::from_value(json!({"url": "http://127.0.0.1:1/mcp"})).unwrap();
+        let http = Http::new(&config).unwrap();
+        let failed = http
+            .post_notification(&json!({"jsonrpc": "2.0", "id": "s1", "result": {}}))
+            .await
+            .unwrap_err();
+        assert!(failed.contains("the request failed"), "{failed}");
+    }
+
+    /// An answer that is not JSON is a broken server, and the client says
+    /// so rather than handing back nothing.
+    #[tokio::test]
+    async fn an_answer_that_is_not_json_says_so() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json at all"))
+            .mount(&server)
+            .await;
+        let http = endpoint(&server, json!({}));
+        let failed = http.ask("tools/list", json!({}), BUDGET).await.unwrap_err();
+        assert!(failed.contains("not JSON"), "{failed}");
+    }
+
+    /// A frame that is not a message is read past: the stream is the
+    /// server's, and the answer may still be on its way.
+    #[tokio::test]
+    async fn a_frame_that_is_not_a_message_is_read_past() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: not a message at all\n\n\
+                 data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n",
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+        let http = endpoint(&server, json!({}));
+        let answer = http.ask("tools/list", json!({}), BUDGET).await.unwrap();
+        assert_eq!(answer["ok"], json!(true));
+    }
+
+    /// A handshake that comes back as a stream settles the version just as
+    /// one that comes back as a body does, and the version settled is the
+    /// one every later request announces.
+    #[tokio::test]
+    async fn the_version_a_streamed_handshake_settles_on_is_announced_afterwards() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(sse_answer(&[json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": {"protocolVersion": "2025-03-26"}
+            })]))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(json_answer(json!({"jsonrpc": "2.0", "id": 2, "result": {}})))
+            .mount(&server)
+            .await;
+        let http = endpoint(&server, json!({}));
+        http.ask("initialize", json!({}), BUDGET).await.unwrap();
+        http.ask("tools/list", json!({}), BUDGET).await.unwrap();
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(
+            sent[1].headers.get("mcp-protocol-version").unwrap(),
+            "2025-03-26",
+            "the version the handshake settled on is the one announced after"
+        );
+    }
+
+    /// A handshake that comes back as a stream and names no version leaves
+    /// the version this client asked for: the server said nothing about a
+    /// version, so nothing is announced in its place.
+    #[tokio::test]
+    async fn a_streamed_handshake_that_names_no_version_keeps_the_one_asked_for() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(sse_answer(&[json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": {"serverInfo": {"name": "http stub", "version": "1"}}
+            })]))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(json_answer(json!({"jsonrpc": "2.0", "id": 2, "result": {}})))
+            .mount(&server)
+            .await;
+        let http = endpoint(&server, json!({}));
+        http.ask("initialize", json!({}), BUDGET).await.unwrap();
+        http.ask("tools/list", json!({}), BUDGET).await.unwrap();
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(
+            sent[1].headers.get("mcp-protocol-version").unwrap(),
+            wire::PROTOCOL_VERSION,
+            "the version this client asked for is the one announced after"
+        );
+    }
+
+    /// A server that names no session is a server this client talks to
+    /// without one: nothing is carried, and nothing is invented.
+    #[tokio::test]
+    async fn a_server_that_names_no_session_is_talked_to_without_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"id": 1})))
+            .respond_with(json_answer(json!({"jsonrpc": "2.0", "id": 1, "result": {}})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"id": 2})))
+            .respond_with(json_answer(json!({"jsonrpc": "2.0", "id": 2, "result": {}})))
+            .mount(&server)
+            .await;
+        let http = endpoint(&server, json!({}));
+        http.ask("initialize", json!({}), BUDGET).await.unwrap();
+        http.ask("tools/list", json!({}), BUDGET).await.unwrap();
+        let sent = server.received_requests().await.unwrap();
+        assert!(sent[0].headers.get("mcp-session-id").is_none());
+        assert!(sent[1].headers.get("mcp-session-id").is_none());
+    }
+
+    /// A notification the server answers with a stream is a notification it
+    /// took: the stream carries what it had to say, and the client waits
+    /// for nothing.
+    #[tokio::test]
+    async fn a_notification_the_server_answers_with_a_stream_is_taken_as_answered() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(sse_answer(&[json!({
+                "jsonrpc": "2.0", "method": "notifications/message"
+            })]))
+            .mount(&server)
+            .await;
+        let http = endpoint(&server, json!({}));
+        http.tell("notifications/initialized", json!({}))
+            .await
+            .expect("the notification was taken");
+        // and it really went out: a `tell` that took nothing would leave
+        // the server waiting for a client that never said hello.
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1, "the notification reached the server: {sent:?}");
+        let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(body["method"], json!("notifications/initialized"));
+    }
+
+    /// The answer to a server's own question carries what every other
+    /// request carries: the session and the headers the entry asked for.
+    #[tokio::test]
+    async fn the_reply_to_a_server_that_asked_carries_the_session_and_the_headers() {
+        let server = MockServer::start().await;
+        // The reply to the server's own question: it is a message of its
+        // own, and it is told apart by the id it answers.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"id": "s1"})))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(sse_answer(&[
+                json!({"jsonrpc": "2.0", "id": "s1", "method": "ping"}),
+                json!({"jsonrpc": "2.0", "id": 2, "result": {"ok": true}}),
+            ]))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                json_answer(json!({"jsonrpc": "2.0", "id": 1, "result": {}}))
+                    .insert_header("mcp-session-id", "sess-9"),
+            )
+            .mount(&server)
+            .await;
+        let http = endpoint(&server, json!({"headers": {"authorization": "Bearer t"}}));
+        http.ask("initialize", json!({}), BUDGET).await.unwrap();
+        let answer = http.ask("tools/list", json!({}), BUDGET).await.unwrap();
+        assert_eq!(answer["ok"], json!(true));
+        let sent = server.received_requests().await.unwrap();
+        let reply = &sent[2];
+        assert_eq!(reply.headers.get("mcp-session-id").unwrap(), "sess-9");
+        assert_eq!(reply.headers.get("authorization").unwrap(), "Bearer t");
+    }
+
+    /// A server that refuses the answer to its own question does not break
+    /// the request that is still on its way: the answer still comes back.
+    #[tokio::test]
+    async fn a_server_that_refuses_the_reply_to_its_own_request_still_gets_its_answer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"id": "s1"})))
+            .respond_with(ResponseTemplate::new(500).set_body_string("no"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(sse_answer(&[
+                json!({"jsonrpc": "2.0", "id": "s1", "method": "ping"}),
+                json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}),
+            ]))
+            .mount(&server)
+            .await;
+        let http = endpoint(&server, json!({}));
+        let answer = http.ask("tools/list", json!({}), BUDGET).await.unwrap();
+        assert_eq!(answer["ok"], json!(true), "the request was answered anyway");
+    }
+
+    /// A session id the server sent that cannot be read as text is a
+    /// session this client cannot use, and the client says so.
+    #[tokio::test]
+    async fn a_session_id_the_server_sent_that_cannot_be_read_says_so() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                json_answer(json!({"jsonrpc": "2.0", "id": 1, "result": {}}))
+                    .insert_header("mcp-session-id", "s\u{e9}"),
+            )
+            .mount(&server)
+            .await;
+        let http = endpoint(&server, json!({}));
+        let failed = http.ask("initialize", json!({}), BUDGET).await.unwrap_err();
+        assert!(
+            failed.contains("the session id the server sent cannot be read"),
+            "{failed}"
+        );
+    }
+
+    /// A stream that is cut in the middle is a broken stream, and the
+    /// client says so rather than reading what arrived as if it were the
+    /// whole thing.
+    #[tokio::test]
+    async fn a_stream_that_is_cut_in_the_middle_says_so() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            // The head promises more than the body carries, and the frame
+            // it does carry is not finished: no answer is in it.
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Content-Length: 400\r\n\r\n\
+                      data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}",
+                )
+                .await;
+            let _ = socket.flush().await;
+            // And then the connection ends before the promised bytes arrive.
+            drop(socket);
+        });
+        let config: ServerConfig =
+            serde_json::from_value(json!({"url": format!("http://127.0.0.1:{port}/mcp")})).unwrap();
+        let http = Http::new(&config).unwrap();
+        let failed = http.ask("tools/list", json!({}), BUDGET).await.unwrap_err();
+        assert!(
+            failed.contains("reading the server's stream failed"),
+            "{failed}"
+        );
     }
 }

@@ -1077,4 +1077,127 @@ mod tests {
         );
         hub.shutdown().await;
     }
+
+    // ---- the hub's own failures --------------------------------------------
+
+    /// A hub whose actor goes away while commands are still waiting in its
+    /// mailbox drops their replies. The callers are told so, rather than
+    /// waiting for an answer that is never coming.
+    #[tokio::test]
+    async fn a_hub_that_goes_away_while_commands_are_waiting_says_the_reply_was_dropped() {
+        let (stub, entry) = gated_stub("stub");
+        let hub = Hub::of_entries(vec![entry]).await;
+
+        // A call is in flight, and its server is busy: the actor cannot
+        // finish a shutdown until that call comes back.
+        let held = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.call("mcp__stub__gate", r#"{"text":"held"}"#).await }
+        });
+        assert!(
+            stub.wait_for(r#""method":"tools/call""#).await,
+            "the call reached its server"
+        );
+
+        // The shutdown is queued first — the mailbox is first in, first out,
+        // so the actor takes it and waits for the busy server to stop.
+        let (reply, waiting) = oneshot::channel();
+        hub.tx.send(Command::Shutdown { reply }).unwrap();
+
+        // These two are queued behind the shutdown. The actor is busy, so
+        // they wait in the mailbox.
+        let call = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.call("mcp__stub__echo", "{}").await }
+        });
+        let op = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.enable("stub").await }
+        });
+        // Let both reach the mailbox before the actor is let go.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // The gate opens: the held call comes back, the server stops, the
+        // actor finishes its shutdown and goes away — with two commands
+        // still in its mailbox.
+        std::fs::write(stub.gate(), "open").unwrap();
+        assert_eq!(held.await.unwrap(), "called with {text:held}");
+        waiting.await.unwrap();
+
+        assert_eq!(call.await.unwrap(), "error: mcp hub dropped the reply");
+        assert_eq!(
+            op.await.unwrap().unwrap_err(),
+            "mcp hub dropped the reply"
+        );
+    }
+
+    /// A hub that is already shut down is shut down again without waiting:
+    /// there is no actor left to answer, and nothing to wait for.
+    #[tokio::test]
+    async fn shutting_down_a_hub_that_is_already_shut_down_returns_at_once() {
+        let hub = Hub::empty();
+        hub.shutdown().await;
+        // The actor is gone when it lets go of the mailbox — and the
+        // sender can be *asked* about that, so the second shutdown
+        // provably finds no actor instead of racing one. The wait is
+        // for the fact, with a deadline.
+        let gone = timeout(Duration::from_secs(5), async {
+            while !hub.tx.is_closed() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(gone.is_ok(), "the actor let go of the mailbox");
+        let second = timeout(Duration::from_secs(5), hub.shutdown()).await;
+        assert!(second.is_ok(), "the second shutdown returned rather than waiting");
+        // And the hub is still shut down.
+        assert_eq!(
+            hub.call("mcp__nope__nada", "{}").await,
+            "error: mcp hub is shut down"
+        );
+    }
+
+    /// A reconnect to a server that cannot be reached fails it, and the
+    /// next call to that server says what the failure was.
+    #[tokio::test]
+    async fn a_reconnect_to_a_server_that_cannot_be_reached_fails_it() {
+        let stub = Stub::new();
+        let hub = Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
+        // The hub is ready when its server has come up: the actor connects
+        // before it takes any command.
+        assert_eq!(hub.definitions().await.len(), 1, "the server came up");
+        // The script is gone: the server cannot be started any more.
+        std::fs::remove_file(stub.script()).unwrap();
+        let err = hub.reconnect("stub").await.unwrap_err();
+        assert_eq!(err, "mcp server stub failed to reconnect");
+        // The server is failed now, and a call to it says so.
+        let out = hub.call("mcp__stub__echo", "{}").await;
+        assert!(out.starts_with("error: mcp server stub could not run echo"), "{out}");
+        hub.shutdown().await;
+    }
+
+    /// A server whose connection was closed but whose configuration is
+    /// untouched is brought back by a reconnect, not by an enable: the
+    /// refusal says which one to use.
+    #[tokio::test]
+    async fn enabling_a_disconnected_server_says_to_reconnect_it_instead() {
+        let stub = Stub::new();
+        let hub = Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
+        hub.disconnect("stub").await.unwrap();
+        let err = hub.enable("stub").await.unwrap_err();
+        assert_eq!(err, "mcp server stub is disconnected; reconnect instead");
+        hub.shutdown().await;
+    }
+
+    /// A tool that takes its own server down is answered with the reason
+    /// the call could not be run: the model is told which server failed.
+    #[tokio::test]
+    async fn a_tool_that_kills_its_server_says_the_server_could_not_run_it() {
+        let stub = Stub::new();
+        let hub = Hub::of_entries(vec![stub.entry(&[("STUB_TOOLS", "die")])]).await;
+        let out = hub.call("mcp__stub__die", "{}").await;
+        assert!(out.starts_with("error: mcp server stub could not run die"), "{out}");
+        hub.shutdown().await;
+    }
 }

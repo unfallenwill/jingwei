@@ -214,4 +214,15 @@ mod tests {
         assert_eq!(shown.input, 6);
         assert_eq!(shown.cache_read, 4);
     }
+
+    #[test]
+    fn the_effort_word_names_every_tier_in_the_wires_own_words() {
+        // zai's vocabulary is low/high/max — there is no "medium" on this
+        // wire, and the middle tier folds into the one the vendor maps
+        // it to.
+        assert_eq!(super::effort_word(Effort::Low), "low");
+        assert_eq!(super::effort_word(Effort::Medium), "high", "medium folds into high");
+        assert_eq!(super::effort_word(Effort::High), "high");
+        assert_eq!(super::effort_word(Effort::Max), "max");
+    }
 }

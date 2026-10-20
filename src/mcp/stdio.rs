@@ -584,4 +584,295 @@ mod tests {
         let refused = sink.send(&json!({"jsonrpc": "2.0"})).await.unwrap_err();
         assert!(refused.contains("input is closed"), "{refused}");
     }
+
+    /// A reader that fails the way a pipe that breaks does.
+    struct Broken;
+
+    impl tokio::io::AsyncRead for Broken {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "the pipe broke",
+            )))
+        }
+    }
+
+    impl tokio::io::AsyncBufRead for Broken {
+        fn poll_fill_buf(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<&[u8]>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "the pipe broke",
+            )))
+        }
+
+        fn consume(self: std::pin::Pin<&mut Self>, _amount: usize) {}
+    }
+
+    /// A writer that takes the bytes and then fails to flush: the message
+    /// was written, and the connection is over anyway.
+    struct FailsToFlush;
+
+    impl tokio::io::AsyncWrite for FailsToFlush {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "the pipe is jammed",
+            )))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A message that was written but could not be flushed is a message
+    /// that did not arrive: the connection is over, and it says so.
+    #[tokio::test]
+    async fn a_message_that_cannot_be_flushed_says_so() {
+        let sink = Sink::new(FailsToFlush);
+        let refused = sink.send(&json!({"jsonrpc": "2.0"})).await.unwrap_err();
+        assert!(refused.contains("writing to the server failed"), "{refused}");
+    }
+
+    /// A transport with no server behind it: the pipes are the test's own,
+    /// and the child is a `sleep` that is killed when the transport goes.
+    fn transport(sink: Sink) -> Stdio {
+        let mut child = Command::new("bash")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .stdin(ProcessStdio::piped())
+            .stdout(ProcessStdio::piped())
+            .stderr(ProcessStdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let _ = child.stdin.take();
+        let _ = child.stdout.take();
+        Stdio {
+            sink,
+            pending: Pending::new(),
+            health: Health::new(),
+            child: Mutex::new(child),
+            noise: Arc::new(std::sync::Mutex::new(None)),
+            log: Arc::new(std::sync::Mutex::new(None)),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    /// A write to a server that is not there any more is a failure, and it
+    /// says so rather than pretending the message went out.
+    #[tokio::test]
+    async fn a_write_to_a_server_that_is_gone_says_so() {
+        let (writer, reader) = duplex(1024);
+        // Nobody reads the other end: the pipe is broken.
+        drop(reader);
+        let sink = Sink::new(writer);
+        let refused = sink.send(&json!({"jsonrpc": "2.0"})).await.unwrap_err();
+        assert!(refused.contains("writing to the server failed"), "{refused}");
+    }
+
+    /// A request that cannot be written is a request that was never made,
+    /// and the connection is over: the write is the first thing to fail.
+    #[tokio::test]
+    async fn a_request_to_a_server_that_is_gone_says_so() {
+        let (writer, reader) = duplex(1024);
+        drop(reader);
+        let stdio = transport(Sink::new(writer));
+        let refused = stdio
+            .ask("tools/list", json!({}), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("writing to the server failed"), "{refused}");
+        assert!(!stdio.health.alive(), "the connection is over");
+        assert!(
+            stdio.health.why().contains("writing to the server failed"),
+            "{}",
+            stdio.health.why()
+        );
+    }
+
+    /// A request whose waiter is gone — the caller gave up on it — leaves
+    /// the client with nothing to say but that the connection is closed.
+    #[tokio::test]
+    async fn a_request_whose_waiter_is_forgotten_says_the_connection_is_closed() {
+        let (writer, reader) = duplex(1024);
+        // The server's end of the pipe is read and thrown away: the request
+        // goes out, and nobody answers it.
+        tokio::spawn(async move {
+            let mut reader = reader;
+            let mut buf = [0u8; 1024];
+            while reader.read(&mut buf).await.unwrap_or(0) > 0 {}
+        });
+        let stdio = std::sync::Arc::new(transport(Sink::new(writer)));
+        let asking = tokio::spawn({
+            let stdio = stdio.clone();
+            async move { stdio.ask("tools/list", json!({}), Duration::from_secs(30)).await }
+        });
+        // The request is out and the client is waiting for it.
+        let pending = stdio.pending.clone();
+        tokio::spawn(async move {
+            while pending.0.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            pending.forget(1).await;
+        });
+        let refused = asking.await.unwrap().unwrap_err();
+        assert_eq!(refused, "the connection is closed");
+    }
+
+    /// A notification to a server that has gone is refused with the reason
+    /// the connection ended, not with a fresh failure of its own.
+    #[tokio::test]
+    async fn a_notification_to_a_server_that_has_gone_says_why() {
+        let stub = crate::mcp::stub::Stub::new();
+        let config = stub.config(&[("STUB_TOOLS", "die")]);
+        let stdio = Stdio::spawn(&config).unwrap();
+        // The tool the server dies for. The transport carries the name in
+        // the parameters, the way the protocol layer sends it.
+        let died = stdio
+            .ask("tools/call", json!({"name": "die", "arguments": {}}), Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(died.contains("closed its output"), "{died}");
+        // And a notification to it now says the connection is over.
+        let refused = stdio
+            .tell("notifications/initialized", json!({}))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("closed its output"), "{refused}");
+    }
+
+    /// A server that says something on its error stream and then says
+    /// nothing at all is a server a request runs out of time on, and the
+    /// sentence about the timeout says what the server last said.
+    #[tokio::test]
+    async fn a_request_that_runs_out_of_time_says_what_the_server_last_logged() {
+        let dir = crate::test_util::temp_dir("stdio_log_only");
+        let script = dir.join("server.sh");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env bash\necho 'the server is thinking' >&2\nsleep 30\n",
+        )
+        .unwrap();
+        let config = ServerConfig {
+            command: Some("bash".into()),
+            args: vec![script.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let stdio = Stdio::spawn(&config).unwrap();
+        // The sentence is about something the server really said.
+        for _ in 0..500 {
+            if stdio.log.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let refused = stdio
+            .ask("tools/list", json!({}), Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("no answer to tools/list within 1s"), "{refused}");
+        assert!(
+            refused.contains("the server last logged: the server is thinking"),
+            "{refused}"
+        );
+    }
+
+    /// A server that writes a banner where a message belongs and says
+    /// something on its error stream is a server with two voices, and the
+    /// sentence about the timeout names both.
+    #[tokio::test]
+    async fn a_request_that_runs_out_of_time_says_what_the_server_last_wrote() {
+        let dir = crate::test_util::temp_dir("stdio_log_and_noise");
+        let script = dir.join("server.sh");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env bash\necho 'Stub MCP server ready.'\necho 'the server is thinking' >&2\nsleep 30\n",
+        )
+        .unwrap();
+        let config = ServerConfig {
+            command: Some("bash".into()),
+            args: vec![script.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let stdio = Stdio::spawn(&config).unwrap();
+        for _ in 0..500 {
+            if stdio.log.lock().unwrap().is_some() && stdio.noise.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let refused = stdio
+            .ask("tools/list", json!({}), Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("no answer to tools/list within 1s"), "{refused}");
+        assert!(
+            refused.contains("the server last logged: the server is thinking"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("it last wrote: Stub MCP server ready."),
+            "{refused}"
+        );
+    }
+
+    /// A server whose output cannot be read is a server that is not there
+    /// any more, and the connection says so.
+    #[tokio::test]
+    async fn a_server_whose_output_cannot_be_read_ends_the_connection() {
+        let health = Health::new();
+        let (writer, _reader) = duplex(1024);
+        // The pump ends when the reader fails, so awaiting it is the fact.
+        pump(
+            BufReader::new(Broken),
+            Sink::new(writer),
+            Pending::new(),
+            Arc::clone(&health),
+            Arc::new(std::sync::Mutex::new(None)),
+        )
+        .await;
+        assert!(!health.alive(), "the connection is over");
+        assert!(
+            health.why().contains("reading the server's output failed"),
+            "{}",
+            health.why()
+        );
+    }
+
+    /// A blank line on the server's error stream is not the last thing it
+    /// said: the line after it is.
+    #[tokio::test]
+    async fn a_blank_line_a_server_logs_is_not_the_last_thing_it_said() {
+        let (mut writer, reader) = duplex(1024);
+        let log = Arc::new(std::sync::Mutex::new(None));
+        let keeper = log.clone();
+        let reading = tokio::spawn(log_lines(BufReader::new(reader), keeper));
+        writer.write_all(b"first line\n   \nsecond line\n").await.unwrap();
+        // The error stream ends: the reader is done.
+        writer.shutdown().await.unwrap();
+        reading.await.unwrap();
+        assert_eq!(log.lock().unwrap().as_deref(), Some("second line"));
+    }
 }

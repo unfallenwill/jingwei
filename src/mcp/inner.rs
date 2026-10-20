@@ -999,3 +999,564 @@ fn short_hash(text: &str) -> String {
     }
     format!("{:08x}", hash & 0xffff_ffff)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::stub::Stub;
+
+    /// A registry over the entries given, and the mailbox its servers report
+    /// through. The actor is not built: the registry answers on its own, and
+    /// a server's task only writes to the mailbox.
+    async fn registry(entries: Vec<Entry>) -> (HubInner, mpsc::UnboundedReceiver<Command>) {
+        let (actor, reports) = mpsc::unbounded_channel();
+        let inner = HubInner::from_entries(entries, Vec::new(), actor).await;
+        (inner, reports)
+    }
+
+    /// A connection that came up, with what it has to say.
+    fn adoption(notes: Vec<String>) -> Adoption {
+        Adoption {
+            identity: "stub 0.0.0".into(),
+            protocol: "2025-06-18".into(),
+            tools: Vec::new(),
+            notes,
+        }
+    }
+
+    /// Stop a server's task and wait for it to be gone, so that the queue
+    /// it took its work from is closed.
+    async fn stop_the_task(inner: &HubInner, name: &str) {
+        let (done, waiting) = oneshot::channel();
+        inner.servers[name].queue.send(ServerMsg::Stop { done }).unwrap();
+        waiting.await.unwrap();
+    }
+
+    /// A server that came up is named in the notes, with the number of
+    /// tools the session is being offered.
+    #[tokio::test]
+    async fn a_server_that_came_up_is_named_in_the_notes_with_its_tool_count() {
+        let stub = Stub::new();
+        let (inner, _reports) = registry(vec![stub.entry(&[("STUB_TOOLS", "echo,fail")])]).await;
+        let notes = inner.notes();
+        assert!(
+            notes.contains(&"mcp: stub · 2 tools · /mcp names them".to_string()),
+            "{notes:?}"
+        );
+    }
+
+    /// A server that is disconnected is listed as disconnected: the list
+    /// says what state the server stands in.
+    #[tokio::test]
+    async fn a_server_that_is_disconnected_is_listed_as_disconnected() {
+        let stub = Stub::new();
+        let (mut inner, _reports) = registry(vec![stub.entry(&[])]).await;
+        let (tx, rx) = oneshot::channel();
+        inner.server_op(ServerOp::Disconnect, "stub", tx);
+        rx.await.unwrap().unwrap();
+        let statuses = inner.list();
+        assert_eq!(statuses.len(), 1, "{statuses:?}");
+        assert_eq!(statuses[0].state, ServerState::Disconnected, "{statuses:?}");
+        assert_eq!(statuses[0].tools_count, 0, "{statuses:?}");
+    }
+
+    /// A server that was taken out of service on purpose is named as such:
+    /// disabled and disconnected are different things and say so.
+    #[tokio::test]
+    async fn a_server_that_was_disabled_is_named_in_the_notes() {
+        let stub = Stub::new();
+        let (mut inner, _reports) = registry(vec![stub.entry(&[])]).await;
+        let (tx, rx) = oneshot::channel();
+        inner.server_op(ServerOp::Disable, "stub", tx);
+        rx.await.unwrap().unwrap();
+        let notes = inner.notes();
+        assert!(notes.contains(&"mcp: stub is disabled".to_string()), "{notes:?}");
+    }
+
+    /// The same for a server whose connection was closed but whose
+    /// configuration was left alone.
+    #[tokio::test]
+    async fn a_server_that_was_disconnected_is_named_in_the_notes() {
+        let stub = Stub::new();
+        let (mut inner, _reports) = registry(vec![stub.entry(&[])]).await;
+        let (tx, rx) = oneshot::channel();
+        inner.server_op(ServerOp::Disconnect, "stub", tx);
+        rx.await.unwrap().unwrap();
+        let notes = inner.notes();
+        assert!(notes.contains(&"mcp: stub is disconnected".to_string()), "{notes:?}");
+    }
+
+    /// What a server said on the way in is carried into the notes and into
+    /// the report, under the server's own name.
+    #[tokio::test]
+    async fn what_the_server_said_on_the_way_in_is_carried_into_the_notes_and_the_report() {
+        let stub = Stub::new();
+        let (inner, _reports) =
+            registry(vec![stub.entry(&[("STUB_TOOLS", "echo"), ("STUB_JUNK", "1")])]).await;
+        let notes = inner.notes();
+        assert!(
+            notes.iter().any(|line| line
+                == "mcp: stub: an entry in its tool list is not a tool and was left out: \
+                   {\"description\":\"a tool with no name\"}"),
+            "{notes:?}"
+        );
+        let report = inner.report();
+        assert!(
+            report.iter().any(|line| line
+                == "warning: stub: an entry in its tool list is not a tool and was left out: \
+                   {\"description\":\"a tool with no name\"}"),
+            "{report:?}"
+        );
+    }
+
+    /// The report shows the first dozen tools of a server and says how many
+    /// more there are.
+    #[tokio::test]
+    async fn a_server_with_more_tools_than_the_report_shows_says_how_many_more() {
+        let stub = Stub::new();
+        let tools: Vec<String> = (1..=15).map(|n| format!("t{n}")).collect();
+        let (inner, _reports) =
+            registry(vec![stub.entry(&[("STUB_TOOLS", &tools.join(","))])]).await;
+        let report = inner.report();
+        let line = report
+            .iter()
+            .find(|line| line.starts_with("  mcp__stub__t1,"))
+            .expect("the report lists the tools");
+        assert!(line.ends_with("mcp__stub__t12 (and 3 more)"), "{line}");
+    }
+
+    /// Two tools of one server that would carry the same public name: the
+    /// first is offered, the second is left out and the collision is said.
+    #[tokio::test]
+    async fn two_tools_that_would_carry_one_name_leave_the_second_one_out() {
+        let stub = Stub::new();
+        let (inner, _reports) =
+            registry(vec![stub.entry(&[("STUB_TOOLS", "x.y,x/y")])]).await;
+        let definitions = inner.definitions();
+        assert_eq!(definitions.len(), 1, "{definitions:?}");
+        assert_eq!(definitions[0]["name"], json!("mcp__stub__x_y"));
+        let report = inner.report();
+        assert!(
+            report.iter().any(|line| line
+                == "warning: mcp__stub__x_y: two tools would carry this name, so the one from \
+                   stub is not offered"),
+            "{report:?}"
+        );
+    }
+
+    /// A call to a server that failed says what the failure was: the model
+    /// is told which server could not run the call, and why.
+    #[tokio::test]
+    async fn a_call_to_a_server_that_failed_says_what_the_failure_was() {
+        let stub = Stub::new();
+        let (mut inner, _reports) = registry(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
+        inner.servers.get_mut("stub").unwrap().state =
+            InternalState::Failed("the server did not start".into());
+        let (tx, rx) = oneshot::channel();
+        inner.route_call("mcp__stub__echo", "{}", tx);
+        assert_eq!(
+            rx.await.unwrap(),
+            "error: mcp server stub could not run echo: the server did not start"
+        );
+    }
+
+    /// A call for a server whose task has gone is answered: a call that is
+    /// dropped looks to the model like a tool that returned nothing.
+    #[tokio::test]
+    async fn a_call_to_a_server_whose_task_is_gone_says_it_is_not_connected() {
+        let stub = Stub::new();
+        let (inner, _reports) = registry(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
+        stop_the_task(&inner, "stub").await;
+        let (tx, rx) = oneshot::channel();
+        inner.route_call("mcp__stub__echo", "{}", tx);
+        assert_eq!(rx.await.unwrap(), "error: mcp server stub is not connected");
+    }
+
+    /// A call for a tool whose server is not in the registry at all is
+    /// refused with the same sentence — the server is not connected.
+    #[tokio::test]
+    async fn a_call_to_a_tool_of_a_server_that_is_no_longer_there_says_it_is_not_connected() {
+        let stub = Stub::new();
+        let (mut inner, _reports) = registry(vec![stub.entry(&[("STUB_TOOLS", "echo")])]).await;
+        inner.servers.remove("stub");
+        let (tx, rx) = oneshot::channel();
+        inner.route_call("mcp__stub__echo", "{}", tx);
+        assert_eq!(rx.await.unwrap(), "error: mcp server stub is not connected");
+    }
+
+    /// A server whose configuration cannot be read cannot be enabled, and
+    /// the reason is the one the configuration gave.
+    #[tokio::test]
+    async fn a_server_whose_configuration_cannot_be_read_cannot_be_enabled() {
+        let stub = Stub::new();
+        let (mut inner, _reports) = registry(vec![stub.entry(&[])]).await;
+        let entry = inner.servers.get_mut("stub").unwrap();
+        entry.state = InternalState::Disabled;
+        entry.config = Err("no such binary".into());
+        let (tx, rx) = oneshot::channel();
+        inner.server_op(ServerOp::Enable, "stub", tx);
+        assert_eq!(
+            rx.await.unwrap().unwrap_err(),
+            "mcp server stub cannot be enabled: no such binary"
+        );
+    }
+
+    /// Enabling a server whose task has gone says it is not connected,
+    /// rather than leaving the request hanging.
+    #[tokio::test]
+    async fn enabling_a_server_whose_task_is_gone_says_it_is_not_connected() {
+        let stub = Stub::new();
+        let (mut inner, _reports) = registry(vec![stub.entry(&[])]).await;
+        inner.servers.get_mut("stub").unwrap().state = InternalState::Disabled;
+        stop_the_task(&inner, "stub").await;
+        let (tx, rx) = oneshot::channel();
+        inner.server_op(ServerOp::Enable, "stub", tx);
+        assert_eq!(rx.await.unwrap().unwrap_err(), "mcp server stub is not connected");
+    }
+
+    /// A server that is already disabled cannot be disabled again: the
+    /// refusal names the state it is in.
+    #[tokio::test]
+    async fn a_server_that_is_already_disabled_cannot_be_disabled_again() {
+        let stub = Stub::new();
+        let (mut inner, _reports) = registry(vec![stub.entry(&[])]).await;
+        {
+            let (tx, rx) = oneshot::channel();
+            inner.server_op(ServerOp::Disable, "stub", tx);
+            rx.await.unwrap().unwrap();
+        }
+        let (tx, rx) = oneshot::channel();
+        inner.server_op(ServerOp::Disable, "stub", tx);
+        assert_eq!(rx.await.unwrap().unwrap_err(), "mcp server stub is disabled");
+    }
+
+    /// The same for a server that is disconnected: it stays disconnected
+    /// until a reconnect brings it back.
+    #[tokio::test]
+    async fn a_server_that_is_already_disconnected_cannot_be_disconnected_again() {
+        let stub = Stub::new();
+        let (mut inner, _reports) = registry(vec![stub.entry(&[])]).await;
+        {
+            let (tx, rx) = oneshot::channel();
+            inner.server_op(ServerOp::Disconnect, "stub", tx);
+            rx.await.unwrap().unwrap();
+        }
+        let (tx, rx) = oneshot::channel();
+        inner.server_op(ServerOp::Disconnect, "stub", tx);
+        assert_eq!(rx.await.unwrap().unwrap_err(), "mcp server stub is disconnected");
+    }
+
+    /// Reconnecting a server whose task has gone says it is not connected.
+    #[tokio::test]
+    async fn reconnecting_a_server_whose_task_is_gone_says_it_is_not_connected() {
+        let stub = Stub::new();
+        let (mut inner, _reports) = registry(vec![stub.entry(&[])]).await;
+        stop_the_task(&inner, "stub").await;
+        let (tx, rx) = oneshot::channel();
+        inner.server_op(ServerOp::Reconnect, "stub", tx);
+        assert_eq!(rx.await.unwrap().unwrap_err(), "mcp server stub is not connected");
+    }
+
+    /// A connection that comes up with something to say has it remembered
+    /// under the server's own name.
+    #[tokio::test]
+    async fn a_connection_that_comes_up_with_something_to_say_has_it_remembered() {
+        let stub = Stub::new();
+        let (mut inner, _reports) = registry(vec![stub.entry(&[])]).await;
+        let (tx, rx) = oneshot::channel();
+        inner.finish_adopt(
+            "stub",
+            ServerOp::Reconnect,
+            0,
+            Ok(adoption(vec!["the server said a thing".into()])),
+            tx,
+        );
+        rx.await.unwrap().unwrap();
+        assert!(
+            inner.warnings.contains(&"stub: the server said a thing".to_string()),
+            "{:?}",
+            inner.warnings
+        );
+    }
+
+    /// An enable whose connection could not be opened leaves the server
+    /// disabled, and says what the failure was.
+    #[tokio::test]
+    async fn an_enable_whose_connection_could_not_be_opened_leaves_the_server_disabled() {
+        let stub = Stub::new();
+        let (mut inner, _reports) = registry(vec![stub.entry(&[])]).await;
+        inner.servers.get_mut("stub").unwrap().state = InternalState::Disabled;
+        let (tx, rx) = oneshot::channel();
+        inner.finish_adopt(
+            "stub",
+            ServerOp::Enable,
+            0,
+            Err("the server did not come up".into()),
+            tx,
+        );
+        assert_eq!(rx.await.unwrap().unwrap_err(), "the server did not come up");
+        assert!(matches!(
+            inner.servers["stub"].state,
+            InternalState::Disabled
+        ));
+    }
+
+    /// A reconnect whose connection could not be opened fails the server,
+    /// and says that it failed to reconnect.
+    #[tokio::test]
+    async fn a_reconnect_whose_connection_could_not_be_opened_fails_the_server() {
+        let stub = Stub::new();
+        let (mut inner, _reports) = registry(vec![stub.entry(&[])]).await;
+        let (tx, rx) = oneshot::channel();
+        inner.finish_adopt(
+            "stub",
+            ServerOp::Reconnect,
+            0,
+            Err("the server did not come up".into()),
+            tx,
+        );
+        assert_eq!(
+            rx.await.unwrap().unwrap_err(),
+            "mcp server stub failed to reconnect"
+        );
+        assert!(matches!(
+            &inner.servers["stub"].state,
+            InternalState::Failed(why) if why == "the server did not come up"
+        ));
+    }
+
+    /// A connection that comes up after the server it was opened for has
+    /// moved on is refused: the registry does not bring a server back
+    /// because a connection it had given up on came up late. The sentence
+    /// names what moved on and what was being done.
+    #[tokio::test]
+    async fn a_connection_that_comes_up_too_late_says_what_moved_on() {
+        for (state, moved_on) in [
+            (InternalState::Disabled, "was disabled"),
+            (InternalState::Disconnected, "was disconnected"),
+            (InternalState::Failed("it did not start".into()), "was changed"),
+        ] {
+            let stub = Stub::new();
+            let (mut inner, _reports) = registry(vec![stub.entry(&[])]).await;
+            inner.servers.get_mut("stub").unwrap().state = state;
+            let (tx, rx) = oneshot::channel();
+            inner.finish_adopt("stub", ServerOp::Reconnect, 7, Ok(adoption(Vec::new())), tx);
+            let refused = rx.await.unwrap().unwrap_err();
+            assert!(refused.contains(moved_on), "{refused}");
+            assert!(refused.contains("while it was reconnecting"), "{refused}");
+        }
+    }
+
+    /// The same refusal names the operation that was under way.
+    #[tokio::test]
+    async fn a_connection_that_comes_up_too_late_says_what_was_being_done() {
+        for (op, doing) in [
+            (ServerOp::Enable, "enabling"),
+            (ServerOp::Reconnect, "reconnecting"),
+            (ServerOp::Disable, "changing"),
+            (ServerOp::Disconnect, "changing"),
+        ] {
+            let stub = Stub::new();
+            let (mut inner, _reports) = registry(vec![stub.entry(&[])]).await;
+            inner.servers.get_mut("stub").unwrap().state = InternalState::Disabled;
+            let (tx, rx) = oneshot::channel();
+            inner.finish_adopt("stub", op, 7, Ok(adoption(Vec::new())), tx);
+            let refused = rx.await.unwrap().unwrap_err();
+            assert!(refused.contains("was disabled"), "{refused}");
+            assert!(refused.contains(&format!("while it was {doing}")), "{refused}");
+        }
+    }
+
+    /// A server that is not in the registry at all cannot be superseded by
+    /// anything: the connection that came up belongs to nobody.
+    #[tokio::test]
+    async fn a_connection_that_came_up_for_a_server_that_is_not_there_says_it_was_changed() {
+        let stub = Stub::new();
+        let (mut inner, _reports) = registry(vec![stub.entry(&[])]).await;
+        let (tx, rx) = oneshot::channel();
+        inner.finish_adopt("ghost", ServerOp::Reconnect, 0, Ok(adoption(Vec::new())), tx);
+        assert_eq!(
+            rx.await.unwrap().unwrap_err(),
+            "mcp server ghost was changed while it was reconnecting"
+        );
+    }
+
+    /// Shutting down a registry whose server task has already gone is not a
+    /// problem: there is nothing left to stop.
+    #[tokio::test]
+    async fn a_registry_whose_server_task_is_gone_stops_what_is_left() {
+        let stub = Stub::new();
+        let (mut inner, _reports) = registry(vec![stub.entry(&[])]).await;
+        stop_the_task(&inner, "stub").await;
+        inner.shutdown_all().await;
+        assert_eq!(inner.list().len(), 1, "the registry is still there to answer");
+    }
+
+    /// A call for a name nobody offers says what is on offer instead — the
+    /// first few names, and how many more there are.
+    #[tokio::test]
+    async fn a_call_for_a_name_nobody_offers_says_what_is_on_offer() {
+        let stub = Stub::new();
+        let tools: Vec<String> = (1..=15).map(|n| format!("t{n}")).collect();
+        let (inner, _reports) =
+            registry(vec![stub.entry(&[("STUB_TOOLS", &tools.join(","))])]).await;
+        let (tx, rx) = oneshot::channel();
+        inner.route_call("mcp__stub__nope", "{}", tx);
+        let said = rx.await.unwrap();
+        assert!(said.starts_with("error: no MCP tool named"), "{said}");
+        assert!(said.contains("mcp__stub__t1, mcp__stub__t2"), "{said}");
+        assert!(said.ends_with("mcp__stub__t12 (and 3 more)"), "{said}");
+    }
+
+    /// A call for a name nobody offers, in a registry whose tools all fit on
+    /// one line, says the tools there are — with nothing cut off.
+    #[tokio::test]
+    async fn a_call_for_a_name_nobody_offers_names_the_tools_that_fit() {
+        let stub = Stub::new();
+        let (inner, _reports) = registry(vec![stub.entry(&[("STUB_TOOLS", "echo,fail")])]).await;
+        let (tx, rx) = oneshot::channel();
+        inner.route_call("mcp__stub__nope", "{}", tx);
+        let said = rx.await.unwrap();
+        assert!(said.starts_with("error: no MCP tool named"), "{said}");
+        assert!(said.ends_with("mcp__stub__echo, mcp__stub__fail"), "{said}");
+        assert!(!said.contains("more"), "nothing was cut off: {said}");
+    }
+
+    /// A call for a name nobody offers, in a registry with no servers at
+    /// all, says that none came up.
+    #[tokio::test]
+    async fn a_call_for_a_name_nobody_offers_in_an_empty_registry_says_none_came_up() {
+        let inner = HubInner::empty();
+        let (tx, rx) = oneshot::channel();
+        inner.route_call("mcp__nope__nada", "{}", tx);
+        let said = rx.await.unwrap();
+        assert!(said.contains("none came up"), "{said}");
+    }
+
+    /// A server's task with no connection behind it answers a call by
+    /// saying that it is not connected.
+    #[tokio::test]
+    async fn a_server_task_with_no_connection_behind_it_says_it_is_not_connected() {
+        let (actor, _reports) = mpsc::unbounded_channel();
+        let queue = spawn_server("stub".into(), None, actor);
+        let (tx, rx) = oneshot::channel();
+        queue
+            .send(ServerMsg::Call(Call {
+                tool: "echo".into(),
+                arguments: json!({}),
+                reply: tx,
+            }))
+            .unwrap();
+        assert_eq!(rx.await.unwrap(), "error: mcp server stub is not connected");
+        let (done, waiting) = oneshot::channel();
+        queue.send(ServerMsg::Stop { done }).unwrap();
+        waiting.await.unwrap();
+    }
+
+    /// Retiring a server with no connection behind it leaves the task
+    /// standing: there was nothing to close, and the task is still there.
+    #[tokio::test]
+    async fn retiring_a_server_with_no_connection_leaves_the_task_standing() {
+        let (actor, _reports) = mpsc::unbounded_channel();
+        let queue = spawn_server("stub".into(), None, actor);
+        queue.send(ServerMsg::Retire).unwrap();
+        let (tx, rx) = oneshot::channel();
+        queue
+            .send(ServerMsg::Call(Call {
+                tool: "echo".into(),
+                arguments: json!({}),
+                reply: tx,
+            }))
+            .unwrap();
+        assert_eq!(rx.await.unwrap(), "error: mcp server stub is not connected");
+        let (done, waiting) = oneshot::channel();
+        queue.send(ServerMsg::Stop { done }).unwrap();
+        waiting.await.unwrap();
+    }
+
+    /// Retiring a server closes its connection: the task is asked to let go
+    /// of what it holds. The connection is taken — a call has nothing left
+    /// to call through — and the server's own input is closed under it.
+    #[tokio::test]
+    async fn retiring_a_server_closes_its_connection() {
+        let stub = Stub::new();
+        let connection = Connection::open(&stub.config(&[("STUB_TOOLS", "echo")])).await.unwrap();
+        let (actor, _reports) = mpsc::unbounded_channel();
+        let queue = spawn_server("stub".into(), Some(connection), actor);
+        queue.send(ServerMsg::Retire).unwrap();
+        // The connection is gone: a call now has nothing to call through.
+        let (tx, rx) = oneshot::channel();
+        queue
+            .send(ServerMsg::Call(Call {
+                tool: "echo".into(),
+                arguments: json!({}),
+                reply: tx,
+            }))
+            .unwrap();
+        assert_eq!(rx.await.unwrap(), "error: mcp server stub is not connected");
+        // and the server saw its input end — which is what a closed
+        // connection looks like from the other side.
+        let seen = stub.received();
+        assert!(seen.iter().any(|line| line == "eof"),
+            "the server's input ended: {seen:?}");
+        let (done, waiting) = oneshot::channel();
+        queue.send(ServerMsg::Stop { done }).unwrap();
+        waiting.await.unwrap();
+    }
+
+    /// What an entry says it is, for the report: the command line it runs,
+    /// the url it calls, or nothing at all.
+    #[test]
+    fn how_a_server_is_reached_is_said_as_it_is() {
+        let url = config::ServerConfig {
+            url: Some("https://example.test/mcp".into()),
+            ..Default::default()
+        };
+        assert_eq!(how_to_reach(&Ok(url)), "https://example.test/mcp");
+        let stdio = config::ServerConfig {
+            command: Some("npx".into()),
+            args: vec!["-y".into(), "a server".into()],
+            ..Default::default()
+        };
+        assert_eq!(how_to_reach(&Ok(stdio)), "stdio: npx -y \"a server\"");
+        let nothing = config::ServerConfig::default();
+        assert_eq!(how_to_reach(&Ok(nothing)), "nowhere");
+        assert_eq!(
+            how_to_reach(&Err("no such thing".into())),
+            "nothing usable in the entry"
+        );
+    }
+
+    /// A name longer than a backend will take keeps its front and ends with
+    /// a short hash of the whole — the same hash on every machine, forever,
+    /// because the name is written into the session log.
+    #[test]
+    fn a_name_too_long_for_a_backend_keeps_its_front_and_a_hash_of_the_rest() {
+        let long = "a".repeat(80);
+        let name = tool_name("server", &long);
+        assert_eq!(name.len(), MAX_NAME, "{name}");
+        let (front, hash) = name.rsplit_once('~').expect("the cut is marked");
+        assert_eq!(hash, "b3f3266c", "the hash of the whole name: {name}");
+        assert_eq!(front.len(), MAX_NAME - hash.len() - 1, "{name}");
+        assert!(front.starts_with("mcp__server__"), "{name}");
+    }
+
+    /// Two long names that are alike stay two names: the hash is what
+    /// keeps the cut from making them one.
+    #[test]
+    fn two_long_names_that_are_alike_stay_two_names() {
+        let long = "a".repeat(80);
+        let one = tool_name("server", &long);
+        let other = tool_name("server", &format!("{long}b"));
+        assert_ne!(one, other, "two names, not one: {one} and {other}");
+        assert_eq!(tool_name("server", &long), one, "the same name, the same way");
+    }
+
+    /// A name that carries what a function name may not is made safe: what
+    /// is not a letter, a digit, an underscore or a dash becomes one.
+    #[test]
+    fn a_name_that_carries_what_a_function_name_may_not_is_made_safe() {
+        assert_eq!(tool_name("a b", "c.d"), "mcp__a_b__c_d");
+        assert_eq!(tool_name("a-b", "c_d"), "mcp__a-b__c_d");
+    }
+}

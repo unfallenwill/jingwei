@@ -818,4 +818,204 @@ mod tests {
         assert_eq!(identity_of(&json!({"serverInfo": {"name": "s"}})), "s");
         assert_eq!(identity_of(&json!({})), "unnamed");
     }
+
+    /// A result cut at a byte that is in the middle of a character is cut
+    /// at the character boundary before it: a model never reads half a
+    /// character.
+    #[test]
+    fn a_cut_result_never_splits_a_character_in_half() {
+        // "aé" is three bytes: the é is two of them, so a cut at two lands
+        // in the middle of it.
+        let (text, cut) = truncate("aé", 2);
+        assert_eq!(text, "a", "the cut backs off to the character boundary");
+        assert!(cut, "the result was cut");
+        // A result that fits is not cut at all.
+        let (text, cut) = truncate("abc", 3);
+        assert_eq!(text, "abc");
+        assert!(!cut, "nothing was cut");
+    }
+
+    /// An entry that says how to reach a server in neither of the two ways
+    /// the protocol has is refused, and so is one that says both.
+    #[test]
+    fn an_entry_that_names_no_way_to_reach_a_server_is_refused() {
+        let Err(refused) = Transport::open(&ServerConfig::default()) else {
+            panic!("an entry with neither a command nor a url is refused");
+        };
+        assert!(refused.contains("neither"), "{refused}");
+        let both = ServerConfig {
+            command: Some("npx".into()),
+            url: Some("https://example.test/mcp".into()),
+            ..Default::default()
+        };
+        let Err(refused) = Transport::open(&both) else {
+            panic!("an entry with both a command and a url is refused");
+        };
+        assert!(refused.contains("both a command and a url"), "{refused}");
+    }
+
+    /// A server spoken to over HTTP is a server like any other: the
+    /// handshake settles the version, and the tools it lists are the tools
+    /// the model is offered.
+    #[tokio::test]
+    async fn a_server_spoken_to_over_http_offers_its_tools() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // The mocks are matched in the order they are mounted, and each one
+        // says which request it is the answer to.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"id": 1, "method": "initialize"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": {
+                    "protocolVersion": wire::PROTOCOL_VERSION,
+                    "serverInfo": {"name": "http stub", "version": "1"},
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"id": 2, "method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": {"tools": [{
+                    "name": "echo",
+                    "description": "the echo tool",
+                    "inputSchema": {"type": "object"},
+                }]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "notifications/initialized"})))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        let config = ServerConfig {
+            url: Some(format!("{}/mcp", server.uri())),
+            ..Default::default()
+        };
+        let connection = Connection::open(&config)
+            .await
+            .expect("the http server comes up");
+        assert_eq!(connection.identity, "http stub 1");
+        assert_eq!(connection.protocol, wire::PROTOCOL_VERSION);
+        let names: Vec<&str> = connection.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["echo"]);
+        connection.shutdown().await;
+    }
+
+    /// A server that refuses the notification that says the client is ready
+    /// is a server that cannot be talked to, and the refusal is its own
+    /// words.
+    #[tokio::test]
+    async fn a_server_that_refuses_the_handshake_says_why() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"id": 1, "method": "initialize"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": {"protocolVersion": wire::PROTOCOL_VERSION}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "notifications/initialized"})))
+            .respond_with(ResponseTemplate::new(400).set_body_string("not ready"))
+            .mount(&server)
+            .await;
+
+        let config = ServerConfig {
+            url: Some(format!("{}/mcp", server.uri())),
+            ..Default::default()
+        };
+        let refused = Connection::open(&config).await.unwrap_err();
+        assert!(refused.contains("400"), "{refused}");
+    }
+
+    /// A server whose tool list cannot be read is a server with no tools to
+    /// offer, and the refusal says so rather than handing back an empty
+    /// list.
+    #[tokio::test]
+    async fn a_server_whose_tool_list_fails_says_why() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"id": 1, "method": "initialize"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": {"protocolVersion": wire::PROTOCOL_VERSION}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"id": 2, "method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(500).set_body_string("no list today"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "notifications/initialized"})))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        let config = ServerConfig {
+            url: Some(format!("{}/mcp", server.uri())),
+            ..Default::default()
+        };
+        let refused = Connection::open(&config).await.unwrap_err();
+        assert!(refused.contains("500"), "{refused}");
+        assert!(refused.contains("no list today"), "{refused}");
+    }
+
+    /// A connection says which server it is in a test's own output: the
+    /// server it reached, not the pipes it reached it through.
+    #[tokio::test]
+    async fn a_connection_says_which_server_it_is_in_a_test_output() {
+        let (connection, _stub) = connected(&[("STUB_TOOLS", "echo,fail")]).await;
+        let shown = format!("{connection:?}");
+        assert!(shown.contains("identity: \"stub 0.0.0\""), "{shown}");
+        assert!(shown.contains("protocol: \"2025-06-18\""), "{shown}");
+        assert!(shown.contains("tools: 2"), "{shown}");
+        connection.shutdown().await;
+    }
+
+    /// A server that offers more tools than the client will take has the
+    /// rest left out, and the client says how many were left out.
+    #[tokio::test]
+    async fn a_server_that_offers_more_tools_than_the_client_takes_says_so() {
+        let tools: Vec<String> = (1..=MAX_TOOLS + 1).map(|i| format!("t{i}")).collect();
+        let list = tools.join(",");
+        let (connection, _stub) = connected(&[("STUB_TOOLS", &list)]).await;
+        assert_eq!(connection.tools.len(), MAX_TOOLS, "the list is cut");
+        assert_eq!(
+            connection.notes.len(),
+            1,
+            "one note about the rest: {:?}",
+            connection.notes
+        );
+        assert!(
+            connection.notes[0].contains(&format!("more than the {MAX_TOOLS} tools")),
+            "{:?}",
+            connection.notes
+        );
+        connection.shutdown().await;
+    }
+
+    /// A result that carries no content at all is still read for what else
+    /// it has: the shape is the answer when there is no prose.
+    #[test]
+    fn a_result_with_no_content_at_all_is_still_read() {
+        assert_eq!(render(&json!({})), "(the tool answered with nothing)");
+        let structured = render(&json!({"structuredContent": {"count": 2}}));
+        assert!(structured.contains("\"count\": 2"), "{structured}");
+    }
 }

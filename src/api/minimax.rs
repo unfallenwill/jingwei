@@ -166,7 +166,7 @@ mod tests {
 
     use crate::api::{call_api, Protocol};
     use crate::api::{Effort, Thinking as CThinking};
-    use crate::core::ir::{Block, Message, ToolResult};
+    use crate::core::ir::{Block, Message, Response, ToolResult};
     use crate::test_util::{block_on, cfg, ctx as make_ctx, mock, mock_seq, request_body, sink, BlockExt, Recorder};
     use crate::ui::Msg;
     use serde_json::json;
@@ -476,5 +476,183 @@ mod tests {
         assert_eq!(backoff(1), RETRY_BASE);
         assert_eq!(backoff(2), RETRY_BASE * 2);
         assert!(backoff(20) <= RETRY_MAX, "caps at RETRY_MAX");
+    }
+
+    // ---- the Messages wire: the events it speaks -------------------------
+
+    /// A Messages-wire stream served by `events`, and what it produced.
+    fn messages_stream(events: &str) -> (Response, bool, Vec<Msg>) {
+        let port = mock(events, 200, true);
+        let c = cfg(format!("http://127.0.0.1:{port}"), true);
+        let token = crate::cancel::CancelToken::new();
+        let cx = make_ctx();
+        let rec = Recorder::default();
+        let (resp, interrupted, _) = block_on(call_api(&c, &cx, &token, &rec)).unwrap();
+        (resp, interrupted, rec.msgs())
+    }
+
+    #[test]
+    fn a_two_hundred_answer_with_an_error_is_reported_in_the_wires_own_words() {
+        // The status says the request was fine; the body says otherwise.
+        // The wire's own words are what comes back.
+        let (port, reqs) = mock_seq(vec![
+            (200, r#"{"error":{"message":"the model is gone"}}"#.into()),
+        ]);
+        let c = cfg(format!("http://127.0.0.1:{port}"), false);
+        let cx = make_ctx();
+        let err = block_on(call_api(&c, &cx, &crate::cancel::CancelToken::new(), &sink())).unwrap_err();
+        assert!(err.to_string().contains("the model is gone"), "the wire's own words: {err}");
+        assert_eq!(reqs.lock().unwrap().len(), 1, "a wire error is the request's own: no resend");
+    }
+
+    #[test]
+    fn a_stream_that_ends_with_the_done_sentinel_stops_there() {
+        let (resp, _, _) = messages_stream(concat!(
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#, "\n\n",
+            "data: [DONE]\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"never read"}}"#, "\n\n"));
+        assert_eq!(resp.blocks.len(), 1);
+        assert_eq!(resp.blocks[0].text().unwrap(), "hi", "the sentinel ended the stream");
+    }
+
+    #[test]
+    fn a_stream_line_that_is_not_json_is_skipped() {
+        let (resp, _, _) = messages_stream(concat!(
+            "data: this is not json\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n"));
+        assert_eq!(resp.blocks.len(), 1);
+        assert_eq!(resp.blocks[0].text().unwrap(), "hi", "the junk line changed nothing");
+    }
+
+    #[test]
+    fn a_block_that_arrives_out_of_order_lands_in_its_own_slot() {
+        // The wire numbers its blocks; a block that shows up at index 2
+        // without its predecessors is still the third block.
+        let (resp, _, _) = messages_stream(concat!(
+            r#"data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"third"}}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n"));
+        assert_eq!(resp.blocks.len(), 1, "the empty slots before it are not blocks");
+        assert_eq!(resp.blocks[0].text().unwrap(), "third");
+    }
+
+    #[test]
+    fn a_thinking_block_opens_a_think_and_closes_it_at_the_stop() {
+        let (resp, _, msgs) = messages_stream(concat!(
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"pondering"}}"#, "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n"));
+        assert_eq!(resp.blocks.len(), 1);
+        match &resp.blocks[0] {
+            Block::Thinking { text, .. } => assert_eq!(text, "pondering"),
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+        let shape: Vec<&str> = msgs.iter().map(|m| match m {
+            Msg::Think(_) => "think", Msg::ThinkEnd => "think_end", Msg::Done => "done", _ => "other",
+        }).collect();
+        assert_eq!(shape, vec!["think", "think", "think_end", "done"],
+            "the block opens a think and the stop closes it: {msgs:?}");
+    }
+
+    #[test]
+    fn a_block_of_an_unknown_kind_is_ignored() {
+        let (resp, _, _) = messages_stream(concat!(
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"xx"}}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n"));
+        assert!(resp.blocks.is_empty(), "an unknown block kind is not a block");
+    }
+
+    #[test]
+    fn a_delta_for_a_block_that_never_started_is_ignored() {
+        let (resp, _, _) = messages_stream(concat!(
+            r#"data: {"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"nowhere"}}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n"));
+        assert!(resp.blocks.is_empty(), "a delta with no block is dropped");
+    }
+
+    #[test]
+    fn a_text_delta_with_no_text_changes_nothing() {
+        let (resp, _, msgs) = messages_stream(concat!(
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta"}}"#, "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n"));
+        assert_eq!(resp.blocks.len(), 1);
+        assert_eq!(resp.blocks[0].text().unwrap(), "", "no text arrived: the block stays empty");
+        assert!(!msgs.iter().any(|m| matches!(m, Msg::Text(_))), "{msgs:?}");
+    }
+
+    #[test]
+    fn a_thinking_delta_with_no_thinking_changes_nothing() {
+        let (resp, _, msgs) = messages_stream(concat!(
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta"}}"#, "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n"));
+        match &resp.blocks[0] {
+            Block::Thinking { text, .. } => assert_eq!(text, "", "no thinking arrived"),
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+        assert_eq!(msgs.iter().filter(|m| matches!(m, Msg::Think(_))).count(), 1,
+            "only the block start opened a think: {msgs:?}");
+    }
+
+    #[test]
+    fn a_tool_delta_with_no_partial_json_changes_nothing() {
+        let (resp, _, _) = messages_stream(concat!(
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"bash","input":{}}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta"}}"#, "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n"));
+        assert_eq!(resp.blocks.len(), 1);
+        assert!(resp.blocks[0].input().is_null(), "no arguments arrived: the tool has no input");
+    }
+
+    #[test]
+    fn a_message_delta_with_no_output_tokens_reports_the_usage_it_has() {
+        let (resp, _, msgs) = messages_stream(concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":7}}}"#, "\n\n",
+            r#"data: {"type":"message_delta","usage":{"input_tokens":7}}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n"));
+        assert_eq!(resp.usage["input_tokens"], 7);
+        assert!(!msgs.iter().any(|m| matches!(m, Msg::OutTokens(_))),
+            "no output count was reported: {msgs:?}");
+    }
+
+    #[test]
+    fn an_event_of_an_unknown_kind_is_ignored() {
+        let (resp, _, _) = messages_stream(concat!(
+            r#"data: {"type":"ping"}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n"));
+        assert!(resp.blocks.is_empty(), "an unknown event is not a block");
+    }
+
+    /// A body that is not JSON at all is refused with the parser's own
+    /// words: there is no answer to read, and the turn cannot go on.
+    #[test]
+    fn an_answer_that_is_not_json_says_so() {
+        let (port, _) = mock_seq(vec![(200, "this is not json at all".into())]);
+        let c = cfg(format!("http://127.0.0.1:{port}"), false);
+        let cx = make_ctx();
+        let err = block_on(call_api(&c, &cx, &crate::cancel::CancelToken::new(), &sink())).unwrap_err();
+        assert!(matches!(err, crate::Error::Io(_)), "the body was not json: {err:?}");
+        assert!(err.to_string().contains("JSON"), "the parser says why: {err}");
+    }
+
+    /// A block that starts twice in the same slot is one block: the wire
+    /// numbers its blocks, and a slot holds one of them.
+    #[test]
+    fn a_block_that_starts_twice_in_the_same_slot_keeps_one_block() {
+        let (resp, _, _) = messages_stream(concat!(
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n"));
+        assert_eq!(resp.blocks.len(), 1, "the slot holds one block: {resp:?}");
+        assert_eq!(resp.blocks[0].text().unwrap(), "hi");
     }
 }

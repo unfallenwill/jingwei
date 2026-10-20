@@ -296,3 +296,30 @@ if [ -n "${STUB_LOG:-}" ]; then
   printf 'eof\n' >> "$STUB_LOG"
 fi
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fixture asked for by default is the same fixture: a directory of
+    /// its own, with the script written and the log waiting for it.
+    #[test]
+    fn the_default_stub_is_a_stub_of_its_own() {
+        let stub = Stub::default();
+        assert!(stub.script().exists(), "the script is written");
+        assert_ne!(stub.script(), stub.gate(), "the gate is a file of its own");
+        assert!(stub.received().is_empty(), "nothing has been said yet");
+        assert_eq!(stub.count("anything"), 0);
+    }
+
+    /// Waiting for a line that never comes gives up and says no, rather
+    /// than waiting for ever: a test that hangs is not a test.
+    #[tokio::test]
+    async fn waiting_for_a_line_that_never_comes_gives_up() {
+        let stub = Stub::new();
+        assert!(
+            !stub.wait_for("a line nobody is ever going to write").await,
+            "the wait gave up and said so"
+        );
+    }
+}
