@@ -124,6 +124,8 @@ const LAYERS: &[(&str, Layer)] = &[
     ("agent::tools", Layer::L5),        // the fleet's four tools
     ("agent::worker", Layer::L5),       // the background agent's coroutine
     ("agent::cmd", Layer::L5),          // the human's /agents verb
+    ("agent::instance", Layer::L5),     // the top-level agent's lifecycle
+    ("agent::manager", Layer::L5),      // the registry of live instances
     ("workflow", Layer::L5),            // the run boundary
     ("workflow::exec", Layer::L5),      // the fleet: the session's workers
     ("ui::plain", Layer::L5),

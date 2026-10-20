@@ -19,6 +19,11 @@
 //! background, the [`tools`] the main agent uses to manage them, and
 //! the [`cmd`] the human uses.
 //!
+//! The [`instance`] and the [`manager`] are the other end of the same
+//! coin: a **top-level** agent that outlives a single task, and the
+//! place that keeps track of the ones that are alive. The fleet's
+//! workers live inside a run; an instance lives across many.
+//!
 //! The id lives in [`crate::core::ids`] (L0), not here, because the
 //! modules *below* this one — the cancel scope, the ledger, the tool port
 //! — have to be able to name it. It is re-exported so the agent module and
@@ -28,6 +33,16 @@ use crate::core::turn::{Turn, TurnState};
 use crate::ui::Usage;
 
 pub(crate) mod cmd;
+/// The lifecycle layer: one top-level agent, one session, many tasks.
+///
+/// It stands on its own — the frontends keep driving the run boundary
+/// directly, and the layer is called by the crate's own tests — so the
+/// compiler is told once, here, that the layer is not dead but *new*.
+#[allow(dead_code)]
+pub(crate) mod instance;
+/// The manager: the live instances, and the four operations on them.
+#[allow(dead_code)]
+pub(crate) mod manager;
 pub(crate) mod roster;
 pub(crate) mod runner;
 pub(crate) mod tools;
