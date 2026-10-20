@@ -28,6 +28,47 @@ pub(crate) fn temp_dir(name: &str) -> PathBuf {
     p
 }
 
+/// The name of the variable that points at the home directory.
+#[cfg(test)]
+pub(crate) fn home_var() -> &'static str {
+    if cfg!(windows) { "USERPROFILE" } else { "HOME" }
+}
+
+/// A home directory a test may write into, and the name of the variable
+/// that points at it.
+///
+/// The guard owns the dir as well: the session's path points into it, so
+/// the dir has to outlive the writes that use that path and be removed
+/// once they are done. A test that takes the guard also takes the env
+/// lock, so a sibling test that moves the same variable at the same time
+/// cannot see the wrong home.
+#[cfg(test)]
+pub(crate) struct HomeOverride {
+    pub(crate) prev: Option<std::ffi::OsString>,
+    pub(crate) dir: PathBuf,
+}
+
+#[cfg(test)]
+impl HomeOverride {
+    pub(crate) fn new(tag: &str) -> Self {
+        let dir = temp_dir(&format!("home_{tag}"));
+        let prev = std::env::var_os(home_var());
+        std::env::set_var(home_var(), &dir);
+        Self { prev, dir }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HomeOverride {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(v) => std::env::set_var(home_var(), v),
+            None => std::env::remove_var(home_var()),
+        }
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Drive a coroutine to completion on its own little scheduler. Test modules
 /// that need to drive an async fn synchronously — tool runtime, cancel
 /// races, agent turn stubs — use this so they do not have to depend on the

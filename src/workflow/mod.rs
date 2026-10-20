@@ -116,8 +116,7 @@ mod tests {
     use crate::core::ir::Message;
     use crate::core::session::{Provenance, Session};
     use crate::mcp::Hub;
-    use crate::test_util::{block_on, cfg, mock_seq, mock_seq_with, Recorder};
-    use std::ffi::OsString;
+    use crate::test_util::{block_on, cfg, mock_seq, mock_seq_with, HomeOverride, Recorder};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
@@ -152,43 +151,6 @@ mod tests {
             model: "test-model".into(),
             protocol: "minimax".into(),
             base_url: "http://127.0.0.1".into(),
-        }
-    }
-
-    /// A home directory the run may write into, and the name of the
-    /// variable that points at it.
-    fn home_var() -> &'static str {
-        if cfg!(windows) { "USERPROFILE" } else { "HOME" }
-    }
-
-    /// Point the home variable at a fresh temp dir and hand back the
-    /// guard that puts it back. The guard owns the dir as well: the
-    /// session's path points into it, so the dir has to outlive the
-    /// writes that use that path and be removed once they are done. A
-    /// test that takes the guard also takes the env lock, so a sibling
-    /// test that moves the same variable at the same time cannot see
-    /// the wrong home.
-    struct HomeOverride {
-        prev: Option<OsString>,
-        dir: PathBuf,
-    }
-
-    impl HomeOverride {
-        fn new(tag: &str) -> Self {
-            let dir = crate::test_util::temp_dir(&format!("workflow_home_{tag}"));
-            let prev = std::env::var_os(home_var());
-            std::env::set_var(home_var(), &dir);
-            Self { prev, dir }
-        }
-    }
-
-    impl Drop for HomeOverride {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var(home_var(), v),
-                None => std::env::remove_var(home_var()),
-            }
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
