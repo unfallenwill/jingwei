@@ -209,7 +209,7 @@ mod tests {
 
     /// Drive the wizard against an in-memory script of inputs.
     fn run_wizard_against(inputs: &[&str]) -> (Result<String>, Settings) {
-        let joined: String = inputs.iter().flat_map(|s| s.bytes().chain(std::iter::once(b'\n'))).map(|b| b as char).collect();
+        let joined: String = inputs_to_script(inputs);
         let mut input = Cursor::new(joined.into_bytes());
         let mut output: Vec<u8> = Vec::new();
         let mut settings = Settings::empty();
@@ -298,5 +298,502 @@ mod tests {
         assert!(parse_pick("0").is_none());
         assert!(parse_pick("99").is_none());
         assert!(parse_pick("nope").is_none());
+    }
+
+    // ---- the wizard's own failure paths ---------------------------------
+
+    /// A script of answers that breaks on the `fail_at`-th read. The
+    /// wizard asks one question per read — provider, model, base url, api
+    /// key — so the read number *is* the question number.
+    struct BreakingReader {
+        lines: Vec<Vec<u8>>,
+        buf: Vec<u8>,
+        reads: usize,
+        fail_at: usize,
+    }
+
+    impl BreakingReader {
+        fn new(answers: &[&str], fail_at: usize) -> Self {
+            Self {
+                lines: answers.iter().map(|a| format!("{a}\n").into_bytes()).collect(),
+                buf: Vec::new(),
+                reads: 0,
+                fail_at,
+            }
+        }
+    }
+
+    impl std::io::Read for BreakingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = {
+                let available = match self.fill_buf() { Ok(a) => a, Err(e) => return Err(e) };
+                let n = available.len().min(buf.len());
+                buf[..n].copy_from_slice(&available[..n]);
+                n
+            };
+            self.consume(n);
+            Ok(n)
+        }
+    }
+
+    impl std::io::BufRead for BreakingReader {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            self.reads += 1;
+            if self.reads == self.fail_at {
+                return Err(std::io::Error::other("the pipe broke"));
+            }
+            if self.buf.is_empty() {
+                if self.lines.is_empty() { return Ok(&[]); }
+                self.buf = self.lines.remove(0);
+            }
+            Ok(&self.buf)
+        }
+        fn consume(&mut self, amt: usize) {
+            let amt = amt.min(self.buf.len());
+            self.buf.drain(..amt);
+        }
+    }
+
+    /// A writer that fails as soon as its output would carry `needle` —
+    /// the terminal that goes away in the middle of a question.
+    struct FailingWriter { needle: &'static str, seen: String }
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.seen.push_str(&String::from_utf8_lossy(buf));
+            if self.seen.contains(self.needle) {
+                return Err(std::io::Error::other("the terminal went away"));
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// A writer that takes every byte and fails only at the flush — the
+    /// terminal that dies between the question and the answer.
+    struct FailingFlush;
+
+    impl std::io::Write for FailingFlush {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { Ok(buf.len()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("the terminal went away"))
+        }
+    }
+
+    /// Drive the wizard with a reader of our own making.
+    fn run_wizard_with<R: std::io::BufRead>(input: &mut R) -> (Result<String>, Settings) {
+        let mut output: Vec<u8> = Vec::new();
+        let mut settings = Settings::empty();
+        let r = wizard(input, &mut output, &mut settings);
+        if r.is_err() {
+            eprintln!("--- wizard output ---\n{}\n---", String::from_utf8_lossy(&output));
+        }
+        (r, settings)
+    }
+
+    /// Drive the wizard with a writer of our own making.
+    fn run_wizard_writing_to<W: std::io::Write>(input: &[&str], output: &mut W) -> Result<String> {
+        let joined: String = inputs_to_script(input);
+        let mut input = Cursor::new(joined.into_bytes());
+        let mut settings = Settings::empty();
+        wizard(&mut input, output, &mut settings)
+    }
+
+    fn inputs_to_script(inputs: &[&str]) -> String {
+        inputs.iter().flat_map(|s| s.bytes().chain(std::iter::once(b'\n'))).map(|b| b as char).collect()
+    }
+
+    #[test]
+    fn a_vendor_with_no_default_model_cannot_be_chosen() {
+        // deepseek names no default model, so the model question offers
+        // an empty default and Enter leaves the model empty — the wizard
+        // has to say so rather than save a nameless profile.
+        let (r, _) = run_wizard_against(&["deepseek", "", "", "sk-d"]);
+        match r {
+            Err(e) => assert_eq!(e.to_string(), "model cannot be empty (the chosen vendor has no default)"),
+            Ok(k) => panic!("deepseek has no default model; the wizard must refuse, got {k}"),
+        }
+    }
+
+    #[test]
+    fn a_broken_pipe_stops_the_wizard_at_the_provider_question() {
+        let mut input = BreakingReader::new(&["1"], 1);
+        let (r, _) = run_wizard_with(&mut input);
+        assert_eq!(r.unwrap_err().to_string(), "read: the pipe broke");
+    }
+
+    #[test]
+    fn a_broken_pipe_stops_the_wizard_at_the_model_question() {
+        let mut input = BreakingReader::new(&["1"], 2);
+        let (r, _) = run_wizard_with(&mut input);
+        assert_eq!(r.unwrap_err().to_string(), "read: the pipe broke");
+    }
+
+    #[test]
+    fn a_broken_pipe_stops_the_wizard_at_the_base_url_question() {
+        let mut input = BreakingReader::new(&["1"], 3);
+        let (r, _) = run_wizard_with(&mut input);
+        assert_eq!(r.unwrap_err().to_string(), "read: the pipe broke");
+    }
+
+    #[test]
+    fn a_broken_pipe_stops_the_wizard_at_the_api_key_question() {
+        let mut input = BreakingReader::new(&["1"], 4);
+        let (r, _) = run_wizard_with(&mut input);
+        assert_eq!(r.unwrap_err().to_string(), "read: the pipe broke");
+    }
+
+    #[test]
+    fn a_broken_terminal_stops_the_wizard_at_the_provider_list() {
+        let mut output = FailingWriter { needle: "provider:", seen: String::new() };
+        let e = run_wizard_writing_to(&["1"], &mut output).unwrap_err();
+        assert!(matches!(&e, Error::Io(_)), "the failure is the terminal's: {e:?}");
+        assert_eq!(e.to_string(), "the terminal went away");
+    }
+
+    #[test]
+    fn a_broken_terminal_stops_the_wizard_at_the_vendor_list() {
+        let mut output = FailingWriter { needle: "zai", seen: String::new() };
+        let e = run_wizard_writing_to(&["1"], &mut output).unwrap_err();
+        assert!(matches!(&e, Error::Io(_)), "the failure is the terminal's: {e:?}");
+        assert_eq!(e.to_string(), "the terminal went away");
+    }
+
+    #[test]
+    fn a_broken_terminal_stops_the_wizard_at_the_invalid_choice_notice() {
+        let mut output = FailingWriter { needle: "invalid choice", seen: String::new() };
+        let e = run_wizard_writing_to(&["nope"], &mut output).unwrap_err();
+        assert!(matches!(&e, Error::Io(_)), "the failure is the terminal's: {e:?}");
+        assert_eq!(e.to_string(), "the terminal went away");
+    }
+
+    #[test]
+    fn a_broken_terminal_stops_the_wizard_at_the_question_itself() {
+        // the question never reaches the screen, so no answer can come
+        let mut output = FailingWriter { needle: "choice", seen: String::new() };
+        let e = run_wizard_writing_to(&["1"], &mut output).unwrap_err();
+        assert!(matches!(&e, Error::Io(_)), "the failure is the terminal's: {e:?}");
+        assert_eq!(e.to_string(), "the terminal went away");
+    }
+
+    #[test]
+    fn a_broken_terminal_stops_the_wizard_at_the_prompt_flush() {
+        // the question is written, but the terminal dies before the
+        // answer is read
+        let mut output = FailingFlush;
+        let e = run_wizard_writing_to(&["1"], &mut output).unwrap_err();
+        assert!(matches!(&e, Error::Io(_)), "the failure is the terminal's: {e:?}");
+        assert_eq!(e.to_string(), "the terminal went away");
+    }
+
+    // ---- the login command ----------------------------------------------
+
+    /// Point `$HOME` at a temp dir for the length of a test. The settings
+    /// file lives under the home, so the command's own effects are only
+    /// observable against a home we own.
+    struct HomeGuard { prev: Option<String> }
+    impl HomeGuard {
+        fn set(dir: &std::path::Path) -> Self {
+            let prev = std::env::var("HOME").ok();
+            std::env::set_var("HOME", dir);
+            Self { prev }
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_login_command_removes_the_settings_file() {
+        let _lock = crate::test_util::env_lock();
+        let dir = crate::test_util::temp_dir("login_reset");
+        let _home = HomeGuard::set(&dir);
+        let path = dir.join(".jingwei").join("settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        run(false, true, false).expect("the reset succeeds");
+        assert!(!path.exists(), "the settings file is gone");
+    }
+
+    #[test]
+    fn the_login_command_reports_a_settings_file_that_is_not_there() {
+        let _lock = crate::test_util::env_lock();
+        let dir = crate::test_util::temp_dir("login_reset_missing");
+        let _home = HomeGuard::set(&dir);
+        // nothing on disk: the reset has nothing to remove, and says so
+        let e = run(false, true, false).unwrap_err().to_string();
+        assert_eq!(e, "settings.json not found — nothing to reset");
+    }
+
+    /// The show arm prints the settings to stdout, and libtest swallows a
+    /// test's own stdout — so the printing happens in a child process
+    /// (this same test binary, told apart by an env marker) whose stdout
+    /// is a pipe the parent reads.
+    const SHOW_MARKER: &str = "JINGWEI_TEST_LOGIN_SHOW";
+
+    #[test]
+    #[ignore = "runs only inside the child process the show test spawns"]
+    fn the_login_show_probe() {
+        if std::env::var_os(SHOW_MARKER).is_none() { return; }
+        run(true, false, false).expect("the settings show");
+        std::io::stdout().flush().expect("the settings are flushed out");
+    }
+
+    #[test]
+    fn the_login_command_shows_the_settings() {
+        let dir = crate::test_util::temp_dir("login_show");
+        let path = dir.join(".jingwei").join("settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"$schema_version":2,"active":"minimax/M","providers":{}}"#).unwrap();
+        // the child gets a home of its own, so the settings it shows are
+        // the ones this test wrote
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "config::login::tests::the_login_show_probe", "--ignored", "--nocapture"])
+            .env(SHOW_MARKER, "1")
+            .env(if cfg!(windows) { "USERPROFILE" } else { "HOME" }, &dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("the child runs");
+        let text = format!("{}{}",
+            String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "the child ran: {text}");
+        assert!(text.contains("$schema_version: 2"), "the settings are shown: {text}");
+        assert!(text.contains("active: minimax/M"), "the active profile is named: {text}");
+        assert!(text.contains("providers: (none)"), "and the profiles are counted: {text}");
+    }
+
+    #[test]
+    fn the_login_command_fails_when_the_settings_file_is_broken() {
+        // the show arm reads the file: a broken one is the visible proof
+        let _lock = crate::test_util::env_lock();
+        let dir = crate::test_util::temp_dir("login_show_broken");
+        let _home = HomeGuard::set(&dir);
+        let path = dir.join(".jingwei").join("settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not json at all").unwrap();
+        let e = run(true, false, false).unwrap_err().to_string();
+        assert!(e.starts_with("settings.json:"), "got: {e}");
+    }
+
+    /// The wizard arm of `run` needs a terminal on *both* ends; a unit
+    /// test has neither, and the moment one of them is a terminal the
+    /// wizard would open and block on the real stdin. So the gate is
+    /// checked in a child process whose stdin and stdout are pipes — the
+    /// same test binary, told apart by an env marker.
+    const GATE_MARKER: &str = "JINGWEI_TEST_LOGIN_GATE";
+
+    #[test]
+    #[ignore = "runs only inside the child process the gate test spawns"]
+    fn the_login_gate_probe() {
+        if std::env::var_os(GATE_MARKER).is_none() { return; }
+        let e = run(false, false, false).unwrap_err();
+        eprintln!("login gate: {e}");
+    }
+
+    #[test]
+    fn the_login_command_needs_a_terminal() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "config::login::tests::the_login_gate_probe", "--ignored", "--nocapture"])
+            .env(GATE_MARKER, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("the child runs");
+        let text = format!("{}{}",
+            String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "the child ran: {text}");
+        assert!(text.contains("jingwei login needs an interactive terminal"),
+            "the gate says why: {text}");
+    }
+
+    // ---- the wizard, behind a terminal ----------------------------------
+
+    /// The gate above is only half the story: the wizard behind it needs
+    /// a terminal on *both* ends, and it reads the process's own stdin.
+    /// So the wizard is reached by handing a **child process** a pty —
+    /// the child is this same test binary, told apart by an env
+    /// marker, and its stdin/stdout are the two ends of a pseudo
+    /// terminal. `libc` is already a dependency (the crate uses it for
+    /// the terminal's own settings), so a pty costs no new one.
+    #[cfg(unix)]
+    struct Pty {
+        /// the child's three standard streams — the same end of the pty
+        streams: (std::process::Stdio, std::process::Stdio, std::process::Stdio),
+        /// the parent's end: the answers go in, the child's output comes out
+        master: std::os::unix::io::RawFd,
+        /// the parent's own copy of the child's end. It has to be closed
+        /// once the child is spawned, or the terminal never hangs up and
+        /// the parent waits for output that will never end.
+        slave: std::os::unix::io::RawFd,
+    }
+
+    #[cfg(unix)]
+    impl Pty {
+        fn open() -> Pty {
+            use std::os::unix::io::FromRawFd;
+            unsafe {
+                let mut master: libc::c_int = -1;
+                let mut slave: libc::c_int = -1;
+                let mut size: libc::winsize = std::mem::zeroed();
+                size.ws_row = 40;
+                size.ws_col = 120;
+                let rc = libc::openpty(
+                    &mut master, &mut slave,
+                    std::ptr::null_mut(), // the pty has no name
+                    std::ptr::null_mut(), // and keeps the default settings
+                    &mut size,
+                );
+                assert_eq!(rc, 0, "a pty opens: {}", std::io::Error::last_os_error());
+                // the child should not keep either end
+                libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+                libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
+                // the child's three standard streams are the same end of
+                // the pty, each on its own descriptor
+                let end = || {
+                    let fd = libc::dup(slave);
+                    assert!(fd >= 0, "the pty end is duplicated");
+                    std::process::Stdio::from(std::fs::File::from_raw_fd(fd))
+                };
+                Pty { streams: (end(), end(), end()), master, slave }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    const WIZARD_MARKER: &str = "JINGWEI_TEST_LOGIN_WIZARD";
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "runs only inside the child process the pty test spawns"]
+    fn the_login_wizard_probe() {
+        if std::env::var_os(WIZARD_MARKER).is_none() { return; }
+        match run(false, false, false) {
+            Ok(()) => eprintln!("login wizard: ok"),
+            Err(e) => eprintln!("login wizard: {e:?}"),
+        }
+    }
+
+    /// Run `jingwei login` in a child process that has a terminal on
+    /// both ends, hand it the given answers, and give back what it
+    /// printed. The child is this same test binary, told apart by an
+    /// env marker; its stdin and stdout are the two ends of a pseudo
+    /// terminal, so the tty gate opens and the wizard runs for real.
+    ///
+    /// "For real" except for the secret prompt. The child is a *test*
+    /// binary, so it runs the `#[cfg(test)]` variant of
+    /// `ask_secret_api_key` — the one that reads the answer straight
+    /// off the input and skips the termios echo toggle. A test build
+    /// cannot reach the `#[cfg(not(test))]` code at all, so the echo
+    /// toggle and `set_echo` are the two things here that no unit test
+    /// executes. That is the price of the echo toggle being the code
+    /// that used to segfault `jingwei login` right after the key was
+    /// read: it is the one piece of the wizard that only the real
+    /// binary has.
+    #[cfg(unix)]
+    fn login_in_a_terminal(home: &std::path::Path, answers: &[u8]) -> String {
+        use std::io::{Read, Write};
+        use std::os::unix::io::FromRawFd;
+
+        let Pty { streams: (stdin, stdout, stderr), master, slave } = Pty::open();
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let mut reader = master.try_clone().expect("the parent end clones");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "config::login::tests::the_login_wizard_probe", "--ignored", "--nocapture"])
+            .env("HOME", home)
+            .env(WIZARD_MARKER, "1")
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .expect("the child runs");
+        // from here on the child is the only one holding the terminal's
+        // far end, so the terminal hangs up when the child is done
+        unsafe { libc::close(slave) };
+        // the answers, in the order the wizard asks them: the provider
+        // (1 = minimax), the model (Enter takes the vendor's default),
+        // the base URL (Enter takes the vendor's default), the key. The
+        // parent's end stays open, so the terminal never sees an
+        // end-of-file that would throw the answers away.
+        master.write_all(answers).expect("the answers reach the terminal");
+        let seen = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => out.extend_from_slice(&chunk[..n]),
+                }
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        });
+        // the wizard asks four questions and four answers are on the
+        // terminal, so it finishes; the deadline is here so that a
+        // wizard asking one question more fails the test instead of
+        // hanging the suite
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let status = loop {
+            match child.try_wait().expect("the child is still ours") {
+                Some(status) => break status,
+                None if std::time::Instant::now() > deadline => {
+                    let _ = child.kill();
+                    panic!("the wizard never finished");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        };
+        let text = seen.join().expect("the reader finishes");
+        assert!(status.success(), "the wizard ran: {text}");
+        text
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_login_command_saves_the_profile_it_collected() {
+        let home = crate::test_util::temp_dir("login_wizard");
+        let text = login_in_a_terminal(&home, b"1\n\n\nsk-test\n");
+        assert!(text.contains("saved minimax/MiniMax-M3 to"), "the profile was saved: {text}");
+        let saved = std::fs::read_to_string(home.join(".jingwei").join("settings.json"))
+            .expect("the settings file is there");
+        assert!(saved.contains("sk-test"), "the key was kept: {saved}");
+        assert!(saved.contains("minimax/MiniMax-M3"), "the profile is named after it: {saved}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_login_command_reports_a_wizard_that_collected_no_key() {
+        let home = crate::test_util::temp_dir("login_wizard_nokey");
+        // the last answer is the api key, and it is empty
+        let text = login_in_a_terminal(&home, b"1\n\n\n\n");
+        assert!(text.contains("api key cannot be empty"), "the wizard says why: {text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_login_command_starts_over_when_the_settings_file_cannot_be_read() {
+        let home = crate::test_util::temp_dir("login_wizard_broken");
+        // a settings file that is not json: the wizard starts from an
+        // empty set of profiles instead of refusing to start
+        std::fs::create_dir_all(home.join(".jingwei")).unwrap();
+        std::fs::write(home.join(".jingwei").join("settings.json"), "not json at all").unwrap();
+        let text = login_in_a_terminal(&home, b"1\n\n\n\n");
+        assert!(text.contains("api key cannot be empty"), "the wizard asked its questions: {text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_login_command_reports_a_home_it_cannot_save_to() {
+        let home = crate::test_util::temp_dir("login_wizard_unsaveable");
+        // ".jingwei" is a file, so the settings cannot be saved there
+        std::fs::write(home.join(".jingwei"), "not a directory").unwrap();
+        let text = login_in_a_terminal(&home, b"1\n\n\nsk-test\n");
+        assert!(text.contains("AlreadyExists"), "the save says why: {text}");
     }
 }

@@ -312,19 +312,28 @@ mod tests {
     struct HomeGuard { prev: Option<String> }
     impl HomeGuard {
         fn set(dir: &std::path::Path) -> Self {
-            let prev = std::env::var("HOME").ok();
-            std::env::set_var("HOME", dir);
+            let prev = std::env::var(home_var()).ok();
+            std::env::set_var(home_var(), dir);
+            Self { prev }
+        }
+        /// Take the home away entirely — the "no home directory" path.
+        fn unset() -> Self {
+            let prev = std::env::var(home_var()).ok();
+            std::env::remove_var(home_var());
             Self { prev }
         }
     }
     impl Drop for HomeGuard {
         fn drop(&mut self) {
             match &self.prev {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
+                Some(v) => std::env::set_var(home_var(), v),
+                None => std::env::remove_var(home_var()),
             }
         }
     }
+    /// The variable the settings file hangs under: HOME on unix,
+    /// USERPROFILE on windows.
+    fn home_var() -> &'static str { if cfg!(windows) { "USERPROFILE" } else { "HOME" } }
 
     #[test]
     fn missing_settings_is_an_empty_value() {
@@ -554,6 +563,226 @@ mod tests {
         let key = s.active.as_deref().unwrap();
         assert_eq!(key, format!("zai/{}", crate::api::Protocol::ZAI.default_model().unwrap()),
             "the migration names the live vendor default, not a stale string");
+    }
+
+    // ---- the home that is not there --------------------------------------
+
+    #[test]
+    fn a_home_less_environment_has_no_settings_at_all() {
+        let _lock = crate::test_util::env_lock();
+        let _home = HomeGuard::unset();
+        assert!(Settings::home_dir().is_none(), "no home, no settings dir");
+        assert!(Settings::path().is_none(), "and no settings file either");
+        // reading is not a failure — it is an empty settings
+        let s = Settings::load().unwrap();
+        assert!(s.providers.is_empty());
+        assert!(s.active.is_none());
+        // but writing and resetting are
+        let e = Settings::empty().save().unwrap_err().to_string();
+        assert_eq!(e, "no home directory — cannot save ~/.jingwei/settings.json");
+        let e = Settings::reset().unwrap_err().to_string();
+        assert_eq!(e, "no home directory — nothing to reset");
+    }
+
+    // ---- the file that cannot be written ---------------------------------
+
+    #[test]
+    fn saving_into_a_home_that_is_a_file_says_so() {
+        let _lock = crate::test_util::env_lock();
+        let dir = temp_dir("settings_home_is_a_file");
+        let _home = HomeGuard::set(&dir);
+        // a *file* where the settings directory belongs: the directory
+        // cannot be created, and the save says so.
+        std::fs::write(dir.join(".jingwei"), "not a directory").unwrap();
+        match Settings::empty().save().unwrap_err() {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists,
+                "the .jingwei file is in the way: {e}"),
+            other => panic!("expected an io failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_settings_file_that_cannot_be_written_says_so() {
+        let _lock = crate::test_util::env_lock();
+        let dir = temp_dir("settings_write_fails");
+        let _home = HomeGuard::set(&dir);
+        // a *directory* where the settings file belongs: the atomic write
+        // cannot land on it, and the message names the file.
+        let path = dir.join(".jingwei").join("settings.json");
+        std::fs::create_dir_all(&path).unwrap();
+        let e = Settings::empty().save().unwrap_err().to_string();
+        assert!(e.starts_with("write settings.json: "), "got: {e}");
+    }
+
+    #[test]
+    fn resetting_a_settings_path_that_is_a_directory_says_so() {
+        let _lock = crate::test_util::env_lock();
+        let dir = temp_dir("settings_reset_is_a_dir");
+        let _home = HomeGuard::set(&dir);
+        let path = dir.join(".jingwei").join("settings.json");
+        std::fs::create_dir_all(&path).unwrap();
+        // the path is there — so this is the io failure, not the
+        // "not found" message
+        match Settings::reset().unwrap_err() {
+            Error::Io(e) => assert!(
+                matches!(e.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::IsADirectory),
+                "the path is there — the kernel refused to unlink a directory: {e}"),
+            other => panic!("expected an io failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_settings_file_that_cannot_be_read_says_so() {
+        let _lock = crate::test_util::env_lock();
+        let dir = temp_dir("settings_read_fails");
+        let _home = HomeGuard::set(&dir);
+        // a directory where the settings file belongs: it cannot be read
+        let path = dir.join(".jingwei").join("settings.json");
+        std::fs::create_dir_all(&path).unwrap();
+        match Settings::load().unwrap_err() {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::IsADirectory,
+                "the path is a directory, and reading it says so: {e}"),
+            other => panic!("expected an io failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_settings_file_with_broken_json_says_so() {
+        let _lock = crate::test_util::env_lock();
+        let dir = temp_dir("settings_broken_json");
+        let _home = HomeGuard::set(&dir);
+        let path = dir.join(".jingwei").join("settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ this is not json").unwrap();
+        let e = Settings::load().unwrap_err().to_string();
+        assert!(e.starts_with("settings.json: "), "got: {e}");
+    }
+
+    // ---- the active profile, lifted --------------------------------------
+
+    #[test]
+    fn the_active_profile_becomes_active_args() {
+        let mut s = Settings::empty();
+        s.active = Some("zai/glm-5.3-flash".into());
+        s.providers.insert("zai/glm-5.3-flash".into(), Profile {
+            protocol: "zai".into(), api_key: "sk-z".into(), base_url: Some("https://z".into()),
+        });
+        let a = s.active_args().expect("an active profile");
+        assert_eq!(a.key, "zai/glm-5.3-flash");
+        assert_eq!(a.protocol, "zai");
+        assert_eq!(a.api_key, "sk-z");
+        assert_eq!(a.base_url.as_deref(), Some("https://z"));
+    }
+
+    #[test]
+    fn settings_without_a_profile_have_no_active_args() {
+        let mut s = Settings::empty();
+        assert!(s.active_args().is_none(), "no profile, no args");
+        s.providers.insert("a/1".into(), Profile {
+            protocol: "minimax".into(), api_key: "k".into(), base_url: None,
+        });
+        // one profile and no active: the survivor answers
+        let a = s.active_args().expect("the only profile answers");
+        assert_eq!(a.key, "a/1");
+        assert_eq!(a.protocol, "minimax");
+        assert_eq!(a.api_key, "k");
+        assert!(a.base_url.is_none());
+    }
+
+    #[test]
+    fn the_settings_description_names_the_limits_it_carries() {
+        let mut s = Settings::empty();
+        s.max_tokens = Some(8192);
+        s.context_size = Some(500_000);
+        let d = s.describe(false);
+        assert!(d.contains("max_tokens: 8192"), "got: {d}");
+        assert!(d.contains("context_size: 500000"), "got: {d}");
+        assert!(d.contains("providers: (none)"), "got: {d}");
+    }
+
+    // ---- the v2 file ----------------------------------------------------
+
+    #[test]
+    fn a_v2_settings_file_is_read() {
+        let _lock = crate::test_util::env_lock();
+        let dir = temp_dir("settings_v2");
+        let _home = HomeGuard::set(&dir);
+        let v2 = r#"{
+            "$schema_version": 2,
+            "active": "zai/glm-5.3-flash",
+            "effort": "high",
+            "max_tokens": 8192,
+            "context_size": 500000,
+            "providers": {
+                "zai/glm-5.3-flash": {"protocol": "zai", "api_key": "sk-z", "base_url": "https://z"}
+            }
+        }"#;
+        std::fs::create_dir_all(Settings::path().unwrap().parent().unwrap()).unwrap();
+        std::fs::write(Settings::path().unwrap(), v2).unwrap();
+        let s = Settings::load().unwrap();
+        assert_eq!(s.active.as_deref(), Some("zai/glm-5.3-flash"));
+        assert_eq!(s.effort.as_deref(), Some("high"));
+        assert_eq!(s.max_tokens, Some(8192));
+        assert_eq!(s.context_size, Some(500_000));
+        let p = &s.providers["zai/glm-5.3-flash"];
+        assert_eq!(p.protocol, "zai");
+        assert_eq!(p.api_key, "sk-z");
+        assert_eq!(p.base_url.as_deref(), Some("https://z"));
+    }
+
+    #[test]
+    fn a_v2_settings_file_without_a_providers_map_says_so() {
+        let e = super::parse_v2(&serde_json::json!({ "$schema_version": 2 })).unwrap_err().to_string();
+        assert_eq!(e, "settings.json: missing `providers` map");
+    }
+
+    #[test]
+    fn a_profile_without_a_protocol_says_so() {
+        let v = serde_json::json!({
+            "$schema_version": 2,
+            "providers": { "zai/m": {"api_key": "sk-z", "base_url": null} },
+        });
+        let e = super::parse_v2(&v).unwrap_err().to_string();
+        assert_eq!(e, "settings.json profile: missing `protocol`");
+    }
+
+    #[test]
+    fn a_profile_without_an_api_key_says_so() {
+        let v = serde_json::json!({
+            "$schema_version": 2,
+            "providers": { "zai/m": {"protocol": "zai", "base_url": null} },
+        });
+        let e = super::parse_v2(&v).unwrap_err().to_string();
+        assert_eq!(e, "settings.json profile: missing `api_key`");
+    }
+
+    // ---- the v1 file ----------------------------------------------------
+
+    #[test]
+    fn a_v1_settings_file_without_an_api_key_says_so() {
+        let v = serde_json::json!({ "protocol": "minimax" });
+        let e = super::parse_v1_then_migrate(&v).unwrap_err().to_string();
+        assert_eq!(e, "settings.json (v1): missing `api_key` — cannot migrate");
+    }
+
+    #[test]
+    fn a_v1_settings_file_names_an_unknown_model() {
+        // an unknown protocol has no default model and no literal
+        // fallback — the key is derived from the protocol's own name
+        let v = serde_json::json!({ "api_key": "sk-x", "protocol": "acme" });
+        let s = super::parse_v1_then_migrate(&v).unwrap();
+        assert_eq!(s.active.as_deref(), Some("acme/acme-model"));
+        assert_eq!(s.providers["acme/acme-model"].api_key, "sk-x");
+    }
+
+    #[test]
+    fn a_v1_settings_file_with_a_huge_max_tokens_says_so() {
+        let v = serde_json::json!({
+            "api_key": "sk-x", "protocol": "minimax", "max_tokens": 9_999_999_999u64,
+        });
+        let e = super::parse_v1_then_migrate(&v).unwrap_err().to_string();
+        assert_eq!(e, "settings.json (v1): max_tokens 9999999999 does not fit in u32");
     }
 }
 

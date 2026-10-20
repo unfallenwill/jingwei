@@ -454,6 +454,7 @@ fn short_clap_err(e: &clap::Error) -> String {
 mod tests {
     use super::*;
     use crate::api::{CacheMode, Effort, Protocol, Thinking};
+    use std::io::Write;
 
     fn parse(argv: &[&str]) -> Result<Args> {
         // The argv grammar is this module's; tests go through the same
@@ -746,4 +747,289 @@ mod tests {
         assert!(!parse(&["-S"]).unwrap().streaming);
         assert!(!parse(&["--no-stream"]).unwrap().streaming);
     }
+
+    // ---- the enum resolver's refusals -----------------------------------
+
+    /// The refusal `build_config` answers with, as text.
+    fn config_refusal(argv: &[&str]) -> String {
+        match build_config(&parse(argv).unwrap()) {
+            Ok(_) => panic!("{argv:?} should be refused"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_unknown_protocol_is_refused_with_the_known_ones() {
+        let e = config_refusal(&["--protocol", "bogus"]);
+        assert_eq!(e, "invalid protocol 'bogus' (available: minimax, zai, deepseek)");
+    }
+
+    #[test]
+    fn an_unknown_thinking_mode_is_refused() {
+        let e = config_refusal(&["--thinking", "bogus"]);
+        assert_eq!(e, "invalid thinking 'bogus' (available: preserve, strip)");
+    }
+
+    #[test]
+    fn an_unknown_effort_is_refused() {
+        let e = config_refusal(&["--effort", "bogus"]);
+        assert_eq!(e, "invalid effort 'bogus' (available: low, medium, high, max)");
+    }
+
+    // ---- the help text --------------------------------------------------
+
+    /// The help is printed to stdout, and libtest swallows a test's own
+    /// stdout — so the printing happens in a child process (this same
+    /// test binary, told apart by an env marker) whose stdout is a pipe
+    /// the parent reads.
+    const HELP_MARKER: &str = "JINGWEI_TEST_HELP_PRINT";
+
+    #[test]
+    #[ignore = "runs only inside the child process the help test spawns"]
+    fn the_help_probe() {
+        if std::env::var_os(HELP_MARKER).is_none() { return; }
+        print_help();
+        std::io::stdout().flush().expect("the help is flushed out");
+    }
+
+    #[test]
+    fn the_help_text_names_the_flags_it_accepts() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "config::tests::the_help_probe", "--ignored", "--nocapture"])
+            .env(HELP_MARKER, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("the child runs");
+        let text = format!("{}{}",
+            String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "the child ran: {text}");
+        // the *printed* help — not the constant behind it — names the flags
+        for flag in ["--base-url", "--api-key", "--model", "--protocol", "--max-tokens",
+                     "--max-turns", "--context-size", "--max-agents", "--agent-wait-ms",
+                     "--cache", "--thinking", "--effort", "--list", "--all", "--resume"] {
+            assert!(text.contains(flag), "the printed help must name {flag}: {text}");
+        }
+    }
+
+    // ---- the subcommands ------------------------------------------------
+
+    #[test]
+    fn the_list_subcommand_lists_this_project() {
+        let a = parse(&["list"]).unwrap();
+        assert!(a.list, "the subcommand asks for the list");
+        assert!(!a.all, "and only for this project's");
+    }
+
+    #[test]
+    fn the_list_subcommand_with_all_lists_every_project() {
+        let a = parse(&["list", "--all"]).unwrap();
+        assert!(a.list);
+        assert!(a.all, "--all widens the list to every project");
+    }
+
+    #[test]
+    fn the_resume_subcommand_carries_its_id() {
+        let a = parse(&["resume", "abc123"]).unwrap();
+        assert_eq!(a.resume.as_deref(), Some("abc123"));
+        assert!(a.resuming());
+    }
+
+    #[test]
+    fn the_bare_resume_subcommand_means_the_newest_session() {
+        let a = parse(&["resume"]).unwrap();
+        assert!(a.cont, "no id means the newest session");
+        assert!(a.resume.is_none());
+        assert!(a.resuming());
+    }
+
+    /// The `login` subcommand runs the wizard, which needs a terminal on
+    /// both ends. A unit test has neither, and the moment one of them is
+    /// a terminal the wizard would open and block on the real stdin — so
+    /// the subcommand is driven in a child process whose stdin and stdout
+    /// are pipes. The child is this same test binary, told apart by an
+    /// env marker.
+    const LOGIN_MARKER: &str = "JINGWEI_TEST_LOGIN_SUBCOMMAND";
+
+    #[test]
+    #[ignore = "runs only inside the child process the login subcommand test spawns"]
+    fn the_login_subcommand_probe() {
+        if std::env::var_os(LOGIN_MARKER).is_none() { return; }
+        let e = parse_argv(&["login"]).unwrap_err();
+        eprintln!("login subcommand: {e}");
+    }
+
+    #[test]
+    fn the_login_subcommand_says_it_needs_a_terminal() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "config::tests::the_login_subcommand_probe", "--ignored", "--nocapture"])
+            .env(LOGIN_MARKER, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("the child runs");
+        let text = format!("{}{}",
+            String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "the child ran: {text}");
+        assert!(text.contains("jingwei login needs an interactive terminal"),
+            "the gate says why: {text}");
+    }
+
+    // ---- the process argv ------------------------------------------------
+
+    #[test]
+    fn the_process_arguments_are_parsed_into_args() {
+        // The parser reads the *process* argv, so what it sees depends on
+        // how the harness was invoked: a plain `cargo test` hands it the
+        // binary's path alone, and `cargo test -- --nocapture` hands it
+        // the flag too. Both are legitimate — a plain run yields the
+        // default args, and a run carrying an unknown flag is refused
+        // by name.
+        match parse_env_args() {
+            Ok(Some(a)) => {
+                assert!(a.streaming, "streaming is the default");
+                assert!(a.api_key.is_none() && a.base_url.is_none() && a.model.is_none(),
+                    "the harness argv carries no jingwei flags");
+                assert!(!a.list && !a.resuming(), "and no subcommand of its own");
+            }
+            Ok(None) => { /* the process asked for help, and got it */ }
+            Err(e) => {
+                let s = e.to_string();
+                assert!(s.contains("unknown flag"), "the offending token is named: {s}");
+            }
+        }
+    }
+
+    /// `parse_env_args` reads the *process* argv, and the harness's own
+    /// argv is whatever `cargo test` was given. A child process gets an
+    /// argv we choose — the only seam the process-argv parse has. The
+    /// probe writes what it saw into the file the env names, because a
+    /// child may capture its own output.
+    const ARGV_OUT: &str = "JINGWEI_TEST_ARGV_OUT";
+
+    /// Wait for a child, but not forever: a child that hangs must fail
+    /// the test that spawned it, not the whole suite.
+    fn wait_bounded(child: &mut std::process::Child, secs: u64) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            match child.try_wait().expect("the child is still ours") {
+                Some(status) => return status,
+                None if std::time::Instant::now() > deadline => {
+                    let _ = child.kill();
+                    panic!("the child never finished");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+    }
+
+    #[test]
+    fn the_login_argv_probe() {
+        // a vehicle, not a test of its own: it only speaks when a parent
+        // test asked for it by naming the file.
+        let Some(path) = std::env::var_os(ARGV_OUT) else { return; };
+        let path = std::path::PathBuf::from(path);
+        let e = parse_env_args().unwrap_err();
+        // The parent may be watching for the file, so it must appear
+        // whole: write beside it and rename over it, which is atomic.
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, e.to_string()).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+    }
+
+    #[test]
+    fn a_process_argv_clap_refuses_is_reported_by_name() {
+        let dir = crate::test_util::temp_dir("argv_refused");
+        let out_file = dir.join("argv.txt");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "config::tests::the_login_argv_probe"])
+            .env(ARGV_OUT, &out_file)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("the child runs");
+        let seen = std::fs::read_to_string(&out_file).expect("the probe wrote what it saw");
+        assert!(out.status.success(), "the child ran: {seen}");
+        assert!(seen.contains("unknown flag: --exact"), "the offending flag is named: {seen}");
+    }
+
+    #[test]
+    fn a_process_argv_that_names_a_failing_subcommand_is_reported() {
+        let dir = crate::test_util::temp_dir("argv_login");
+        let out_file = dir.join("argv.txt");
+        // The child's argv names the login subcommand, which then fails
+        // the terminal gate. That argv doubles as libtest's filter, so
+        // the child also runs every other test whose name mentions
+        // "login" — the parent does not wait for those: it waits for
+        // the probe's own result and stops the child as soon as it is
+        // in. The child's own output goes nowhere; the file is the
+        // channel. It gets a home of its own, so it cannot touch the
+        // caller's.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("login")
+            .env("HOME", &dir)
+            .env(ARGV_OUT, &out_file)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the child runs");
+        // The probe writes what it saw; until it does, there is nothing
+        // to assert. The deadline is here so that a child which never
+        // gets there fails this test instead of hanging the suite.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !out_file.exists() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = wait_bounded(&mut child, 10);
+                panic!("the probe never wrote what it saw");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // the probe has answered; the other tests its argv selected are
+        // none of this test's business
+        let _ = child.kill();
+        let _ = wait_bounded(&mut child, 10);
+        let seen = std::fs::read_to_string(&out_file).expect("the probe wrote what it saw");
+        assert!(seen.contains("jingwei login needs an interactive terminal"), "got: {seen}");
+    }
+
+    #[test]
+    fn a_non_numeric_context_size_is_refused() {
+        let e = parse(&["--context-size", "abc"]).unwrap_err().to_string();
+        assert_eq!(e, "--context-size expects a number");
+    }
+
+    // ---- clap's own errors -----------------------------------------------
+
+    #[test]
+    #[cfg(unix)]
+    fn a_clap_error_with_no_argument_context_is_shown_whole() {
+        // a non-UTF-8 argument is clap's InvalidUtf8: the error carries
+        // no bad argument to name, so the message is clap's own, whole.
+        use std::os::unix::ffi::OsStringExt;
+        let bad = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        let argv: Vec<std::ffi::OsString> = vec!["jingwei".into(), bad];
+        let err = Cli::try_parse_from(argv).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidUtf8);
+        let shown = short_clap_err(&err);
+        assert_eq!(shown, err.to_string(), "no argument context → clap's message, whole");
+    }
+
+    #[test]
+    fn a_clap_error_whose_bad_argument_is_not_one_string_is_shown_whole() {
+        // clap reports a missing required argument with a *list* of
+        // names, not a single string — that list must not be mistaken for
+        // a bad flag, and the message stays clap's own.
+        let cmd = clap::Command::new("probe").arg(clap::Arg::new("needed").required(true));
+        let err = cmd.try_get_matches_from(["probe"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let shown = short_clap_err(&err);
+        assert_eq!(shown, err.to_string(), "no single bad argument → clap's message, whole");
+        assert!(shown.contains("needed"), "the missing argument is named: {shown}");
+    }
 }
+
