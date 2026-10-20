@@ -156,4 +156,51 @@ mod tests {
         let err: Error = io.into();
         assert!(matches!(err, Error::Io(_)));
     }
+
+    // ---- the variants nothing else reaches yet --------------------------
+
+    /// A transport failure, without touching the network: a URL that does
+    /// not parse fails inside `ureq` before a socket is ever opened.
+    fn transport_error() -> ureq::Error {
+        ureq::get("relative/without/a/base").call().unwrap_err()
+    }
+
+    #[test]
+    fn the_http_variant_shows_the_transport_failure_verbatim() {
+        // The Display arm for Http: the inner error's own text, with no
+        // wrapper of ours around it — the user is reading the transport's
+        // complaint, not ours.
+        let inner = transport_error();
+        let expected = inner.to_string();
+        let err: Error = inner.into();
+        assert_eq!(err.to_string(), expected,
+            "Error::Http shows the transport error exactly as it came");
+        assert!(!expected.is_empty(), "the transport error says something");
+        assert_ne!(err.to_string(), "interrupted",
+            "and it is not another variant's text");
+    }
+
+    #[test]
+    fn a_json_failure_becomes_the_json_variant() {
+        // The From<serde_json::Error> conversion: a parse failure keeps
+        // the parser's own message, and stays a Json error (not Io, not
+        // Http) so the frontends can tell "the answer was not json" from
+        // "the wire broke".
+        let inner = serde_json::from_str::<u32>("not json at all").unwrap_err();
+        let expected = inner.to_string();
+        let err: Error = inner.into();
+        assert!(matches!(err, Error::Json(_)), "got {err:?}");
+        assert_eq!(err.to_string(), expected, "the parser's message rides along");
+    }
+
+    #[test]
+    fn a_transport_failure_is_worth_sending_again() {
+        // The Http arm of is_transient: a request that never made it out
+        // (or never came back) is not the request's fault — resend it.
+        let err: Error = transport_error().into();
+        assert!(err.is_transient(), "a transport failure is retried: {err}");
+        // and the other variants stay where they are
+        assert!(!Error::Msg("x".into()).is_transient());
+        assert!(!Error::Api(404, "x".into()).is_transient());
+    }
 }

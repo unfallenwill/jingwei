@@ -121,4 +121,51 @@ mod tests {
         write_atomic(target.to_str().unwrap(), "v").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "v");
     }
+
+    // ---- the paths the write cannot take ----------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_refuses_to_write_through_a_dangling_symlink() {
+        // A symlink whose target is gone: the write means "put these
+        // bytes in the file this link points at", and there is no such
+        // file. The link is left exactly as it was — nothing is created
+        // in its place.
+        let dir = temp_dir("dangling");
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(dir.join("gone.txt"), &link).unwrap();
+        let err = write_atomic(link.to_str().unwrap(), "v").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound,
+            "the target the link names is not there: {err}");
+        assert_eq!(std::fs::read_link(&link).unwrap(), dir.join("gone.txt"),
+            "the link itself is untouched");
+        assert!(!dir.join("gone.txt").exists(), "and no file was created in its place");
+    }
+
+    #[test]
+    fn write_atomic_cannot_write_through_a_path_with_no_file_name() {
+        // "<dir>/sub/.." names no file: the temp file takes the
+        // fallback name and lands in the directory that path resolves
+        // to. A directory sitting at that exact temp name proves which
+        // name the write picked — and stops the write before it starts.
+        let dir = temp_dir("no_file_name");
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let taken = dir.join(format!(".file.jingwei-{}.tmp", std::process::id()));
+        std::fs::create_dir(&taken).unwrap();
+        let err = write_atomic(sub.join("..").to_str().unwrap(), "v").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::IsADirectory,
+            "the temp file took the fallback's name: {err}");
+    }
+
+    #[test]
+    fn write_atomic_cannot_write_into_a_directory_that_is_not_there() {
+        // The temp file lives beside the target, in the target's own
+        // directory. No directory, no temp file, no write.
+        let dir = temp_dir("missing_dir");
+        let target = dir.join("nowhere").join("f.txt");
+        let err = write_atomic(target.to_str().unwrap(), "v").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+        assert!(!dir.join("nowhere").exists(), "the write created nothing");
+    }
 }

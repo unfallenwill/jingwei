@@ -499,4 +499,84 @@ mod tests {
         assert!(ctx.nested_paths.contains(&dir.join("ok").join("AGENTS.md")));
         assert!(ctx.nested_paths.contains(&dir.join("more").join("AGENTS.md")));
     }
+
+    // ---- the walk that cannot go on --------------------------------------
+
+    #[test]
+    fn a_workspace_that_does_not_exist_yields_no_nested_paths() {
+        // The BFS starts at the workspace. A workspace that is not there
+        // cannot be read — the walk skips it and comes back empty
+        // instead of failing the load.
+        let dir = temp_dir("agents_md_missing_workspace");
+        let missing = dir.join("never_existed");
+        let ctx = AgentsMdContext::load(&missing);
+        assert!(ctx.nested_paths.is_empty(),
+            "nothing to find under a workspace that is not there");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_the_walk_cannot_read_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fixture_with_agents("unreadable_subdir", &[
+            "AGENTS.md",
+            "ok/AGENTS.md",
+            "locked/AGENTS.md",
+        ]);
+        // one subdirectory the walk cannot open
+        let locked = dir.join("locked");
+        let _restore = ModeGuard::new(&locked);
+        let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&locked, perms).unwrap();
+
+        let ctx = AgentsMdContext::load(&dir);
+        assert!(ctx.nested_paths.contains(&dir.join("ok").join("AGENTS.md")),
+            "the directories that can be read are still walked");
+        if std::fs::read_dir(&locked).is_err() {
+            // (a root user reads everything — there the branch cannot fire)
+            assert!(!ctx.nested_paths.iter().any(|p| p.starts_with(&locked)),
+                "a directory the walk cannot read is skipped, not fatal");
+        }
+    }
+
+    /// Put a directory's mode back when the test ends, however it ends:
+    /// a directory left unreadable would break the next run's cleanup.
+    #[cfg(unix)]
+    struct ModeGuard(PathBuf, u32);
+
+    #[cfg(unix)]
+    impl ModeGuard {
+        fn new(path: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            Self(path.to_path_buf(), mode)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&self.0).unwrap().permissions();
+            perms.set_mode(self.1);
+            let _ = std::fs::set_permissions(&self.0, perms);
+        }
+    }
+
+    #[test]
+    fn a_path_without_a_file_name_is_not_skipped() {
+        // The skip list works on names. A path that has no name — the
+        // root, the current directory — or one the platform cannot
+        // spell as UTF-8 has no name to match, so it is not on the
+        // list: it is not one of the heavy trees either.
+        assert!(!is_skippable(Path::new("/")), "the root has no name to skip on");
+        assert!(!is_skippable(Path::new(".")), "nor has the current directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::ffi::OsStr::from_bytes(b"na\xffme");
+            assert!(!is_skippable(Path::new(raw)), "a name that is not utf-8 is not on the list");
+        }
+    }
 }

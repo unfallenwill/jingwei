@@ -784,6 +784,84 @@ mod tests {
     // ---- fit_context: integration (JSON wire shape end-to-end) ------------
 
     #[test]
+    fn a_seeded_context_keeps_the_project_reminders() {
+        // The seed hands a worker the project's own conventions — only
+        // the fleet's reminder (the one about spawning agents) is left
+        // behind, because a worker gets no fleet tools.
+        let mut ctx = bare(BUDGET);
+        ctx.reminders.push(SystemReminder {
+            id: ReminderId::AgentsMdClosest { path: std::path::PathBuf::from("/tmp/AGENTS.md") },
+            text: "\n\n# Project conventions".into(),
+        });
+        ctx.reminders.push(SystemReminder {
+            id: ReminderId::AgentTools,
+            text: "\n\n# Background agents".into(),
+        });
+        let worker = ctx.seed().context(&["spawn_agent"]);
+        assert_eq!(worker.reminders.len(), 1, "only the agent-tools reminder is dropped");
+        assert!(matches!(worker.reminders[0].id, ReminderId::AgentsMdClosest { .. }),
+            "the project's own reminder rides along: {:?}", worker.reminders[0].id);
+    }
+
+    #[test]
+    fn a_tool_schema_without_a_name_survives_the_hide_list() {
+        // The hide list matches on the schema's name. A schema that has
+        // no name is not the tool the list names, so it stays — the
+        // list is a list of names, and there is nothing to match.
+        let tools = vec![json!({"name": "bash"}), json!({"description": "no name here"})];
+        let left = hide_tools(tools, &["bash".to_string()]);
+        assert_eq!(left.len(), 1, "the named tool is gone, the nameless one is not");
+        assert_eq!(left[0]["description"], json!("no name here"));
+    }
+
+    #[test]
+    fn a_tool_result_below_a_user_message_leaves_its_tool_use_alone() {
+        // The pairing rule looks at the message right below the result.
+        // When that message is not an assistant turn there is no tool_use
+        // to unpair here — and the one further up stays where it is.
+        let mut h = vec![
+            Message::Assistant(vec![Block::ToolUse {
+                id: "t1".into(), name: "bash".into(), input: json!({}),
+            }]),
+            Message::User("a question in between".into()),
+            Message::ToolResults(vec![ToolResult { id: "t1".into(), content: "ok".into() }]),
+        ];
+        drop_result_and_pair(&mut h, 2, 0);
+        let j = hist(&h).to_string();
+        assert!(!j.contains("tool_result"), "the result is gone: {j}");
+        assert!(j.contains("t1"), "the tool_use above the user message is left alone: {j}");
+    }
+
+    #[test]
+    fn a_tool_result_at_the_very_start_has_no_neighbour() {
+        // Nothing before the result: there is no message to unpair it
+        // from, and the empty result message goes away by itself.
+        let mut h = vec![
+            Message::ToolResults(vec![ToolResult { id: "t1".into(), content: "ok".into() }]),
+        ];
+        drop_result_and_pair(&mut h, 0, 0);
+        assert!(h.is_empty(), "the emptied result message is removed: {h:?}");
+    }
+
+    #[test]
+    fn a_neighbour_that_still_holds_content_is_not_removed_with_the_pair() {
+        // The message below the dropped result still has a block of its
+        // own, so it is not empty and must survive the drop.
+        let mut h = vec![
+            Message::Assistant(vec![
+                Block::ToolUse { id: "t1".into(), name: "bash".into(), input: json!({}) },
+                Block::Text("and here is the answer".into()),
+            ]),
+            Message::ToolResults(vec![ToolResult { id: "t1".into(), content: "ok".into() }]),
+        ];
+        drop_result_and_pair(&mut h, 1, 0);
+        assert_eq!(h.len(), 1, "the message with content stays: {h:?}");
+        let j = hist(&h).to_string();
+        assert!(!j.contains("tool_use"), "the call it made is gone: {j}");
+        assert!(j.contains("and here is the answer"), "its text stays: {j}");
+    }
+
+    #[test]
     fn fit_context_trims_oldest_tool_result_and_keeps_pairing() {
         let big = "x".repeat(10_000);
         let mut history = hv(vec![

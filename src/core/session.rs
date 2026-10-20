@@ -862,6 +862,10 @@ mod tests {
 
     #[test]
     fn project_dir_canonicalizes_before_encoding() {
+        // The name is built from the home directory, so this test reads
+        // the environment: it takes the lock, like every other test that
+        // does.
+        let _lock = crate::test_util::env_lock();
         let d = dir("projdir");
         let clean = project_dir_of(&d.display().to_string()).unwrap();
         let spelled = project_dir_of(&format!("{}/./", d.display())).unwrap();
@@ -981,5 +985,512 @@ mod tests {
         assert_eq!(utc(60), "1970-01-01 00:01");
         assert_eq!(utc(3600), "1970-01-01 01:00");
         assert_eq!(id_stem(0), "19700101-000000");
+    }
+
+    // ---- the home directory -----------------------------------------------
+
+    /// The variable the sessions live under: HOME on unix, USERPROFILE
+    /// on windows.
+    fn home_var() -> &'static str { if cfg!(windows) { "USERPROFILE" } else { "HOME" } }
+
+    /// Point the home variable at a directory for the length of a test,
+    /// and put it back when the test ends — however it ends. The
+    /// variable is process-wide, so the caller takes the env lock.
+    struct HomeGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(dir: &Path) -> Self {
+            let prev = std::env::var_os(home_var());
+            std::env::set_var(home_var(), dir);
+            Self { prev }
+        }
+        fn unset() -> Self {
+            let prev = std::env::var_os(home_var());
+            std::env::remove_var(home_var());
+            Self { prev }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(home_var(), v),
+                None => std::env::remove_var(home_var()),
+            }
+        }
+    }
+
+    /// A directory whose permissions are put back when the test ends —
+    /// however it ends. A directory left unreadable cannot be cleaned up
+    /// by the next run.
+    #[cfg(unix)]
+    struct ModeGuard {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    #[cfg(unix)]
+    impl ModeGuard {
+        /// Take the directory away from everyone who is not its owner.
+        fn seal(path: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = fs::metadata(path).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            let mut perms = meta.permissions();
+            perms.set_mode(0o000);
+            fs::set_permissions(path, perms).unwrap();
+            Self { path: path.to_path_buf(), mode }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = fs::metadata(&self.path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(self.mode);
+                let _ = fs::set_permissions(&self.path, perms);
+            }
+        }
+    }
+
+    #[test]
+    fn a_home_less_environment_has_no_sessions_at_all() {
+        // Without a home there is no projects root, so there is nowhere
+        // a session could live — and the entry points say so instead of
+        // failing with something the user cannot act on.
+        let _lock = crate::test_util::env_lock();
+        let _home = HomeGuard::unset();
+        assert!(projects_root().is_none(), "no home, no projects root");
+        let e = Session::list().unwrap_err().to_string();
+        assert_eq!(e, "no home directory — cannot find ~/.jingwei/projects");
+        let e = Session::list_all().unwrap_err().to_string();
+        assert_eq!(e, "no home directory — cannot find ~/.jingwei/projects");
+        let e = Session::load(None).unwrap_err().to_string();
+        assert_eq!(e, "no home directory — cannot find ~/.jingwei/projects");
+        let e = print_list(false).unwrap_err().to_string();
+        assert_eq!(e, "no home directory — cannot find ~/.jingwei/projects");
+        let e = print_list(true).unwrap_err().to_string();
+        assert_eq!(e, "no home directory — cannot find ~/.jingwei/projects");
+    }
+
+    #[test]
+    fn a_project_directory_that_does_not_exist_falls_back_to_the_path_as_spelled() {
+        // A working directory that cannot be canonicalized (it is gone)
+        // is used exactly as it was spelled — the name is built from
+        // what we know, not from nothing.
+        let _lock = crate::test_util::env_lock();
+        let home = crate::test_util::temp_dir("projdir_gone");
+        let _home = HomeGuard::set(&home);
+        let missing = home.join("no_such_dir");
+        let spelled = missing.display().to_string();
+        let dir = project_dir_of(&spelled).unwrap();
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.contains("no_such_dir"), "the spelled path is what the name is built from: {name}");
+        assert!(!name.contains('/'), "and it stays one path component");
+    }
+
+    // ---- what a session says about itself ---------------------------------
+
+    #[test]
+    fn a_session_reports_where_it_started_and_which_model_wrote_it() {
+        let s = Session::create(Some(Path::new("/tmp")), &prov(), 1, 0);
+        assert_eq!(s.cwd(), current_dir_string(), "the working directory it started in");
+        assert_eq!(s.model(), "test-model", "the model that wrote it");
+    }
+
+    #[test]
+    fn a_session_without_a_home_writes_nothing() {
+        // No home, no file: persistence is quietly off, not an error.
+        let mut s = Session::create(None, &prov(), 1, 0);
+        assert!(s.path().is_none(), "no home, no file to write to");
+        assert!(s.sync(&history()).is_ok(), "a session with nowhere to go is not a failure");
+    }
+
+    #[test]
+    fn a_session_with_nothing_new_to_save_writes_nothing() {
+        // The tail is empty: there is nothing to append, so the file is
+        // not even opened — a session that was deleted stays deleted.
+        let d = dir("empty_tail");
+        let mut s = Session::create(Some(&d), &prov(), 1, 0);
+        let h = history();
+        s.sync(&h).unwrap();
+        let path = s.path().unwrap().to_owned();
+        fs::remove_file(&path).unwrap();
+        s.sync(&h).unwrap();
+        assert!(!path.exists(), "an empty tail writes nothing at all");
+    }
+
+    // ---- the file the session lands in ------------------------------------
+
+    #[test]
+    fn a_session_path_without_a_parent_cannot_be_written() {
+        // A path with no parent: there is no directory to lift, and
+        // the file itself is nowhere to be found.
+        let mut s = Session {
+            path: Some(PathBuf::new()),
+            id: "noparent".into(),
+            created: 0,
+            cwd: "/".into(),
+            model: "test-model".into(),
+            header: "{}".into(),
+            persisted: 0,
+        };
+        let err = s.sync(&history()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+    }
+
+    #[test]
+    fn an_append_to_a_session_file_that_is_no_longer_a_file_says_so() {
+        // Something else took the session file's place — the append
+        // cannot open it, and the caller hears about it.
+        let d = dir("append_denied");
+        let mut s = Session::create(Some(&d), &prov(), 1, 0);
+        let h = history();
+        s.sync(&h).unwrap();
+        let path = s.path().unwrap().to_owned();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let mut longer = h.clone();
+        longer.push(crate::core::ir::user_message("one more"));
+        let err = s.sync(&longer).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::IsADirectory, "{err}");
+    }
+
+    #[test]
+    fn a_rewrite_into_a_directory_that_is_not_a_directory_says_so() {
+        // The history shrank, so the file is rewritten whole — but the
+        // directory it lives in is gone, and a file is in its place.
+        let d = dir("rewrite_no_dir");
+        let mut s = Session::create(Some(&d), &prov(), 1, 0);
+        let h = history();
+        s.sync(&h).unwrap();
+        fs::remove_dir_all(&d).unwrap();
+        fs::write(&d, "not a directory").unwrap();
+        let trimmed = vec![h[0].clone()];
+        let err = s.sync(&trimmed).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists,
+            "the path is there, and it is not a directory: {err}");
+    }
+
+    #[test]
+    fn a_rewrite_whose_temp_file_cannot_be_created_says_so() {
+        // A path with no parent: the rewrite has no directory to lift,
+        // and the temp file it wants to write cannot be created.
+        let mut s = Session {
+            path: Some(PathBuf::new()),
+            id: "noparent".into(),
+            created: 0,
+            cwd: "/".into(),
+            model: "test-model".into(),
+            header: "{}".into(),
+            persisted: 1, // one message is already on disk
+        };
+        let err = s.sync(&[]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+    }
+
+    #[test]
+    fn a_rewrite_whose_temp_name_is_taken_by_a_directory_says_so() {
+        // Something else is sitting where the rewrite's temp file goes.
+        let d = dir("rewrite_tmp_taken");
+        let mut s = Session::create(Some(&d), &prov(), 1, 0);
+        let h = history();
+        s.sync(&h).unwrap();
+        let tmp = s.path().unwrap().with_extension("tmp");
+        fs::create_dir(&tmp).unwrap();
+        let trimmed = vec![h[0].clone()];
+        let err = s.sync(&trimmed).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::IsADirectory, "{err}");
+    }
+
+    #[test]
+    fn a_rewrite_onto_a_directory_says_so() {
+        // The rename cannot land on a directory — and the target is
+        // left exactly as it was found.
+        let d = dir("rewrite_onto_dir");
+        let mut s = Session::create(Some(&d), &prov(), 1, 0);
+        let h = history();
+        s.sync(&h).unwrap();
+        let path = s.path().unwrap().to_owned();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let trimmed = vec![h[0].clone()];
+        let err = s.sync(&trimmed).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::IsADirectory, "{err}");
+        assert!(path.is_dir(), "the target is still what it was");
+    }
+
+    // ---- listing ----------------------------------------------------------
+
+    #[test]
+    fn the_current_project_sessions_are_listed() {
+        let _lock = crate::test_util::env_lock();
+        let home = crate::test_util::temp_dir("session_list_home");
+        let _home = HomeGuard::set(&home);
+        let mut s = Session::new(&prov(), 1);
+        s.sync(&[crate::core::ir::user_message("listed task")]).unwrap();
+        let metas = Session::list().unwrap();
+        assert_eq!(metas.len(), 1, "the session just saved is in this project's list");
+        assert_eq!(metas[0].id, s.id());
+        assert_eq!(metas[0].first, "listed task");
+    }
+
+    #[test]
+    fn every_project_sessions_are_listed_newest_first() {
+        let _lock = crate::test_util::env_lock();
+        let home = crate::test_util::temp_dir("session_list_all_home");
+        let _home = HomeGuard::set(&home);
+        let root = projects_root().unwrap();
+        let mut older = Session::create(Some(&root.join("proj-a")), &prov(), 1, 1000);
+        older.sync(&[crate::core::ir::user_message("old")]).unwrap();
+        let mut newer = Session::create(Some(&root.join("proj-b")), &prov(), 1, 2000);
+        newer.sync(&[crate::core::ir::user_message("new")]).unwrap();
+        let metas = Session::list_all().unwrap();
+        assert_eq!(metas.len(), 2, "both projects are walked");
+        assert_eq!(metas[0].id, newer.id(), "newest first, across projects");
+        assert_eq!(metas[1].id, older.id());
+    }
+
+    #[test]
+    fn a_saved_session_is_loaded_back_from_the_projects_directory() {
+        // The public resume path: what `sync` wrote under the home
+        // directory comes back with its identity and its history.
+        let _lock = crate::test_util::env_lock();
+        let home = crate::test_util::temp_dir("session_load_home");
+        let _home = HomeGuard::set(&home);
+        let mut s = Session::new(&prov(), 1);
+        let h = history();
+        s.sync(&h).unwrap();
+        let (loaded, hist) = Session::load(None).unwrap();
+        assert_eq!(loaded.id(), s.id(), "the newest session of the project is the one saved");
+        assert_eq!(loaded.path(), s.path(), "and it keeps the file's identity");
+        assert_eq!(hist, h, "the history comes back as it went in");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_directory_that_cannot_be_read_stops_the_walk() {
+        // A project directory the walk cannot open is not a project with
+        // no sessions — it is a failure, and the walk says so rather
+        // than quietly handing back what it managed to read.
+        let _lock = crate::test_util::env_lock();
+        let home = crate::test_util::temp_dir("session_list_all_unreadable");
+        let _home = HomeGuard::set(&home);
+        let root = projects_root().unwrap();
+        let locked = root.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        let _mode = ModeGuard::seal(&locked);
+        // a root reads anything: there is no unreadable directory to
+        // trip over, so the case does not exist here.
+        if fs::read_dir(&locked).is_ok() {
+            return;
+        }
+        match Session::list_all().unwrap_err() {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
+            other => panic!("expected an io failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_projects_root_that_is_a_file_says_so() {
+        let _lock = crate::test_util::env_lock();
+        let home = crate::test_util::temp_dir("session_list_all_broken");
+        let _home = HomeGuard::set(&home);
+        // no ~/.jingwei at all: nothing to list, and that is not an error
+        assert!(Session::list_all().unwrap().is_empty(), "no projects root, no sessions");
+        // a *file* where the projects root belongs: the walk cannot start
+        fs::create_dir_all(home.join(".jingwei")).unwrap();
+        fs::write(home.join(".jingwei").join("projects"), "not a directory").unwrap();
+        match Session::list_all().unwrap_err() {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotADirectory, "{e}"),
+            other => panic!("expected an io failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_project_directory_that_cannot_be_listed_says_so() {
+        // A *file* where the project directory belongs: the listing
+        // cannot even start, and the load says so rather than pretending
+        // the project has no sessions.
+        let d = dir("not_a_dir");
+        let not_a_dir = d.join("file");
+        fs::write(&not_a_dir, "not a directory").unwrap();
+        match list_in(&not_a_dir).unwrap_err() {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotADirectory, "{e}"),
+            other => panic!("expected an io failure, got {other:?}"),
+        }
+        match load_in(&not_a_dir, None).unwrap_err() {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotADirectory, "{e}"),
+            other => panic!("expected an io failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_project_directory_has_no_session_to_resume() {
+        let d = dir("empty_project");
+        let err = load_in(&d, None).unwrap_err().to_string();
+        assert_eq!(err, format!("no sessions yet in {} — an interactive run creates one", d.display()));
+    }
+
+    #[test]
+    fn a_session_file_whose_name_does_not_match_its_header_names_the_missing_file() {
+        // The file is called something else, but its header says it is
+        // "abc" — the loader goes looking for abc.jsonl and says which
+        // file it could not read.
+        let d = dir("mismatched_name");
+        let body = r#"{"type":"session","id":"abc","created":1,"format":1,"model":"m","protocol":"p","base_url":"b","cwd":"/tmp"}"#;
+        fs::write(d.join("other.jsonl"), body).unwrap();
+        let err = load_in(&d, Some("abc")).unwrap_err().to_string();
+        let wanted = d.join("abc.jsonl");
+        assert!(err.starts_with(&format!("reading {}: ", wanted.display())), "{err}");
+    }
+
+    // ---- the files that are not sessions ----------------------------------
+
+    #[test]
+    fn an_empty_session_file_is_not_a_session() {
+        let d = dir("empty_file");
+        fs::write(d.join("empty.jsonl"), "").unwrap();
+        assert!(list_in(&d).unwrap().is_empty(), "a file with no header is not a session");
+    }
+
+    #[test]
+    fn a_file_whose_header_is_not_a_session_is_skipped() {
+        let d = dir("not_a_session");
+        fs::write(d.join("notes.jsonl"), r#"{"type":"notes"}"#).unwrap();
+        assert!(list_in(&d).unwrap().is_empty(), "a foreign file is skipped, not fatal");
+    }
+
+    #[test]
+    fn a_session_header_without_an_id_is_skipped() {
+        // Without an id the file cannot be named, so it cannot be
+        // resumed — the listing skips it rather than listing a session
+        // with no name.
+        let d = dir("no_id");
+        fs::write(d.join("noid.jsonl"), r#"{"type":"session","created":1}"#).unwrap();
+        assert!(list_in(&d).unwrap().is_empty(), "a session with no id is skipped");
+    }
+
+    #[test]
+    fn a_session_entry_that_cannot_be_read_is_skipped() {
+        // The listing reads what it can: an entry it cannot read is
+        // skipped, and the sessions around it are still listed.
+        let d = dir("unreadable_entry");
+        fs::create_dir(d.join("locked.jsonl")).unwrap();
+        let mut s = Session::create(Some(&d), &prov(), 1, 1000);
+        s.sync(&[crate::core::ir::user_message("kept")]).unwrap();
+        let metas = list_in(&d).unwrap();
+        assert_eq!(metas.len(), 1, "only the readable session is listed");
+        assert_eq!(metas[0].id, s.id());
+    }
+
+    #[test]
+    fn a_first_task_that_is_not_a_string_shows_no_first_task() {
+        // The first task is a peek, not a contract: a content that is
+        // not a plain string shows nothing rather than failing the read.
+        let d = dir("array_content");
+        let body = concat!(
+            r#"{"type":"session","id":"arr","created":1,"format":1,"model":"m","protocol":"p","base_url":"b","cwd":"/tmp"}"#,
+            "\n",
+            r#"{"role":"user","content":[{"type":"text","text":"hi"}]}"#,
+        );
+        fs::write(d.join("arr.jsonl"), body).unwrap();
+        let metas = list_in(&d).unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].first, "", "a content that is not a string shows no first task");
+        assert_eq!(metas[0].msgs, 1, "but the message still counts");
+    }
+
+    // ---- the --list command and the table ---------------------------------
+
+    /// `--list` prints to stdout, and libtest swallows a test's own
+    /// stdout — so the printing happens in a child process (this same
+    /// test binary, told apart by an env marker) whose stdout is a pipe
+    /// the parent reads.
+    const LIST_MARKER: &str = "JINGWEI_TEST_LIST_PRINT";
+
+    #[test]
+    #[ignore = "runs only inside the child process the list command test spawns"]
+    fn the_print_list_probe() {
+        if std::env::var_os(LIST_MARKER).is_none() { return; }
+        print_list(false).expect("this project's sessions list");
+        print_list(true).expect("every project's sessions list");
+        std::io::stdout().flush().expect("the listing is flushed out");
+    }
+
+    /// Run the list probe in a child process whose home is `home`, and
+    /// give back what it printed.
+    fn print_list_in_a_child(home: &Path) -> String {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "core::session::tests::the_print_list_probe", "--ignored", "--nocapture"])
+            .env(LIST_MARKER, "1")
+            .env(home_var(), home)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("the child runs");
+        let text = format!("{}{}",
+            String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "the child ran: {text}");
+        text
+    }
+
+    #[test]
+    fn the_list_command_reports_what_it_found() {
+        // nothing saved yet: the notice, and the scope it looked in
+        let empty = crate::test_util::temp_dir("print_list_empty");
+        let text = print_list_in_a_child(&empty);
+        assert!(text.contains("no sessions yet in"), "an empty project says so: {text}");
+        assert!(text.contains(".jingwei/projects"), "and names the scope it looked in: {text}");
+
+        // a saved session: the table, the task, and the count
+        let home = crate::test_util::temp_dir("print_list_home");
+        {
+            let _lock = crate::test_util::env_lock();
+            let _home = HomeGuard::set(&home);
+            let mut s = Session::new(&prov(), 1);
+            s.sync(&[crate::core::ir::user_message("printed task")]).unwrap();
+        }
+        let text = print_list_in_a_child(&home);
+        assert!(text.contains("FIRST TASK"), "the table has its columns: {text}");
+        assert!(text.contains("printed task"), "the task is the one that is listed: {text}");
+        assert!(text.contains("1 session in"), "and the count is right: {text}");
+    }
+
+    #[test]
+    fn the_table_counts_its_sessions_in_the_plural() {
+        let meta = |id: &str, created: u64| Meta {
+            id: id.into(),
+            created,
+            cwd: "/home/u/proj".into(),
+            model: "a-model".into(),
+            protocol: "test-proto".into(),
+            msgs: 3,
+            first: "a task".into(),
+        };
+        let table = format_table(&[meta("a1b2", 1_758_000_000)], Path::new("/tmp/here"), false);
+        assert!(table.contains("1 session"), "one is singular: {table}");
+        let table = format_table(
+            &[meta("a1b2", 1_758_000_000), meta("b2c3", 1_758_000_100)],
+            Path::new("/tmp/here"),
+            false,
+        );
+        assert!(table.contains("2 sessions"), "two are plural: {table}");
+    }
+
+    // ---- the calendar, before the epoch -----------------------------------
+
+    #[test]
+    fn a_date_before_the_epoch_still_maps_to_a_calendar_day() {
+        // The calendar helper walks both ways: the day before the
+        // epoch, and the leap day of the year zero.
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(-719_469), (0, 2, 29));
     }
 }

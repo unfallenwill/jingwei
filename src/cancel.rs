@@ -352,6 +352,34 @@ mod tests {
     }
 
     #[test]
+    fn a_child_scope_minted_under_a_cancelled_scope_is_born_cancelled() {
+        // A nested scope is a node under its parent: minted under a dead
+        // parent it comes up dead, exactly like a leaf does.
+        let parent = CancelScope::new();
+        parent.cancel();
+        let child = parent.child();
+        assert!(child.is_cancelled(), "a scope minted under a dead scope is not live");
+        assert!(child.token().is_cancelled(), "and its leaves are born dead too");
+    }
+
+    #[test]
+    fn a_panicking_worker_is_reported_as_a_worker_error() {
+        // The blocking pool's join failed — the closure panicked on the
+        // worker thread. That is neither an interruption nor the
+        // caller's own error: it comes back as a worker error, named.
+        // (The panic prints its own message to stderr; that noise is the
+        // panic hook doing its job, not a failing test.)
+        let t = CancelToken::new();
+        let err = crate::test_util::block_on(blocking(&t, || -> crate::Result<()> {
+            panic!("the worker fell over")
+        }))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.starts_with("worker: "), "the failure is named as the worker's: {msg}");
+        assert!(msg.contains("the worker fell over"), "and it says what happened: {msg}");
+    }
+
+    #[test]
     fn minting_and_cancelling_take_the_same_lock() {
         // The race the tree has to close: a leaf minted while a cancel is
         // landing must not slip through. Both the mint and the cancel take
