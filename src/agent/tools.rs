@@ -309,4 +309,123 @@ mod tests {
         );
         assert_eq!(on, off, "the schemas are the same bytes either way");
     }
+
+    // ---- the four tools, as the model sees them --------------------------
+
+    /// A provider over a fleet with no run in flight: every call that
+    /// reaches the fleet is refused, which is what the error strings
+    /// are about.
+    fn tools() -> AgentTools {
+        AgentTools::new(Arc::new(Fleet::new(AgentCfg::default())))
+    }
+
+    #[test]
+    fn the_agent_tools_provider_owns_only_the_fleet_tool_names() {
+        let tools = tools();
+        for n in AGENT_TOOL_NAMES {
+            assert!(tools.owns(n), "the provider owns {n}");
+        }
+        assert!(!tools.owns("bash"), "and not the built-ins");
+        assert!(!tools.owns(""), "and not an empty name");
+    }
+
+    #[test]
+    fn an_unknown_agent_tool_name_is_refused_with_its_own_name() {
+        let out = block_on(tools().call("nope", &json!({}), &CancelToken::new(), AgentId::MAIN));
+        assert_eq!(out, "error: unknown agent tool 'nope'");
+    }
+
+    #[test]
+    fn spawn_agent_without_a_task_is_refused() {
+        let out = block_on(tools().call("spawn_agent", &json!({}), &CancelToken::new(), AgentId::MAIN));
+        assert_eq!(out, "error: spawn_agent needs a task");
+    }
+
+    #[test]
+    fn spawn_agent_with_a_blank_task_is_refused() {
+        // a task of nothing but spaces is no task at all
+        let out = block_on(tools().call("spawn_agent", &json!({"task": "   "}), &CancelToken::new(), AgentId::MAIN));
+        assert_eq!(out, "error: spawn_agent needs a task");
+    }
+
+    #[test]
+    fn spawn_agent_says_so_when_the_fleet_refuses_the_worker() {
+        // there is no run in flight, so the fleet has nothing for a
+        // worker to hang under — and it says so, in the shape the model
+        // already reads for a failure.
+        let out = block_on(tools().call(
+            "spawn_agent",
+            &json!({"task": "count the files"}),
+            &CancelToken::new(),
+            AgentId::MAIN,
+        ));
+        assert_eq!(out, "error: no run in flight");
+    }
+
+    #[test]
+    fn wait_agents_says_the_ids_must_be_agent_ids() {
+        // an id that is not a string is not an agent id
+        let out = block_on(tools().call("wait_agents", &json!({"ids": [7]}), &CancelToken::new(), AgentId::MAIN));
+        assert_eq!(out, "error: ids are agent ids like \"a1\"");
+    }
+
+    #[test]
+    fn wait_agents_names_the_id_it_could_not_parse() {
+        let out = block_on(tools().call("wait_agents", &json!({"ids": ["zz"]}), &CancelToken::new(), AgentId::MAIN));
+        assert_eq!(out, "error: 'zz' is not an agent id");
+    }
+
+    #[test]
+    fn wait_agents_says_the_ids_must_be_a_list() {
+        let out = block_on(tools().call("wait_agents", &json!({"ids": "a1"}), &CancelToken::new(), AgentId::MAIN));
+        assert_eq!(out, "error: ids is a list of agent ids like [\"a1\"]");
+    }
+
+    #[test]
+    fn wait_agents_waits_for_the_workers_it_was_given() {
+        // The ids the model asked for are the ids the wait is about: the
+        // worker it did not name does not come back.
+        let fleet = Arc::new(Fleet::new(AgentCfg { max_agents: 4, wait_ms: 2_000 }));
+        let router = Arc::new(crate::core::ports::ToolRouter::new(vec![Box::new(crate::tools::Builtins)]));
+        let sink: Arc<dyn crate::ui::Show> = Arc::new(crate::test_util::Recorder::default());
+        let scope = crate::cancel::CancelScope::new();
+        // the run is already over: the workers it spawns are born
+        // cancelled, and never reach the model
+        scope.cancel();
+        fleet.begin_run(
+            &crate::test_util::cfg("http://127.0.0.1:1".into(), false),
+            &crate::test_util::ctx(),
+            &router,
+            &sink,
+            &scope,
+        );
+        let tools = AgentTools::new(fleet.clone());
+        let (wanted, other, out) = block_on(async {
+            let wanted = fleet.spawn("count the files", None).expect("a worker");
+            let other = fleet.spawn("check the tests", None).expect("a worker");
+            let out = tools
+                .call(
+                    "wait_agents",
+                    &json!({"ids": [wanted.to_string()]}),
+                    &CancelToken::new(),
+                    AgentId::MAIN,
+                )
+                .await;
+            (wanted, other, out)
+        });
+        assert!(out.contains(&wanted.to_string()), "the wait answered about the worker it was given: {out}");
+        assert!(!out.contains(&other.to_string()), "and not about the one it was not: {out}");
+    }
+
+    #[test]
+    fn stop_agent_without_an_id_is_refused() {
+        let out = block_on(tools().call("stop_agent", &json!({}), &CancelToken::new(), AgentId::MAIN));
+        assert_eq!(out, "error: stop_agent needs an id");
+    }
+
+    #[test]
+    fn stop_agent_rejects_an_id_that_is_not_an_agent_id() {
+        let out = block_on(tools().call("stop_agent", &json!({"id": "zz"}), &CancelToken::new(), AgentId::MAIN));
+        assert_eq!(out, "error: 'zz' is not an agent id");
+    }
 }

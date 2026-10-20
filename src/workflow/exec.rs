@@ -1090,4 +1090,159 @@ mod tests {
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(labels, vec!["count", "count the files"], "the fleet named them the same: {rows:?}");
     }
+
+    // ---- the fleet's own numbers -----------------------------------------
+
+    #[test]
+    fn the_fleet_reads_its_limits_from_the_config() {
+        let mut c = cfg("http://127.0.0.1:1".into(), false);
+        c.max_agents = 3;
+        c.agent_wait_ms = 1_234;
+        let agent_cfg = AgentCfg::from_config(&c);
+        assert_eq!(agent_cfg.max_agents, 3, "the cap comes from the config");
+        assert_eq!(agent_cfg.wait_ms, 1_234, "and so does the wait");
+    }
+
+    #[test]
+    fn a_spawn_without_a_run_in_flight_says_so() {
+        // A worker hangs under the run's scope: with no run there is
+        // nothing for it to hang under.
+        let fleet = Fleet::new(AgentCfg { max_agents: 4, wait_ms: 1_000 });
+        let err = fleet.spawn("count the files", None).unwrap_err();
+        assert_eq!(err, "no run in flight");
+    }
+
+    #[test]
+    fn a_wait_that_was_cancelled_says_so() {
+        // The token is cancelled before the wait begins: the check at
+        // the top of the wait answers before the wait does.
+        let port = mock_late(LATE, ANSWER);
+        block_on(async {
+            let h = Harness::new(port, AgentCfg { max_agents: 4, wait_ms: 60_000 });
+            let id = h.fleet.spawn("count the files", None).unwrap();
+            let token = CancelToken::new();
+            token.cancel();
+            let out = h.fleet.wait(&[id], &token).await;
+            assert_eq!(out, "the wait was cancelled");
+        });
+    }
+
+    #[test]
+    fn a_wait_for_an_id_that_is_not_a_worker_says_nothing() {
+        // The wait takes the caller's ids verbatim, so an id the fleet
+        // never handed out has no block to say anything about.
+        let fleet = Fleet::new(AgentCfg { max_agents: 4, wait_ms: 1_000 });
+        let unknown = AgentId::next();
+        let out = block_on(fleet.wait(&[unknown], &CancelToken::new()));
+        assert_eq!(out, "", "an id that is not a worker has no block: {out:?}");
+    }
+
+    // ---- the fleet's own state -------------------------------------------
+
+    #[test]
+    fn the_fleet_lists_the_workers_that_are_alive() {
+        let fleet = Fleet::new(AgentCfg { max_agents: 4, wait_ms: 1_000 });
+        let id = AgentId::next();
+        fleet.roster().register(id, CancelScope::new());
+        assert_eq!(fleet.live_ids(), vec![id], "the worker is live");
+    }
+
+    #[test]
+    fn cloning_a_fleet_shares_its_roster() {
+        // A clone is another handle on the same fleet, not a second
+        // fleet: the workers it knows are the workers both know.
+        let fleet = Fleet::new(AgentCfg { max_agents: 4, wait_ms: 1_000 });
+        let id = AgentId::next();
+        fleet.roster().register(id, CancelScope::new());
+        let clone = fleet.clone();
+        assert_eq!(clone.live_ids(), vec![id], "the clone sees the same live workers");
+        clone.roster().register(AgentId::next(), CancelScope::new());
+        assert_eq!(fleet.live_ids().len(), 2, "the two fleets share one roster");
+    }
+
+    #[test]
+    fn the_fleet_recovers_from_a_poisoned_lock() {
+        // A thread that dies holding the fleet's own lock poisons it.
+        // The next caller must still get the fleet's state: a poisoned
+        // lock is a broken *writer*, not a broken fleet.
+        let fleet = Fleet::new(AgentCfg { max_agents: 4, wait_ms: 1_000 });
+        let inner = fleet.inner.clone();
+        let doomed = inner.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = doomed.lock().unwrap();
+            panic!("the writer died holding the lock");
+        })
+        .join();
+        assert!(fleet.inner.is_poisoned(), "the lock is poisoned");
+        assert_eq!(fleet.list(), "no background agents", "and the fleet still reads itself: {}", fleet.list());
+        assert_eq!(fleet.live_ids(), Vec::<AgentId>::new(), "and still lists its workers");
+    }
+
+    #[test]
+    fn the_fleet_debug_names_how_many_workers_it_holds() {
+        let fleet = Fleet::new(AgentCfg { max_agents: 4, wait_ms: 1_000 });
+        let text = format!("{fleet:?}");
+        assert!(text.contains("Fleet"), "it names itself: {text}");
+        assert!(text.contains("workers"), "and the field it holds: {text}");
+        assert!(text.contains("workers: 0"), "and how many it holds: {text}");
+    }
+
+    // ---- what the fleet shows --------------------------------------------
+
+    #[test]
+    fn a_failed_worker_is_shown_as_failed_and_a_running_one_as_running() {
+        assert_eq!(state_word(TurnState::Failed), "failed");
+        assert_eq!(state_word(TurnState::Queued), "running");
+        assert_eq!(state_word(TurnState::InProgress), "running");
+    }
+
+    /// A worker that ended, as the fleet's record holds it.
+    fn finished(state: TurnState, report: Option<&str>) -> WorkerDone {
+        let mut agent = Agent::new(
+            AgentId::next(),
+            "w1".into(),
+            crate::agent::AgentRole::Worker,
+            "count the files".into(),
+            crate::core::turn::Turn::new(0),
+        );
+        agent.lifecycle.transition(TurnState::InProgress, None).unwrap();
+        if state != TurnState::InProgress {
+            agent.lifecycle.transition(state, None).unwrap();
+        }
+        agent.report = report.map(str::to_string);
+        WorkerDone { agent, elapsed: Duration::from_secs(3) }
+    }
+
+    #[test]
+    fn a_stopped_worker_with_a_report_shows_the_report() {
+        // A worker that was stopped after it had said something: the
+        // block carries what it produced.
+        let done = finished(TurnState::Interrupted, Some("half an answer"));
+        let id = done.agent.id;
+        let block = block_for(id, &done);
+        assert!(block.contains("stopped after 3s"), "got: {block}");
+        assert!(block.contains("half an answer"), "and the report it produced: {block}");
+    }
+
+    #[test]
+    fn a_worker_that_is_still_running_says_so() {
+        let done = finished(TurnState::InProgress, None);
+        let id = done.agent.id;
+        let block = block_for(id, &done);
+        assert!(block.contains("still running"), "got: {block}");
+    }
+
+    // ---- the label -------------------------------------------------------
+
+    #[test]
+    fn the_default_label_of_a_worker_is_capped_at_24_characters() {
+        // Four long words make a label longer than a table column can
+        // hold: it is cut, and the cut says so.
+        let label = default_label("aaaaaaa bbbbbbb ccccccc ddddddd");
+        assert_eq!(label.chars().count(), 25, "24 characters and the ellipsis: {label}");
+        assert!(label.ends_with('…'), "got: {label}");
+        assert!(label.starts_with("aaaaaaa bbbbbbb cccccc"), "got: {label}");
+        // a label that fits is left alone
+        assert_eq!(default_label("count the files in src"), "count the files in");
+    }
 }

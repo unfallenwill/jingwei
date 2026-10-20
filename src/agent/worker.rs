@@ -193,3 +193,204 @@ impl Show for CountingSink {
         self.inner.show(m);
     }
 }
+
+// ---- tests -----------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::{block_on, cfg, mock_seq, Recorder};
+
+    /// A model that answers once and stops.
+    const ANSWER: &str =
+        r#"{"content":[{"type":"text","text":"the report"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
+
+    /// A worker job over a mock model, wired the way the fleet wires it.
+    fn job(port: u16, done: Arc<Mutex<Option<WorkerDone>>>, tools: Arc<AtomicUsize>) -> WorkerJob {
+        let router = Arc::new(ToolRouter::new(vec![Box::new(crate::tools::Builtins)]));
+        let rec = Recorder::default();
+        let sink: Arc<dyn Show> = Arc::new(rec);
+        let seed = crate::test_util::ctx().seed();
+        WorkerJob {
+            id: AgentId::next(),
+            label: "w1".into(),
+            task: "count the files".into(),
+            scope: CancelScope::new(),
+            cfg: cfg(format!("http://127.0.0.1:{port}"), false),
+            router,
+            sink,
+            seed,
+            roster: Roster::new(),
+            done,
+            tools,
+        }
+    }
+
+    /// The worker's sink, built the way `run_worker` builds it: the
+    /// session's sink, attributed to the worker, counting its tool calls.
+    fn counting_sink() -> (CountingSink, Arc<AtomicUsize>) {
+        let rec = Recorder::default();
+        let count = Arc::new(AtomicUsize::new(0));
+        let sink = CountingSink {
+            inner: AgentSink::new(rec, AgentId::next()),
+            count: count.clone(),
+            seen: Mutex::new(String::new()),
+        };
+        (sink, count)
+    }
+
+    // ---- the worker's own report -----------------------------------------
+
+    #[test]
+    fn a_finished_worker_hands_its_result_back() {
+        // The fleet waits on the worker's `done` slot: the worker has to
+        // leave its result there, or the wait never ends.
+        let (port, _reqs) = mock_seq(vec![(200, ANSWER.into())]);
+        let done = Arc::new(Mutex::new(None));
+        let tools = Arc::new(AtomicUsize::new(0));
+        let j = job(port, done.clone(), tools.clone());
+        let id = j.id;
+        block_on(run_worker(j));
+        let slot = done.lock().unwrap();
+        let d = slot.as_ref().expect("the worker left its result behind");
+        assert_eq!(d.agent.id, id, "the result is the worker's own");
+        assert_eq!(d.agent.state(), TurnState::Completed, "and it says how it ended");
+        assert_eq!(d.agent.report.as_deref(), Some("the report"), "with the report it produced");
+    }
+
+    #[test]
+    fn a_worker_whose_result_slot_is_poisoned_leaves_nothing_behind() {
+        // The slot the fleet reads is poisoned: a thread died holding
+        // it. The worker cannot leave its result there, and it does not
+        // panic over it — the wait is what notices.
+        let (port, _reqs) = mock_seq(vec![(200, ANSWER.into())]);
+        let done = Arc::new(Mutex::new(None));
+        let doomed = done.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = doomed.lock().unwrap();
+            panic!("the writer died holding the lock");
+        })
+        .join();
+        let tools = Arc::new(AtomicUsize::new(0));
+        let j = job(port, done.clone(), tools);
+        block_on(run_worker(j));
+        let left = done.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(left.is_none(), "the worker left nothing behind");
+    }
+
+    #[test]
+    fn the_report_of_a_worker_is_the_text_it_ended_with() {
+        let mut ctx = crate::test_util::ctx();
+        ctx.push(Message::User("count the files".into()));
+        ctx.push(Message::Assistant(vec![Block::Text("the answer".into())]));
+        assert_eq!(
+            report_of(&ctx, TurnState::Completed).as_deref(),
+            Some("the answer"),
+            "the report is the last thing the worker said"
+        );
+        // a worker that finished without saying anything says so
+        let blank = crate::test_util::ctx();
+        assert_eq!(
+            report_of(&blank, TurnState::Completed).as_deref(),
+            Some("no answer"),
+            "a silent worker says it had nothing to say"
+        );
+        // a worker that failed has no report: the failure is the report
+        assert_eq!(report_of(&blank, TurnState::Failed), None);
+    }
+
+    #[test]
+    fn a_worker_that_ended_with_blank_text_has_no_text_of_its_own() {
+        // The last thing the worker said was whitespace: that is not a
+        // report, so the way it ended is the report.
+        let mut ctx = crate::test_util::ctx();
+        ctx.push(Message::User("count the files".into()));
+        ctx.push(Message::Assistant(vec![Block::Text("   ".into())]));
+        assert_eq!(
+            report_of(&ctx, TurnState::Completed).as_deref(),
+            Some("no answer"),
+            "a blank last text is no text: the state says how it ended"
+        );
+    }
+
+    #[test]
+    fn the_last_text_of_a_worker_steps_over_what_is_not_text() {
+        // The last turn can end with something that is not text — a
+        // thinking block, a tool call. The walk steps over it and finds
+        // the text before it.
+        let mut ctx = crate::test_util::ctx();
+        ctx.push(Message::User("count the files".into()));
+        ctx.push(Message::Assistant(vec![
+            Block::Text("the answer".into()),
+            Block::Thinking { text: "hmm".into(), signature: None },
+        ]));
+        assert_eq!(
+            last_text(&ctx).as_deref(),
+            Some("the answer"),
+            "the text before the last non-text block is still the last text"
+        );
+    }
+
+    #[test]
+    fn the_last_text_of_a_worker_is_the_text_it_ended_with() {
+        let mut ctx = crate::test_util::ctx();
+        ctx.push(Message::User("count the files".into()));
+        ctx.push(Message::Assistant(vec![Block::Text("the first answer".into())]));
+        ctx.push(Message::Assistant(vec![Block::Text("the last answer".into())]));
+        assert_eq!(
+            last_text(&ctx).as_deref(),
+            Some("the last answer"),
+            "the last text, walking the transcript backwards"
+        );
+        // a transcript with no answer in it has no last text
+        let mut quiet = crate::test_util::ctx();
+        quiet.push(Message::User("count the files".into()));
+        assert_eq!(last_text(&quiet), None);
+    }
+
+    // ---- the worker's sink -----------------------------------------------
+
+    #[test]
+    fn the_sink_counts_the_tool_calls_a_worker_made() {
+        let (sink, count) = counting_sink();
+        sink.show(Msg::Tool { name: "bash".into(), summary: "echo hi".into(), output: "hi".into() });
+        sink.show(Msg::Tool { name: "read_file".into(), summary: "a.txt".into(), output: "x".into() });
+        assert_eq!(count.load(Ordering::Relaxed), 2, "two tool calls, two counts");
+        // and prose is not a tool call
+        sink.show(Msg::Text("not a tool".into()));
+        assert_eq!(count.load(Ordering::Relaxed), 2, "prose does not count");
+    }
+
+    #[test]
+    fn the_sink_keeps_the_text_a_worker_streamed() {
+        let (sink, _count) = counting_sink();
+        sink.show(Msg::Text("the report".into()));
+        assert!(sink.has_seen("the report"), "the sink kept what the worker said");
+        assert!(!sink.has_seen("something else"), "and not what it did not say");
+        assert!(!sink.has_seen(""), "an empty report is never seen");
+    }
+
+    #[test]
+    fn the_worker_sink_recovers_from_a_poisoned_lock() {
+        // A thread that dies holding the sink's own lock poisons it. The
+        // next caller must still get the text: a poisoned lock is a
+        // broken *writer*, not a broken sink.
+        let seen = Arc::new(Mutex::new(String::new()));
+        let doomed = seen.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = doomed.lock().unwrap();
+            panic!("the writer died holding the lock");
+        })
+        .join();
+        let rec = Recorder::default();
+        let count = Arc::new(AtomicUsize::new(0));
+        let sink = CountingSink {
+            inner: AgentSink::new(rec, AgentId::next()),
+            count,
+            seen: Arc::try_unwrap(seen).ok().expect("the only handle left"),
+        };
+        assert!(sink.seen.is_poisoned(), "the lock is poisoned");
+        sink.show(Msg::Text("the report".into()));
+        assert!(sink.has_seen("the report"), "the sink still keeps what the worker said");
+    }
+}

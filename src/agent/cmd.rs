@@ -198,4 +198,68 @@ mod tests {
             "got: {msgs:?}"
         );
     }
+
+    // ---- the verbs the human types ---------------------------------------
+
+    #[test]
+    fn the_agents_command_without_a_verb_prints_its_usage() {
+        let fleet = Fleet::new(crate::workflow::exec::AgentCfg::default());
+        let msgs = handle("stop", &fleet).expect("a command");
+        assert_eq!(msgs.len(), 1, "one banner: {msgs:?}");
+        assert!(
+            matches!(&msgs[0], Msg::Banner(t) if t == "usage: /agents stop <id>"),
+            "got: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn the_agents_command_rejects_an_id_that_is_not_an_agent_id() {
+        let fleet = Fleet::new(crate::workflow::exec::AgentCfg::default());
+        let msgs = handle("stop zz", &fleet).expect("a command");
+        assert_eq!(msgs.len(), 1, "one banner: {msgs:?}");
+        assert!(
+            matches!(&msgs[0], Msg::Banner(t) if t == "'zz' is not an agent id"),
+            "got: {msgs:?}"
+        );
+    }
+
+    // ---- the table the human reads ---------------------------------------
+
+    #[test]
+    fn the_agents_table_shows_the_error_a_worker_failed_with() {
+        // A failed worker's detail is what went wrong, not how many
+        // tools it called: the failure is the information.
+        let a = AgentId::next();
+        let mut r = row(a, "build", "failed");
+        r.error = Some("api 400: no".into());
+        let text = render_table(&[r]);
+        assert!(text.contains("api 400: no"), "the error is the detail: {text}");
+        assert!(!text.contains("7 tools"), "and it replaced the tool count: {text}");
+    }
+
+    #[test]
+    fn a_report_is_printed_under_its_row() {
+        // The human should not have to ask the model for a report: it is
+        // printed under the row that made it, indented.
+        let a = AgentId::next();
+        let mut r = row(a, "build", "done");
+        r.report = Some("the build is green".into());
+        let text = render_table(&[r]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "the row and its report: {text}");
+        assert_eq!(lines[1], "    the build is green", "indented under the row: {text}");
+    }
+
+    #[test]
+    fn a_blank_report_prints_nothing_under_its_row() {
+        // A report of nothing but whitespace is no report: it prints no
+        // line of its own, and the next row still follows.
+        let a = AgentId::next();
+        let mut r = row(a, "build", "done");
+        r.report = Some("   ".into());
+        let b = AgentId::next();
+        let text = render_table(&[r, row(b, "test", "done")]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "two rows and no report line: {text}");
+    }
 }

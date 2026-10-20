@@ -215,4 +215,49 @@ mod tests {
         assert!(worker_scope.is_cancelled(), "the background agent is stopped");
         assert!(!main_scope.is_cancelled(), "the conversation is not the fleet's to stop");
     }
+
+    /// A thread that dies while holding the roster's own lock poisons it.
+    /// The next caller must still get the agents: a poisoned lock is a
+    /// broken *writer*, not a broken registry — and the roster is the
+    /// thing a stop request reaches through, so it must not go dead
+    /// because one writer panicked.
+    #[test]
+    fn the_roster_recovers_from_a_poisoned_lock() {
+        let roster = Roster::new();
+        let a = AgentId::next();
+        roster.register(a, CancelScope::new());
+        // poison *this* roster's lock — the one the test owns, never a
+        // shared one
+        let inner = roster.inner.clone();
+        let doomed = inner.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = doomed.lock().unwrap();
+            panic!("the writer died holding the lock");
+        })
+        .join();
+        assert!(roster.inner.is_poisoned(), "the lock is poisoned");
+
+        // the roster still answers: it still lists, registers, removes
+        // and stops.
+        assert_eq!(roster.list(), vec![a], "the agent is still live: {:?}", roster.list());
+        let b = AgentId::next();
+        roster.register(b, CancelScope::new());
+        assert_eq!(roster.list(), vec![a, b], "and a new one joins: {:?}", roster.list());
+        roster.remove(a);
+        assert_eq!(roster.list(), vec![b], "and a gone one leaves: {:?}", roster.list());
+        assert!(roster.stop(b), "and a stop request still reaches its scope");
+    }
+
+    /// The debug form is what a log line reads: it must name the roster
+    /// and the agents that are alive.
+    #[test]
+    fn the_roster_debug_names_the_agents_that_are_alive() {
+        let roster = Roster::new();
+        let a = AgentId::next();
+        roster.register(a, CancelScope::new());
+        let text = format!("{roster:?}");
+        assert!(text.contains("Roster"), "it names itself: {text}");
+        assert!(text.contains("live"), "and the field it holds: {text}");
+        assert!(text.contains(&format!("{a:?}")), "and the agent that is alive: {text}");
+    }
 }

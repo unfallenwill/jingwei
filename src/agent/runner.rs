@@ -261,6 +261,43 @@ mod tests {
         cx
     }
 
+    /// A command that leaves a mark in `dir` and then waits: the mark is
+    /// written when the command really starts, so a test that waits for
+    /// it waits for the tool, not for a clock. A fixed delay raced the
+    /// response under load, and the race was lost by the tool that had
+    /// not started yet.
+    fn a_command_that_announces_itself(dir: &std::path::Path) -> String {
+        let started = dir.join("started");
+        // long enough that the tool is still running when the cancel
+        // lands, short enough that a stray child does not outlive the
+        // suite by much
+        let wait = if cfg!(windows) { "ping -n 10 127.0.0.1 > nul" } else { "sleep 10" };
+        if cfg!(windows) {
+            format!("type nul > \"{}\" && {wait}", started.display())
+        } else {
+            format!(": > '{}' && {wait}", started.display())
+        }
+    }
+
+    /// Cancel once the mark is there — the run is interrupted while the
+    /// tool is really running, which is the only moment the interruption
+    /// means what the test says it means.
+    fn cancel_when_the_tool_starts(mark: std::path::PathBuf, token: Arc<CancelToken>) {
+        tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !mark.exists() {
+                if std::time::Instant::now() > deadline {
+                    // The tool never started: stop the run rather than
+                    // waiting out a command that sleeps for half a minute.
+                    token.cancel();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            token.cancel();
+        });
+    }
+
     // ---- truncate: the bounded-output safety net --------------------------
 
     #[test]
@@ -451,20 +488,21 @@ mod tests {
 
     #[test]
     fn agent_loop_interrupted_mid_tool_finishes_pairing() {
-        let cmd = if cfg!(windows) { "ping -n 30 127.0.0.1 > nul" } else { "sleep 30" };
-        let tool = format!(
-            r#"{{"content":[{{"type":"tool_use","id":"t1","name":"bash","input":{{"command":"{cmd}"}}}}],"usage":{{"input_tokens":1,"output_tokens":1}}}}"#);
+        // The cancel waits for the tool to say it started: a fixed delay
+        // raced the response, and the race could be lost by a tool that
+        // had not begun — which is an interruption of the request, not
+        // of the tool.
+        let dir = crate::test_util::temp_dir("interrupt_mid_tool");
+        let tool = json!({"content": [
+            {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": a_command_that_announces_itself(&dir)}},
+        ], "usage": {"input_tokens": 1, "output_tokens": 1}}).to_string();
         let (port, _) = mock_seq(vec![(200, tool)]);
         let mut cx = ctx_with("go");
         let mut agent = Agent::main("go");
         let err = block_on(async {
             let (router, hub) = router();
             let token = Arc::new(CancelToken::new());
-            let t = token.clone();
-            tokio::task::spawn_blocking(move || {
-                std::thread::sleep(std::time::Duration::from_millis(400));
-                t.cancel();
-            });
+            cancel_when_the_tool_starts(dir.join("started"), token.clone());
             let res = agent_loop(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &token, &sink()).await;
             hub.shutdown().await;
             res
@@ -607,6 +645,152 @@ mod tests {
             roster.list().is_empty(),
             "and it let the roster go when the run ended: {:?}",
             roster.list()
+        );
+    }
+
+    // ---- the loop's own guard rails --------------------------------------
+
+    #[test]
+    fn a_turn_that_is_not_fresh_is_refused() {
+        // The only legal first move is `Queued → InProgress`. A caller
+        // that hands in a turn that has already left `Queued` gets a
+        // plain error — not a panic, and not a run on a turn whose
+        // timestamps are already stamped.
+        let done = r#"{"content":[{"type":"text","text":"all done"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let (port, reqs) = mock_seq(vec![(200, done.into())]);
+        let mut cx = ctx_with("say hi");
+        let mut agent = Agent::main("say hi");
+        // the turn is already running: the loop must refuse it
+        agent.lifecycle.transition(TurnState::InProgress, None).unwrap();
+        let err = block_on(async {
+            let (router, hub) = router();
+            let res = agent_loop(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &CancelToken::new(), &sink()).await;
+            hub.shutdown().await;
+            res
+        })
+        .unwrap_err();
+        assert!(matches!(&err, Error::Msg(m) if m.contains("illegal transition")), "got: {err}");
+        assert!(reqs.lock().unwrap().is_empty(), "and nothing went out: {:?}", reqs.lock().unwrap());
+    }
+
+    #[test]
+    fn a_history_too_big_for_the_context_is_trimmed_and_says_so() {
+        // The context's budget cannot hold the history: the trim policy
+        // drops the tool result and the tool call it belongs to, and the
+        // run says that it did.
+        let done = r#"{"content":[{"type":"text","text":"all done"}],"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let (port, _reqs) = mock_seq(vec![(200, done.into())]);
+        let md = crate::core::agents_md::AgentsMdContext::empty(&std::path::PathBuf::from("."));
+        let mut cx = crate::core::context::Context::new(&md, 1);
+        cx.push(Message::User("say hi".into()));
+        cx.push(Message::Assistant(vec![Block::ToolUse {
+            id: "t1".into(),
+            name: "bash".into(),
+            input: json!({"command": "true"}),
+        }]));
+        cx.push(Message::ToolResults(vec![ToolResult { id: "t1".into(), content: "the output".into() }]));
+        let before = cx.history().len();
+        let recorder = Recorder::default();
+        let mut agent = Agent::main("say hi");
+        block_on(async {
+            let (router, hub) = router();
+            agent_loop(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &CancelToken::new(), &recorder).await.unwrap();
+            hub.shutdown().await;
+        });
+        assert!(
+            recorder.msgs().iter().any(|m| matches!(m, Msg::Note { sev: Sev::Warn, text } if text == " trimmed history to fit --context-size ")),
+            "the trim is announced: {:?}",
+            recorder.msgs()
+        );
+        assert!(cx.history().len() < before, "and the history shrank: {:?}", cx.history());
+    }
+
+    #[test]
+    fn an_interrupted_response_that_carries_no_text_keeps_nothing() {
+        // The response was cut off before it said anything. The tool
+        // call it had is dropped — its result never ran — and there is
+        // no text to keep, so nothing at all is pushed onto the history.
+        let tool = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#, "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"bash","input":{}}}"#, "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"echo hi\"}"}}"#, "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n");
+        // The second response stalls after its message_delta: the client
+        // is inside the stream, and the cancellation lands there.
+        let stalled = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}"#, "\n\n",
+            r#"data: {"type":"message_delta","usage":{"output_tokens":1}}"#, "\n\n");
+        let (port, _stalled_written) = mock_stall(tool, stalled);
+        let mut cx = ctx_with("go");
+        let mut agent = Agent::main("go");
+        let recorder = Recorder::default();
+        let err = block_on(async {
+            let (router, hub) = router();
+            let token = Arc::new(CancelToken::new());
+            let t = token.clone();
+            let seen = recorder.clone();
+            // Cancel only once the client has read the stalled response:
+            // the message_delta it carries is the one event that proves
+            // the client is inside the stream, and the run has to be
+            // interrupted *there* — a cancel that landed earlier would
+            // abort the request instead of cutting the response short.
+            tokio::task::spawn_blocking(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !seen.msgs().iter().any(|m| matches!(m, Msg::OutTokens(_))) {
+                    if std::time::Instant::now() > deadline { panic!("the client never read the stalled response"); }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                t.cancel();
+            });
+            let res = agent_loop(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), true), &mut cx, &router, &token, &recorder).await;
+            hub.shutdown().await;
+            res
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::Interrupted), "got: {err}");
+        // user + assistant(tool_use) + user(tool_result) — and nothing
+        // from the response that was cut off
+        assert_eq!(cx.history().len(), 3, "the cut-off response left nothing behind: {:?}", cx.history());
+    }
+
+    #[test]
+    fn a_tool_call_after_the_interrupt_is_skipped() {
+        // The model asked for two calls. The first was interrupted, so
+        // the second never runs — and it says so, in the shape the model
+        // reads for a tool result.
+        //
+        // The cancel waits for the first tool to say it started: the
+        // interruption has to land while the tool is running, or the
+        // run is cut short before any tool ran at all.
+        let dir = crate::test_util::temp_dir("interrupt_skips");
+        let two = json!({"content": [
+            {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": a_command_that_announces_itself(&dir)}},
+            {"type": "tool_use", "id": "t2", "name": "bash", "input": {"command": "echo hi"}},
+        ], "usage": {"input_tokens": 1, "output_tokens": 1}}).to_string();
+        let (port, _reqs) = mock_seq(vec![(200, two)]);
+        let mut cx = ctx_with("go");
+        let mut agent = Agent::main("go");
+        let err = block_on(async {
+            let (router, hub) = router();
+            let token = Arc::new(CancelToken::new());
+            cancel_when_the_tool_starts(dir.join("started"), token.clone());
+            let res = agent_loop(&mut agent, &cfg(format!("http://127.0.0.1:{port}"), false), &mut cx, &router, &token, &sink()).await;
+            hub.shutdown().await;
+            res
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::Interrupted), "got: {err}");
+        let j = hist(cx.history());
+        assert_eq!(j.as_array().unwrap().len(), 3,
+            "user + assistant(tool_use) + user(tool_result): {j:?}");
+        let results = j[2]["content"].as_array().expect("the tool results");
+        assert_eq!(results.len(), 2, "every tool call still leaves with a result: {j:?}");
+        assert!(results[0]["content"].as_str().unwrap().contains("[interrupted by user]"), "the first call was interrupted: {j:?}");
+        assert_eq!(
+            results[1]["content"],
+            json!("skipped: this run was interrupted before the tool ran"),
+            "the second call was skipped: {j:?}"
         );
     }
 }
