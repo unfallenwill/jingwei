@@ -625,4 +625,70 @@ mod tests {
         assert_eq!(via_link, target, "the symlink itself is unchanged");
         assert_eq!(on_target, "v", "the target got the bytes");
     }
+
+    // ---- a path with no directory part ------------------------------------
+
+    /// Removes a file the test created, even when an assertion fails first.
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
+    }
+
+    /// A path that names a file and nothing else has no parent to create:
+    /// the tool writes it where the agent stands instead of making a
+    /// directory for it. The file lands in the process's working directory,
+    /// so the test puts it back the way it found it. The name carries the
+    /// process's own id, so two suites running side by side do not write
+    /// over each other's probe.
+    #[test]
+    fn a_path_with_no_directory_part_is_written_where_the_agent_stands() {
+        let name = format!("jingwei_s14_bare_name_probe_{}.txt", std::process::id());
+        let cwd = std::env::current_dir().unwrap();
+        let landed = cwd.join(&name);
+        let _cleanup = Cleanup(landed.clone());
+        let out = dispatch("write_file", &json!({"path": name, "content": "bare"}), AgentId::MAIN);
+        assert_eq!(out, format!("ok: wrote 4 bytes to {name}"), "got: {out}");
+        assert_eq!(fs::read_to_string(&landed).unwrap(), "bare",
+            "the file landed in the working directory");
+        // and it is gone again once the test is over
+        drop(_cleanup);
+        assert!(!landed.exists(), "the probe file must not outlive the test");
+    }
+
+    // ---- the spawn failure: the shell is not there -------------------------
+
+    /// The bash tool spawns `sh`; when the program cannot be found the tool
+    /// answers with the spawn error instead of an exit code. The only way
+    /// to reach that branch is to take the shell off the PATH — and the
+    /// PATH is shared by every test in this process, so the probe runs in
+    /// a child process of its own, with an empty PATH of its own.
+    fn re_run_without_a_shell(test_name: &str) -> String {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env("PATH", "")
+            .env("JINGWEI_S14_NO_SHELL", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(),
+            "the child probe failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bash_tool_that_cannot_find_its_shell_says_so() {
+        const NAME: &str = "tools::tests::a_bash_tool_that_cannot_find_its_shell_says_so";
+        if std::env::var_os("JINGWEI_S14_NO_SHELL").is_some() {
+            // the child: there is no `sh` on the PATH any more
+            let out = dispatch("bash", &json!({"command": "echo hi"}), AgentId::MAIN);
+            println!("JINGWEI_PROBE:{out}");
+            return;
+        }
+        let stdout = re_run_without_a_shell(NAME);
+        let line = stdout.lines().find_map(|l| l.find("JINGWEI_PROBE:").map(|i| &l[i..]))
+            .unwrap_or_else(|| panic!("the child said nothing: {stdout}"));
+        assert_eq!(line, "JINGWEI_PROBE:error: No such file or directory (os error 2)",
+            "the spawn failure is reported as an error, not as an exit code");
+    }
 }

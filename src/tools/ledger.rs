@@ -428,4 +428,62 @@ mod tests {
             assert!(msg.contains("changed on disk"), "other bytes are refused: {msg}");
         });
     }
+
+    /// The limit of the check, pinned: a file that was read and then
+    /// *deleted* cannot be compared against anything, so it is not refused.
+    /// There is no "the file moved" to speak of — there is no file. The write
+    /// lands, and the file is back.
+    #[test]
+    fn a_file_that_was_read_and_then_deleted_is_not_refused() {
+        let _g = ledger_lock();
+        let dir = temp_dir("stale_deleted");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "first").unwrap();
+        let p = path.to_str().unwrap();
+        // the ledger remembers the bytes the agent saw
+        with_ledger(|led| led.note(AgentId::MAIN, p, b"first"));
+        // and then the file is gone
+        std::fs::remove_file(&path).unwrap();
+        assert!(with_ledger(|led| led.stale(AgentId::MAIN, p)).is_none(),
+            "there is nothing on the disk to compare against: no refusal");
+        // the blunt tool therefore writes it again
+        let out = crate::tools::dispatch("write_file", &serde_json::json!({"path": p, "content": "again"}), AgentId::MAIN);
+        assert!(out.starts_with("ok:"), "the write lands: {out}");
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "again");
+    }
+
+    /// The lock is what the ledger is, and a poisoned lock is still a lock:
+    /// the ledger hands out its data instead of panicking, so a panic in one
+    /// agent's tool call cannot take every other agent's write down with it.
+    ///
+    /// The panic is caught, so the test itself passes; the poison is on the
+    /// process-wide ledger, and every later lock of it takes the same path.
+    #[test]
+    fn a_poisoned_ledger_still_hands_out_what_it_knows() {
+        let _g = ledger_lock();
+        let dir = temp_dir("poisoned");
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "first").unwrap();
+        let p = path.to_str().unwrap();
+        with_ledger(|led| led.note(AgentId::MAIN, p, b"first"));
+        // a panic inside the critical section poisons the lock
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_ledger(|_led| -> () { panic!("a tool call blew up") });
+        }));
+        assert!(panicked.is_err(), "the panic must have unwound through the lock");
+        // and the ledger still answers
+        with_ledger(|led| {
+            assert_eq!(led.seen.get(&(AgentId::MAIN, ledger_key(p))).copied(),
+                Some(fingerprint(b"first")),
+                "the ledger kept its view through the poison");
+        });
+        assert!(with_ledger(|led| led.stale(AgentId::MAIN, p)).is_none(),
+            "and the check still works: the bytes on disk are the bytes we saw");
+        // The poison is left behind on purpose: the lock is process-wide
+        // and the test cannot reach it to clear the flag (the `OnceLock`
+        // is function-local in `ledger()`, and a guard does not hand back
+        // the mutex it holds). Every later lock of it takes the same
+        // recovery path, so the ledger keeps working — that is the
+        // behaviour this test pins.
+    }
 }

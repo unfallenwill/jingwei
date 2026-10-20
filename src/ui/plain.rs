@@ -726,6 +726,130 @@ mod tests {
         assert_eq!(texts, vec!["no background agents".to_string()]);
     }
 
+    /// A worker's reasoning folds the same way the conversation's does —
+    /// into one marker line — but the worker's tag rides in front of it.
+    #[test]
+    fn a_workers_thinking_folds_into_a_tagged_marker() {
+        let id = ui::AgentId::next();
+        let out = run(vec![
+            Msg::FromAgent { id, event: Box::new(ui::AgentMsg::Think("worker reasoning\n".into())) },
+            Msg::FromAgent { id, event: Box::new(ui::AgentMsg::ThinkEnd) },
+        ]);
+        assert_eq!(
+            out,
+            vec![(Stream::Out, format!("[{id}] ▸ thought #1 · worker reasoning"))],
+            "{out:?}",
+        );
+    }
+
+    /// The sink is the fold plus the write: it holds nothing of its own
+    /// beyond the fold, and a fresh one has folded nothing yet.
+    #[test]
+    fn a_sink_folds_what_it_is_shown() {
+        let sink = PlainSink::new();
+        assert_eq!(sink.0.lock().unwrap().main.thoughts, 0, "a fresh sink has folded nothing");
+        sink.show(Msg::Think("a thought".into()));
+        sink.show(Msg::ThinkEnd);
+        assert_eq!(sink.0.lock().unwrap().main.thoughts, 1, "the sink folded the thought");
+        // `default` is the same sink, and it is fresh too
+        let other = PlainSink::default();
+        assert_eq!(other.0.lock().unwrap().main.thoughts, 0, "the default sink is fresh");
+        // a note is the sink's other stream: it rides stderr, not stdout
+        sink.show(Msg::Note { sev: Sev::Warn, text: " a note ".into() });
+        assert_eq!(sink.0.lock().unwrap().main.thoughts, 1, "a note is not a thought");
+    }
+
+    /// A hub with one server whose configuration is a failure: the hub
+    /// knows the server, so `/mcp list` has a row to show and every verb
+    /// has a server to act on.
+    async fn a_hub_with_a_broken_server(name: &str) -> crate::mcp::Hub {
+        let mut entry = crate::mcp::stub::Stub::new().entry(&[]);
+        entry.name = name.to_string();
+        entry.config = Err("no such command".into());
+        crate::mcp::Hub::of_entries(vec![entry]).await
+    }
+
+    /// A server that cannot start is still a server the user can see:
+    /// `/mcp list` gives it a row and says why it is not there.
+    #[tokio::test]
+    async fn mcp_list_shows_a_server_that_cannot_start() {
+        let hub = a_hub_with_a_broken_server("alpha").await;
+        let sink = Recorder::default();
+        handle_mcp_command("list", &hub, &sink).await;
+        let msgs = sink.msgs();
+        assert_eq!(msgs.len(), 1, "got: {msgs:?}");
+        match &msgs[0] {
+            Msg::Banner(s) => {
+                assert!(s.contains("alpha"), "{s}");
+                assert!(s.contains("failed"), "{s}");
+                assert!(s.contains("no such command"), "{s}");
+            }
+            other => panic!("expected a banner, got {other:?}"),
+        }
+        hub.shutdown().await;
+    }
+
+    /// Each of the four verbs names the server it acted on and says what
+    /// came of it: the hub's own words, in the note.
+    #[tokio::test]
+    async fn the_four_server_verbs_say_what_the_hub_said() {
+        let hub = a_hub_with_a_broken_server("alpha").await;
+        for verb in ["enable", "disable", "reconnect", "disconnect"] {
+            let sink = Recorder::default();
+            handle_mcp_command(&format!("{verb} alpha"), &hub, &sink).await;
+            let msgs = sink.msgs();
+            assert_eq!(msgs.len(), 1, "{verb}: got {msgs:?}");
+            match &msgs[0] {
+                Msg::Note { sev, text } => {
+                    assert_eq!(*sev, Sev::Err, "{verb}");
+                    assert!(text.contains(verb), "{verb}: {text}");
+                    assert!(text.contains("alpha"), "{verb}: {text}");
+                }
+                other => panic!("{verb}: expected a note, got {other:?}"),
+            }
+        }
+        hub.shutdown().await;
+    }
+
+    /// A server that goes offline on request says the verb is done: the
+    /// banner names the server and the verb.
+    #[tokio::test]
+    async fn a_server_that_goes_offline_says_the_verb_is_done() {
+        let stub = crate::mcp::stub::Stub::new();
+        let mut entry = stub.entry(&[("STUB_TOOLS", "echo")]);
+        entry.name = "alpha".into();
+        let hub = crate::mcp::Hub::of_entries(vec![entry]).await;
+        let sink = Recorder::default();
+        handle_mcp_command("disable alpha", &hub, &sink).await;
+        let msgs = sink.msgs();
+        assert_eq!(msgs.len(), 1, "got: {msgs:?}");
+        match &msgs[0] {
+            Msg::Banner(s) => assert_eq!(s, "mcp: disable alpha: done"),
+            other => panic!("expected a banner, got {other:?}"),
+        }
+        hub.shutdown().await;
+    }
+
+    /// A server that is out of service is summarised by what it is, not
+    /// by a failure: the row says "disabled" or "disconnected".
+    #[test]
+    fn a_disabled_or_a_disconnected_server_is_summarised_as_such() {
+        use crate::mcp::{ServerState, ServerStatus};
+        let disabled = format_mcp_status(&ServerStatus {
+            name: "alpha".into(),
+            state: ServerState::Disabled,
+            tools_count: 0,
+        });
+        assert!(disabled.contains("alpha"), "{disabled}");
+        assert!(disabled.contains("disabled"), "{disabled}");
+        let gone = format_mcp_status(&ServerStatus {
+            name: "alpha".into(),
+            state: ServerState::Disconnected,
+            tools_count: 0,
+        });
+        assert!(gone.contains("disconnected"), "{gone}");
+    }
+
     /// `format_mcp_status` produces one row with the columns a list needs:
     /// the name, the state, the tool count.
     #[test]

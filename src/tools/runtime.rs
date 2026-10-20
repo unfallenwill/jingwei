@@ -340,4 +340,92 @@ mod tests {
         assert!(out.starts_with("exit=0\nhello"), "got: {out}");
         assert!(!out.contains("[interrupted by user]"), "no interruption: {out}");
     }
+
+    // ---- the spawn failure: the shell is not there -------------------------
+
+    /// The child process the spawn-failure probe runs in: with an empty PATH
+    /// of its own, so the rest of the suite keeps its shell.
+    fn re_run_without_a_shell(test_name: &str) -> String {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env("PATH", "")
+            .env("JINGWEI_S14_NO_SHELL", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(),
+            "the child probe failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bash_that_cannot_find_its_shell_says_so() {
+        const NAME: &str = "tools::runtime::tests::a_bash_that_cannot_find_its_shell_says_so";
+        if std::env::var_os("JINGWEI_S14_NO_SHELL").is_some() {
+            // the child: there is no `sh` on the PATH any more
+            let token = CancelToken::new();
+            let out = block_on(async { run_bash("echo hello", &token).await });
+            println!("JINGWEI_PROBE:{out}");
+            return;
+        }
+        let stdout = re_run_without_a_shell(NAME);
+        let line = stdout.lines().find_map(|l| l.find("JINGWEI_PROBE:").map(|i| &l[i..]))
+            .unwrap_or_else(|| panic!("the child said nothing: {stdout}"));
+        assert_eq!(line, "JINGWEI_PROBE:error: No such file or directory (os error 2)",
+            "the coroutine path reports the spawn failure as an error, not as an exit code");
+    }
+
+    // ---- the drain thread: the collector can go away ------------------------
+
+    /// A pipe source that hands over one chunk when the test says so, and
+    /// would keep handing chunks over if anybody were still listening.
+    struct OneChunkThenMore {
+        /// "you may read now" — the test drops the collector first.
+        go: std::sync::mpsc::Receiver<()>,
+        /// how many reads have happened.
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        /// "I read" — sent by the first read.
+        first: std::sync::mpsc::Sender<()>,
+        /// "I read again" — sent by any read after the first.
+        again: std::sync::mpsc::Sender<()>,
+    }
+
+    impl Read for OneChunkThenMore {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                // the first read waits until the test has let go of the
+                // collector, so the send that follows is bound to fail
+                let _ = self.go.recv();
+                buf[0] = b'x';
+                let _ = self.first.send(());
+                return Ok(1);
+            }
+            // a second read would mean the drain thread did not notice
+            // that nobody is collecting any more
+            let _ = self.again.send(());
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn the_drain_thread_gives_up_when_the_collector_is_gone() {
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (first_tx, first_rx) = std::sync::mpsc::channel::<()>();
+        let (again_tx, again_rx) = std::sync::mpsc::channel::<()>();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let d = drain_pipe(Some(OneChunkThenMore {
+            go: go_rx, reads: reads.clone(), first: first_tx, again: again_tx }));
+        // the collector goes away before the pipe produces anything
+        drop(d);
+        go_tx.send(()).unwrap();
+        // the reader thread does read — and then stops: the send fails and
+        // the thread breaks out of its loop instead of reading again
+        first_rx.recv().unwrap();
+        assert!(again_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the drain thread read again after the collector was gone");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "the pipe was read exactly once");
+    }
 }

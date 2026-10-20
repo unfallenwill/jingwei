@@ -1274,4 +1274,153 @@ mod tests {
         type_str(&mut a, "hi");
         assert!(matches!(update(&mut a, key(KeyCode::Enter, KeyModifiers::NONE)), Action::Submit(_)));
     }
+
+    // ---- the gaps the slice asked for ---------------------------------------
+
+    /// An empty candidate list does not make the menu vanish: it says
+    /// what it found nothing for.
+    #[test]
+    fn an_empty_menu_says_it_has_no_matches() {
+        let mut a = App::new();
+        type_str(&mut a, "/zzz");
+        set_completion(&mut a, CompletionKind::Command, "zzz", vec![]);
+        let texts = texts_of(&pane(&a, 80, 24).lines);
+        assert!(texts.iter().any(|t| t.contains("(no matches for /zzz)")), "{texts:?}");
+    }
+
+    /// A menu with more candidates than it has rows says how many it
+    /// hid.
+    #[test]
+    fn a_long_menu_says_how_many_more_it_hides() {
+        let mut a = App::new();
+        type_str(&mut a, "/");
+        let cands: Vec<CompletionItem> = (0..8)
+            .map(|i| CompletionItem {
+                insert: format!("c{i}"),
+                label: format!("/c{i}"),
+                description: "a command".into(),
+                trailing_space: false,
+            })
+            .collect();
+        set_completion(&mut a, CompletionKind::Command, "", cands);
+        let texts = texts_of(&pane(&a, 80, 24).lines);
+        assert!(texts.iter().any(|t| t == "  … +2 more"), "{texts:?}");
+    }
+
+    /// A line wider than the row scrolls under the caret: the front is
+    /// dropped and the caret stays visible.
+    #[test]
+    fn a_long_line_scrolls_horizontally_to_keep_the_caret_visible() {
+        let mut a = App::new();
+        type_str(&mut a, &"x".repeat(50));
+        let p = pane(&a, 20, 24);
+        let texts = texts_of(&p.lines);
+        assert!(texts[1].starts_with("❯ …"), "the front of the line is dropped: {texts:?}");
+        assert!(disp_width(&texts[1]) <= 20, "the row still fits: {texts:?}");
+        assert_eq!(p.cursor.unwrap().col, (prompt_w() + 15) as u16, "the caret rides the window");
+    }
+
+    /// The review overlay shows the streaming partial — the same line the
+    /// pane shows live.
+    #[test]
+    fn the_review_overlay_shows_the_streaming_partial() {
+        let mut a = App::new();
+        update(&mut a, Ev::Msg(Msg::Text("partial tail".into())));
+        update(&mut a, key(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        let texts = browse(&a, 80, 12).texts();
+        assert!(texts.iter().any(|t| t == "partial tail"), "{texts:?}");
+    }
+
+    /// A task row in the pane's layout is a preview: one physical row per
+    /// line of the task, each cut to the width.
+    #[test]
+    fn a_task_row_in_the_pane_truncates_to_one_row_per_line() {
+        let mut out = vec![];
+        row_lines(&Row::Task("first\nsecond".into()), 40, &mut out, Lay::Pane);
+        let texts = texts_of(&out);
+        assert_eq!(texts.len(), 2, "one row per line of the task: {texts:?}");
+        assert!(texts[0].starts_with("❯ "), "the first line carries the prompt: {texts:?}");
+        assert_eq!(texts[1], format!("{}second", " ".repeat(prompt_w())), "the continuation aligns: {texts:?}");
+    }
+
+    /// A warning is not an error: it is not painted as one.
+    #[test]
+    fn a_warning_note_is_not_painted_like_an_error() {
+        let mut a = App::new();
+        update(&mut a, Ev::Msg(Msg::Note { sev: crate::ui::Sev::Warn, text: " watch out ".into() }));
+        update(&mut a, Ev::Msg(Msg::Note { sev: crate::ui::Sev::Err, text: " api 429 ".into() }));
+        let rows = flush_lines(&a, 60, 0);
+        let warn = rows.iter().find(|l| l.spans.iter().any(|s| s.content.contains("watch out")))
+            .expect("the warning rendered");
+        let err = rows.iter().find(|l| l.spans.iter().any(|s| s.content.contains("api 429")))
+            .expect("the error rendered");
+        assert!(err.spans.iter().all(|s| s.style.add_modifier.contains(Modifier::BOLD)), "the error is loud");
+        assert!(warn.spans.iter().all(|s| !s.style.add_modifier.contains(Modifier::BOLD)), "the warning is not");
+    }
+
+    /// A multi-line task echoes as one row per line, the continuation
+    /// lines lining up under the prompt.
+    #[test]
+    fn a_continuation_line_lines_up_under_the_prompt() {
+        let mut a = App::new();
+        update(&mut a, Ev::Msg(Msg::TaskBegin("first\nsecond".into())));
+        let texts = texts_of(&flush_lines(&a, 40, 0));
+        assert_eq!(texts.len(), 2, "one row per line of the task: {texts:?}");
+        assert!(texts[0].starts_with("❯ "), "the first line carries the prompt: {texts:?}");
+        assert_eq!(texts[1], format!("{}second", " ".repeat(prompt_w())), "the continuation aligns: {texts:?}");
+    }
+
+    /// A long tool head wraps under its own text, so a long command still
+    /// reads as one call.
+    #[test]
+    fn a_long_tool_head_wraps_under_its_own_text() {
+        let mut a = App::new();
+        update(&mut a, Ev::Msg(Msg::Tool {
+            name: "bash".into(),
+            summary: format!("$ {}", "echo ".repeat(20)),
+            output: "out".into(),
+        }));
+        let texts = texts_of(&flush_lines(&a, 40, 0));
+        assert!(texts[0].starts_with("▸ [bash]"), "the head carries the glyph: {texts:?}");
+        assert!(texts[1].starts_with("  "), "the continuation hangs under the head: {texts:?}");
+        assert!(!texts[1].starts_with("  ▸"), "and carries no second glyph: {texts:?}");
+    }
+
+    /// A thought with no task behind it has no clock: the live head says
+    /// how much there is, not how long it has been.
+    #[test]
+    fn a_thought_with_no_task_shows_no_clock() {
+        let mut a = App::new();
+        update(&mut a, Ev::Msg(Msg::Think("musing".into())));
+        let texts = texts_of(&pane(&a, 72, 24).lines);
+        let head = texts.iter().find(|t| t.starts_with("◌")).expect("the live block has a head");
+        assert!(head.starts_with("◌ thought #1 · 1 line"), "{head}");
+        assert!(!head.contains("· 0s"), "no clock without a task: {head}");
+    }
+
+    /// With a terminal on stderr the styles carry their colors: the
+    /// prompt is blue and bold, the gutter grey, a fold's head yellow, and
+    /// a note its background.
+    #[cfg(unix)]
+    #[test]
+    fn the_styles_carry_color_when_stderr_is_a_terminal() {
+        use crate::ui::tests::with_a_tty_stderr;
+        let _env = crate::test_util::env_lock();
+        with_a_tty_stderr(|| {
+            assert!(color_on(), "stderr is a terminal now");
+            assert_eq!(prompt_style().fg, Some(Color::LightBlue), "the prompt is blue");
+            assert!(prompt_style().add_modifier.contains(Modifier::BOLD), "and bold");
+            assert_eq!(gutter_style().fg, Some(Color::DarkGray), "the gutter is grey");
+            assert_eq!(head_style().fg, Some(Color::Yellow), "a fold's head is yellow");
+            assert!(head_style().add_modifier.contains(Modifier::BOLD), "and bold");
+            // a warning gets the honey background, an error the red one
+            let warn = note_style(WARN_BG, false);
+            assert_eq!(warn.bg, Some(Color::Rgb(WARN_BG.0, WARN_BG.1, WARN_BG.2)), "the warning's background");
+            assert!(!warn.add_modifier.contains(Modifier::BOLD), "a warning is not an error");
+            let err = note_style(ERR_BG, true);
+            assert_eq!(err.bg, Some(Color::Rgb(ERR_BG.0, ERR_BG.1, ERR_BG.2)), "the error's background");
+            assert_eq!(err.fg, Some(Color::White), "and its text is white");
+            assert!(err.add_modifier.contains(Modifier::BOLD), "and it is bold");
+        });
+    }
 }

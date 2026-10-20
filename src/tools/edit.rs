@@ -488,4 +488,203 @@ mod tests {
         fs::write(&fresh, "hello").unwrap();
         assert!(dispatch("edit_file", &json!({"path": fresh.to_str().unwrap(), "old": "hello", "new": "bye"}), AgentId::MAIN).starts_with("ok:"));
     }
+
+    // ---- the refusals ------------------------------------------------------
+
+    /// An edit with neither `old`/`new` nor `edits` has nothing to apply.
+    /// The tool says that, rather than guessing what was meant.
+    #[test]
+    fn an_edit_with_nothing_to_apply_says_so() {
+        let dir = temp_dir("edit_nothing");
+        let p = dir.join("f.txt");
+        fs::write(&p, "x").unwrap();
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap()}), AgentId::MAIN);
+        assert_eq!(out, format!(
+            "error: send `old`/`new` or `edits` — there is nothing to apply (in {})", p.to_str().unwrap()),
+            "got: {out}");
+        assert_eq!(fs::read_to_string(&p).unwrap(), "x", "nothing was written");
+    }
+
+    /// A file that is not there cannot be edited: the read fails first, and
+    /// the error names the file that could not be read.
+    #[test]
+    fn an_edit_of_a_file_that_is_not_there_says_so() {
+        let dir = temp_dir("edit_missing");
+        let p = dir.join("nope.txt");
+        let out = dispatch("edit_file",
+            &json!({"path": p.to_str().unwrap(), "old": "a", "new": "b"}), AgentId::MAIN);
+        assert!(out.starts_with("error: "), "got: {out}");
+        assert!(out.contains("(os error 2)"), "the io error is in the message: {out}");
+        assert!(out.ends_with(&format!(" (in {})", p.to_str().unwrap())),
+            "the file is named: {out}");
+    }
+
+    /// The read succeeds and the write does not: a directory that cannot be
+    /// written into. The tool says the write failed, and the file is left
+    /// exactly as it was.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_that_cannot_be_written_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("edit_readonly");
+        let p = dir.join("f.txt");
+        fs::write(&p, "before\n").unwrap();
+        // the directory's own permissions are put back whatever happens, so
+        // the temp dir stays removable and the next test is unaffected
+        struct Restore(std::path::PathBuf, std::fs::Permissions);
+        impl Drop for Restore {
+            fn drop(&mut self) { let _ = fs::set_permissions(&self.0, self.1.clone()); }
+        }
+        let original = fs::metadata(&dir).unwrap().permissions();
+        let restore = Restore(dir.clone(), original.clone());
+        let mut readonly = original;
+        readonly.set_mode(0o555);
+        fs::set_permissions(&dir, readonly).unwrap();
+        let out = dispatch("edit_file",
+            &json!({"path": p.to_str().unwrap(), "old": "before", "new": "after"}), AgentId::MAIN);
+        assert!(out.starts_with("error: "), "got: {out}");
+        assert!(out.contains("(os error 13)"), "the io error is in the message: {out}");
+        assert!(out.ends_with(&format!(" (in {})", p.to_str().unwrap())),
+            "the file is named: {out}");
+        assert_eq!(fs::read_to_string(&p).unwrap(), "before\n", "the file is untouched");
+        drop(restore);
+    }
+
+    // ---- the report --------------------------------------------------------
+
+    /// An `old` that appears more than eight times names the first eight and
+    /// says there are more — the model gets the line numbers it needs
+    /// without the message growing without bound.
+    #[test]
+    fn an_old_that_appears_more_than_eight_times_says_so() {
+        let dir = temp_dir("edit_many");
+        let p = dir.join("f.txt");
+        fs::write(&p, "x\n".repeat(10)).unwrap();
+        let out = dispatch("edit_file",
+            &json!({"path": p.to_str().unwrap(), "old": "x", "new": "y"}), AgentId::MAIN);
+        assert!(out.contains("appears 10 times"), "got: {out}");
+        assert!(out.contains("(lines 1, 2, 3, 4, 5, 6, 7, 8, …)"),
+            "the extra occurrences are counted, not listed: {out}");
+        assert_eq!(fs::read_to_string(&p).unwrap(), "x\n".repeat(10),
+            "an ambiguous edit writes nothing");
+    }
+
+    /// A batch whose first edit lands twice says "lines", not "line".
+    #[test]
+    fn a_batch_edit_that_lands_twice_names_its_lines() {
+        let dir = temp_dir("edit_batch_lines");
+        let p = dir.join("f.txt");
+        fs::write(&p, "x\nx\ny\n").unwrap();
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(), "replace_all": true,
+            "edits": [{"old": "x", "new": "z"}, {"old": "y", "new": "w"}]}), AgentId::MAIN);
+        assert!(out.contains("2 edits, 3 replacements"), "got: {out}");
+        assert!(out.contains("edit 1 at lines 1, 2"), "two lines, so lines: {out}");
+        assert!(out.contains("edit 2 at line 3"), "one line, so line: {out}");
+        assert_eq!(fs::read_to_string(&p).unwrap(), "z\nz\nw\n");
+    }
+
+    /// A replacement bigger than the diff is willing to print falls back to
+    /// counts: the file is still changed, the report just says how many lines
+    /// went where instead of printing them.
+    #[test]
+    fn a_replacement_too_big_for_a_diff_reports_counts_instead() {
+        let dir = temp_dir("edit_big_diff");
+        let p = dir.join("f.txt");
+        let old: String = (1..=7).map(|i| format!("l{i}\n")).collect();
+        let new: String = (1..=7).map(|i| format!("m{i}\n")).collect();
+        fs::write(&p, format!("{old}l8\n")).unwrap();
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(),
+            "old": old.trim_end_matches('\n'), "new": new.trim_end_matches('\n')}), AgentId::MAIN);
+        assert!(out.contains("diff omitted"), "the diff is not printed: {out}");
+        assert!(out.contains("7 line(s) to 7 line(s)"), "the counts are: {out}");
+        assert_eq!(fs::read_to_string(&p).unwrap(), format!("{new}l8\n"));
+    }
+
+    // ---- the tolerant pass -------------------------------------------------
+
+    /// The block's own indentation drifted, but its base did not: the
+    /// replacement is left exactly as it was written.
+    #[test]
+    fn a_fuzzy_match_whose_indentation_already_matches_leaves_the_new_alone() {
+        let dir = temp_dir("edit_same_indent");
+        let p = dir.join("f.rs");
+        fs::write(&p, "    if ready {\n        go();\n    }\n").unwrap();
+        // the interior line drifted; the block's base indent did not
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(),
+            "old": "    if ready {\n      go();\n    }",
+            "new": "    if ready {\n      run();\n    }"}), AgentId::MAIN);
+        assert!(out.starts_with("ok:"), "got: {out}");
+        assert_eq!(fs::read_to_string(&p).unwrap(), "    if ready {\n      run();\n    }\n",
+            "nothing is re-indented: the base already matched");
+    }
+
+    /// The `old` ends with a newline: the newline ends the block, and the
+    /// block still matches the file.
+    #[test]
+    fn a_fuzzy_match_of_a_block_that_ends_with_a_newline_lands() {
+        let dir = temp_dir("edit_fuzzy_nl");
+        let p = dir.join("f.rs");
+        fs::write(&p, "fn main() {\n    if ready {\n        go();\n    }\n}\n").unwrap();
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(),
+            "old": "if ready {\n    go();\n", "new": "if ready {\n    run();\n"}), AgentId::MAIN);
+        assert!(out.starts_with("ok:"), "got: {out}");
+        assert_eq!(fs::read_to_string(&p).unwrap(),
+            "fn main() {\n    if ready {\n        run();\n    }\n}\n");
+    }
+
+    /// A file with windows line endings keeps them: the replacement carries
+    /// the carriage return the block sat in.
+    #[test]
+    fn a_fuzzy_match_keeps_the_line_ending_the_file_uses() {
+        let dir = temp_dir("edit_crlf");
+        let p = dir.join("f.rs");
+        fs::write(&p, "fn main() {\r\n    if ready {\r\n        go();\r\n    }\r\n}\r\n").unwrap();
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(),
+            "old": "if ready {\n    go();\n}", "new": "if ready {\n    run();\n}"}), AgentId::MAIN);
+        assert!(out.starts_with("ok:"), "got: {out}");
+        assert_eq!(fs::read_to_string(&p).unwrap(),
+            "fn main() {\r\n    if ready {\n        run();\n    }\r\n}\r\n",
+            "the carriage return the file uses is carried over");
+    }
+
+    /// A file whose last line has no newline: the block at the end is
+    /// replaced without one, and the file keeps its shape.
+    #[test]
+    fn a_fuzzy_match_at_the_end_of_a_file_keeps_the_last_line() {
+        let dir = temp_dir("edit_no_newline");
+        let p = dir.join("f.rs");
+        fs::write(&p, "fn main() {\n    if ready {\n        go();\n    }").unwrap();
+        let out = dispatch("edit_file", &json!({"path": p.to_str().unwrap(),
+            "old": "if ready {\n    go();\n}", "new": "if ready {\n    run();\n}"}), AgentId::MAIN);
+        assert!(out.starts_with("ok:"), "got: {out}");
+        assert_eq!(fs::read_to_string(&p).unwrap(),
+            "fn main() {\n    if ready {\n        run();\n    }",
+            "no newline is invented at the end of the file");
+    }
+
+    /// An `old` that is only whitespace has nothing to anchor it: it matches
+    /// nowhere, and the tool says the text was not found.
+    #[test]
+    fn a_whitespace_only_old_finds_nothing() {
+        let dir = temp_dir("edit_ws_old");
+        let p = dir.join("f.txt");
+        fs::write(&p, "hello\n").unwrap();
+        let out = dispatch("edit_file",
+            &json!({"path": p.to_str().unwrap(), "old": "   ", "new": "x"}), AgentId::MAIN);
+        assert!(out.contains("`old` not found"), "got: {out}");
+        assert!(out.contains("nothing was written"), "got: {out}");
+        assert_eq!(fs::read_to_string(&p).unwrap(), "hello\n");
+    }
+
+    /// An `old` with more lines than the file cannot be anywhere in it.
+    #[test]
+    fn an_old_with_more_lines_than_the_file_finds_nothing() {
+        let dir = temp_dir("edit_too_long");
+        let p = dir.join("f.txt");
+        fs::write(&p, "a\n").unwrap();
+        let out = dispatch("edit_file",
+            &json!({"path": p.to_str().unwrap(), "old": "a\nb\nc", "new": "x"}), AgentId::MAIN);
+        assert!(out.contains("`old` not found"), "got: {out}");
+        assert_eq!(fs::read_to_string(&p).unwrap(), "a\n");
+    }
 }

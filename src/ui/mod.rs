@@ -803,4 +803,117 @@ mod tests {
         sink.show(Msg::Text("through the arc".into()));
         assert_eq!(rec.msgs().len(), 1, "the arc carried the message to the sink under it");
     }
+
+    /// A worker's reasoning is wrapped like the rest of its events, and
+    /// the block that closes it comes through as the same event.
+    #[test]
+    fn a_workers_thinking_is_wrapped() {
+        let rec = crate::test_util::Recorder::default();
+        let id = worker_id();
+        let sink = AgentSink::new(rec.clone(), id);
+        sink.show(Msg::Think("reasoning".into()));
+        sink.show(Msg::ThinkEnd);
+        let msgs = rec.msgs();
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        match &msgs[0] {
+            Msg::FromAgent { id: got, event } => {
+                assert_eq!(*got, id, "the wrapper carries the attribution");
+                assert!(matches!(event.as_ref(), AgentMsg::Think(t) if t == "reasoning"), "{msgs:?}");
+            }
+            other => panic!("expected a wrapped think, got {other:?}"),
+        }
+        match &msgs[1] {
+            Msg::FromAgent { id: got, event } => {
+                assert_eq!(*got, id);
+                assert!(matches!(event.as_ref(), AgentMsg::ThinkEnd), "{msgs:?}");
+            }
+            other => panic!("expected a wrapped think end, got {other:?}"),
+        }
+    }
+
+    /// No nesting: a wrapped event belongs to the agent it names, so a
+    /// worker's sink drops it rather than wrapping it again.
+    #[test]
+    fn a_wrapped_event_is_never_wrapped_again() {
+        let rec = crate::test_util::Recorder::default();
+        let id = worker_id();
+        let sink = AgentSink::new(rec.clone(), id);
+        sink.show(Msg::FromAgent { id, event: Box::new(AgentMsg::Text("not mine".into())) });
+        assert!(rec.msgs().is_empty(), "no nesting: {:?}", rec.msgs());
+    }
+
+    /// Run `f` with the process's stderr attached to a pty, so that
+    /// [`color_on`] — which asks whether stderr is a terminal — answers
+    /// yes. The real stderr goes back afterwards, whatever `f` does.
+    #[cfg(unix)]
+    pub(crate) fn with_a_tty_stderr<T>(f: impl FnOnce() -> T) -> T {
+        /// Puts the real stderr back when it goes out of scope — a panic
+        /// in the body included.
+        struct Restore {
+            saved: libc::c_int,
+            slave: libc::c_int,
+            master: libc::c_int,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::dup2(self.saved, 2);
+                    libc::close(self.saved);
+                    libc::close(self.slave);
+                    libc::close(self.master);
+                }
+            }
+        }
+        // A pty: the master keeps it alive, the slave is what the process
+        // writes to.
+        let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(master >= 0, "a pty could not be opened");
+        assert_eq!(unsafe { libc::grantpt(master) }, 0, "the pty could not be granted");
+        assert_eq!(unsafe { libc::unlockpt(master) }, 0, "the pty could not be unlocked");
+        let name = unsafe { libc::ptsname(master) };
+        assert!(!name.is_null(), "the pty has no name");
+        let slave = unsafe { libc::open(name, libc::O_RDWR) };
+        assert!(slave >= 0, "the pty's slave could not be opened");
+        let saved = unsafe { libc::dup(2) };
+        assert!(saved >= 0, "stderr could not be saved");
+        unsafe { libc::dup2(slave, 2) };
+        // The pty's buffer is a few KB and nobody reads it: a write to
+        // fd 2 that fills it blocks the writer until the pty is put
+        // back — a hang, not a failure. So the far end is drained by a
+        // thread of its own, which stops when the pty goes away (the
+        // read fails once the slave end is closed).
+        let drain = unsafe { libc::dup(master) };
+        assert!(drain >= 0, "the pty's far end could not be duplicated");
+        unsafe { libc::fcntl(drain, libc::F_SETFD, libc::FD_CLOEXEC) };
+        std::thread::spawn(move || {
+            use std::io::Read;
+            use std::os::fd::FromRawFd;
+            let mut reader = unsafe { std::fs::File::from_raw_fd(drain) };
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 { break }
+            }
+        });
+        let _restore = Restore { saved, slave, master };
+        f()
+    }
+
+    /// The positive half of the color gate: with a terminal on stderr,
+    /// `paint` really paints.
+    #[cfg(unix)]
+    #[test]
+    fn paint_paints_when_stderr_is_a_terminal() {
+        let _env = crate::test_util::env_lock();
+        with_a_tty_stderr(|| {
+            assert!(color_on(), "stderr is a terminal now");
+            let painted = paint("err", ERR_BG, true);
+            assert!(painted.contains("\x1b["), "the badge carries escape codes: {painted:?}");
+            assert!(painted.contains("err"), "and the text it badges: {painted:?}");
+            assert!(painted.contains("48;2;198;40;40"), "the truecolor background: {painted:?}");
+            // the other foreground: a badge on a light background is dark-on-dark
+            let dark = paint("warn", WARN_BG, false);
+            assert!(dark.contains("\x1b[30m"), "the near-black foreground: {dark:?}");
+            assert!(dark.contains("48;2;255;220;100"), "the warn background: {dark:?}");
+        });
+    }
 }

@@ -649,4 +649,117 @@ mod tests {
         input.cursor = 6;
         assert_eq!(input.caret(), 6);
     }
+
+    /// A reasoning block is measured from its *first* delta: the later
+    /// deltas of the same block ride on the clock it opened.
+    #[test]
+    fn a_second_thought_delta_keeps_the_clock_the_block_started() {
+        let mut a = App::new();
+        a.status.task = Some(Task { text: "t".into(), elapsed: Duration::from_secs(5) });
+        a.push_think("first");
+        // the task clock moves on
+        a.status.task.as_mut().unwrap().elapsed += Duration::from_secs(4);
+        a.push_think(" second");
+        a.fold_thought();
+        match a.rows.last() {
+            Some(Row::Thought(fold)) => {
+                assert_eq!(fold.body, "first second", "both deltas are in the fold");
+                assert_eq!(fold.duration, Some(Duration::from_secs(4)), "measured from the first delta");
+            }
+            other => panic!("expected a thought row, got {other:?}"),
+        }
+    }
+
+    /// The clock a thought is measured against is the task's — so a
+    /// thought with no task has no clock, and a new task (whose clock
+    /// starts at zero) leaves the open block without one.
+    #[test]
+    fn a_thought_with_no_task_has_no_clock() {
+        let mut a = App::new();
+        a.push_think("thinking");
+        assert_eq!(a.thinking_for(), None, "no task, no clock");
+
+        let mut b = App::new();
+        b.status.task = Some(Task { text: "t".into(), elapsed: Duration::from_secs(5) });
+        b.push_think("thinking");
+        assert_eq!(b.thinking_for(), Some(Duration::ZERO), "the block just opened");
+        // a new task restarts the clock under the open block
+        b.status.task = Some(Task { text: "next".into(), elapsed: Duration::ZERO });
+        assert_eq!(b.thinking_for(), None, "the new task's clock is behind the block's anchor");
+    }
+
+    /// A worker's reasoning block is measured against the *worker's* own
+    /// clock — and from its first delta, like the main's.
+    #[test]
+    fn a_second_worker_thought_delta_keeps_the_clock_the_block_started() {
+        let mut a = App::new();
+        let id = AgentId::next();
+        a.agents.insert(id, AgentBuf { elapsed: Duration::from_secs(3), ..Default::default() });
+        a.push_agent_think(id, "first");
+        a.agents.get_mut(&id).unwrap().elapsed += Duration::from_secs(4);
+        a.push_agent_think(id, " second");
+        a.fold_agent_thought(id);
+        match a.rows.last() {
+            Some(Row::Thought(fold)) => {
+                assert_eq!(fold.body, "first second", "both deltas are in the fold");
+                assert_eq!(fold.duration, Some(Duration::from_secs(4)), "measured from the first delta");
+                assert_eq!(fold.tag.as_deref(), Some(agent_tag(id).as_str()), "the worker's fold is tagged");
+            }
+            other => panic!("expected a thought row, got {other:?}"),
+        }
+    }
+
+    /// A reasoning block that never got a clock folds without one: the
+    /// worker holds the reasoning, but not the moment the block opened,
+    /// so the fold carries no duration rather than a made-up one.
+    #[test]
+    fn a_worker_thought_with_no_clock_folds_without_a_duration() {
+        let mut a = App::new();
+        let id = AgentId::next();
+        a.agents.insert(id, AgentBuf {
+            think: "reasoning".into(),
+            think_start: None,
+            ..Default::default() });
+        a.fold_agent_thought(id);
+        match a.rows.last() {
+            Some(Row::Thought(fold)) => {
+                assert_eq!(fold.body, "reasoning", "the reasoning still lands");
+                assert_eq!(fold.duration, None, "a block with no clock folds with no duration");
+                assert_eq!(fold.tag.as_deref(), Some(agent_tag(id).as_str()), "the worker's fold is tagged");
+            }
+            other => panic!("expected a thought row, got {other:?}"),
+        }
+    }
+
+    /// A finished worker's report is read back into the transcript, one
+    /// row per line, with the worker's tag in front.
+    #[test]
+    fn the_report_of_a_finished_worker_becomes_rows() {
+        let mut a = App::new();
+        let id = AgentId::next();
+        a.agents.insert(id, AgentBuf { label: "build".into(), ..Default::default() });
+        a.finish_agent(id, TurnState::Completed, "found three files\nand two dirs".into());
+        let texts: Vec<String> = a
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Line(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        let tag = agent_tag(id);
+        assert!(texts.contains(&format!("{tag}found three files")), "{texts:?}");
+        assert!(texts.contains(&format!("{tag}and two dirs")), "{texts:?}");
+    }
+
+    /// The default app is a fresh app: the input mode, no rows, no menu.
+    #[test]
+    fn a_default_app_is_a_fresh_app() {
+        let a: App = App::default();
+        assert_eq!(a.mode, Mode::Input);
+        assert!(a.rows.is_empty(), "no rows yet: {:?}", a.rows);
+        assert!(a.completion.is_none(), "no menu yet");
+        assert!(!a.quit, "not quitting yet");
+        assert!(a.agents.is_empty(), "no background agents yet");
+    }
 }

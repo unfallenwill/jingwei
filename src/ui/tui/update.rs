@@ -1480,4 +1480,256 @@ mod tests {
         drive(&mut a, vec![Ev::Msg(Msg::TaskBegin("busy".into()))]);
         assert!(a.completion.is_none(), "TaskBegin locks the editor and the menu");
     }
+
+    // ---- the gaps the slice asked for ---------------------------------------
+
+    /// A finished agent's clock stops: the tick that follows its end
+    /// counts for nobody.
+    #[test]
+    fn a_finished_agents_clock_stops() {
+        let mut a = App::new();
+        let id = AgentId::next();
+        drive(&mut a, vec![Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Started {
+            label: "build".into(),
+        }) })]);
+        drive(&mut a, vec![Ev::Tick(TICK * 3)]);
+        assert_eq!(a.agents[&id].elapsed, TICK * 3, "a live agent's clock runs");
+        drive(&mut a, vec![Ev::Msg(Msg::FromAgent { id, event: Box::new(AgentMsg::Finished {
+            state: TurnState::Completed,
+            report: String::new(),
+        }) })]);
+        drive(&mut a, vec![Ev::Tick(TICK * 5)]);
+        assert_eq!(a.agents[&id].elapsed, TICK * 3, "a finished agent's clock stops");
+    }
+
+    /// A banner is a line of the transcript, like any other.
+    #[test]
+    fn a_banner_lands_as_a_line_of_the_transcript() {
+        let mut a = App::new();
+        drive(&mut a, vec![Ev::Msg(Msg::Banner("jingwei 0.1.0".into()))]);
+        assert_eq!(row_texts(&a), vec!["jingwei 0.1.0".to_string()]);
+    }
+
+    /// A live output count with no request in flight moves the bar and
+    /// nothing else: there is no pending reading to refine.
+    #[test]
+    fn a_live_output_count_with_no_request_in_flight_only_moves_the_bar() {
+        let mut a = App::new();
+        drive(&mut a, vec![Ev::Msg(Msg::OutTokens(9))]);
+        assert_eq!(a.status.turn.output, 9, "the live count moves");
+        assert!(a.status.pending.is_none(), "there is no reading to refine");
+        drive(&mut a, vec![Ev::Msg(Msg::Done)]);
+        assert_eq!(a.status.total, Usage::default(), "a stray Done folds nothing");
+    }
+
+    /// A key the terminal reports as anything but a press does nothing at
+    /// all — a release must not type.
+    #[test]
+    fn a_key_that_is_not_a_press_does_nothing() {
+        let mut a = App::new();
+        type_str(&mut a, "draft");
+        let before = a.input.text.clone();
+        let acts = drive(&mut a, vec![Ev::Key(KeyEvent {
+            code: KeyCode::Char('x'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        })]);
+        assert_eq!(acts, vec![Action::None]);
+        assert_eq!(a.input.text, before, "a released key types nothing");
+    }
+
+    /// A command that takes no argument closes the menu whether the
+    /// trailing space is there or an argument followed it.
+    #[test]
+    fn a_no_arg_command_with_an_argument_offers_nothing() {
+        assert_eq!(detect_completion("/exit now"), None);
+        assert_eq!(detect_completion("/quit now"), None);
+        assert_eq!(detect_completion("/help now"), None);
+    }
+
+    /// A command that takes one argument offers nothing once a second
+    /// argument follows.
+    #[test]
+    fn a_command_with_too_many_arguments_offers_nothing() {
+        assert_eq!(detect_completion("/model a b"), None);
+    }
+
+    /// A command name is completed against itself before the space: the
+    /// menu offers the command until the user means it.
+    #[test]
+    fn a_command_name_is_completed_before_the_space() {
+        assert_eq!(detect_completion("/mcp"), Some((CompletionKind::Command, "mcp".into())));
+    }
+
+    /// An unknown command with a space after it is not a command at all:
+    /// the menu closes rather than offering nonsense.
+    #[test]
+    fn an_unknown_command_with_a_space_offers_nothing() {
+        assert_eq!(detect_completion("/xyz "), None);
+    }
+
+    /// The highlight never runs past the last candidate: a refresh with
+    /// fewer candidates clamps it back into the list.
+    #[test]
+    fn the_highlight_never_runs_past_the_last_candidate() {
+        let mut a = App::new();
+        let cands = fake_candidates(CompletionKind::Command, "");
+        set_completion(&mut a, CompletionKind::Command, "", cands.clone());
+        a.completion.as_mut().unwrap().selected = 2;
+        // the same kind and the same prefix, but a shorter list
+        set_completion(&mut a, CompletionKind::Command, "", vec![cands[0].clone()]);
+        let c = a.completion.as_ref().unwrap();
+        assert_eq!(c.selected, 0, "clamped onto the last candidate");
+    }
+
+    /// An empty candidate list leaves the highlight where it was: there
+    /// is nothing to point at.
+    #[test]
+    fn an_empty_candidate_list_leaves_the_highlight_at_the_top() {
+        let mut a = App::new();
+        set_completion(&mut a, CompletionKind::Command, "", fake_candidates(CompletionKind::Command, ""));
+        a.completion.as_mut().unwrap().selected = 1;
+        set_completion(&mut a, CompletionKind::Command, "", vec![]);
+        let c = a.completion.as_ref().unwrap();
+        assert!(c.candidates.is_empty(), "the list is empty");
+        assert_eq!(c.selected, 0, "and the highlight sits at the top");
+    }
+
+    /// Moving the highlight with nothing to move it — no menu, or an
+    /// empty one — does nothing at all.
+    #[test]
+    fn moving_the_highlight_with_nothing_to_move_it_does_nothing() {
+        let mut a = App::new();
+        completion_up(&mut a);
+        completion_down(&mut a);
+        assert!(a.completion.is_none(), "still no menu");
+        set_completion(&mut a, CompletionKind::Command, "", vec![]);
+        completion_up(&mut a);
+        completion_down(&mut a);
+        assert_eq!(a.completion.as_ref().unwrap().selected, 0, "an empty list has nothing to move");
+    }
+
+    /// Applying a completion with no menu open changes nothing and says
+    /// so.
+    #[test]
+    fn applying_a_completion_with_no_menu_does_nothing() {
+        let mut a = App::new();
+        type_str(&mut a, "/mod");
+        let before = a.input.text.clone();
+        assert!(!apply_completion(&mut a), "no menu, nothing applied");
+        assert_eq!(a.input.text, before, "and the line is untouched");
+    }
+
+    /// BackTab moves the highlight up, the way Shift-Tab does in every
+    /// other menu.
+    #[test]
+    fn back_tab_moves_the_highlight_up_in_the_menu() {
+        let mut a = App::new();
+        type_str(&mut a, "/");
+        set_completion(&mut a, CompletionKind::Command, "", fake_candidates(CompletionKind::Command, ""));
+        drive(&mut a, vec![key(KeyCode::BackTab, KeyModifiers::NONE)]);
+        let c = a.completion.as_ref().unwrap();
+        assert_eq!(c.selected, c.candidates.len() - 1, "BackTab wraps to the bottom");
+    }
+
+    /// A key neither the menu nor the editor uses is ignored: it types
+    /// nothing and asks for nothing.
+    #[test]
+    fn a_key_the_input_does_not_use_is_ignored() {
+        let mut a = App::new();
+        type_str(&mut a, "/");
+        set_completion(&mut a, CompletionKind::Command, "", fake_candidates(CompletionKind::Command, ""));
+        let acts = drive(&mut a, vec![key(KeyCode::F(5), KeyModifiers::NONE)]);
+        assert_eq!(acts, vec![Action::None]);
+        assert_eq!(a.input.text, "/", "the key typed nothing");
+    }
+
+    /// Ctrl-Backspace kills the word before the caret, the way Ctrl-W
+    /// does.
+    #[test]
+    fn a_control_backspace_deletes_the_word_before_the_caret() {
+        let mut a = App::new();
+        type_str(&mut a, "one two");
+        drive(&mut a, vec![key(KeyCode::Backspace, KeyModifiers::CONTROL)]);
+        assert_eq!(a.input.text, "one", "the word and the space before it go");
+        assert_eq!(a.input.cursor, "one".len());
+    }
+
+    /// The right arrow lands on the next character — and on nothing else
+    /// at the end of the line.
+    #[test]
+    fn the_right_arrow_lands_on_the_next_character() {
+        let mut a = App::new();
+        type_str(&mut a, "abc");
+        drive(&mut a, vec![key(KeyCode::Left, KeyModifiers::NONE)]);
+        assert_eq!(a.input.cursor, 2);
+        drive(&mut a, vec![key(KeyCode::Right, KeyModifiers::NONE)]);
+        assert_eq!(a.input.cursor, 3, "the caret is back at the end");
+    }
+
+    /// End is line-wise: it lands at the end of the caret's line, and
+    /// stops before a line break.
+    #[test]
+    fn the_end_key_lands_on_the_end_of_the_line() {
+        let mut a = App::new();
+        type_str(&mut a, "one\ntwo");
+        drive(&mut a, vec![key(KeyCode::Home, KeyModifiers::NONE)]);
+        drive(&mut a, vec![key(KeyCode::End, KeyModifiers::NONE)]);
+        assert_eq!(a.input.cursor, "one\ntwo".len(), "End on the last line is the end of the text");
+        // on the first line, End stops before the break
+        a.input.cursor = 0;
+        drive(&mut a, vec![key(KeyCode::End, KeyModifiers::NONE)]);
+        assert_eq!(a.input.cursor, "one".len(), "End stops at the line break");
+    }
+
+    /// Ctrl-C in the overlay follows the same ladder as in the REPL while
+    /// a task runs, and leaves the overlay when there is nothing to
+    /// cancel.
+    #[test]
+    fn a_control_c_in_browse_cancels_while_working_and_leaves_otherwise() {
+        let mut a = seeded();
+        drive(&mut a, vec![key(KeyCode::Char('o'), KeyModifiers::CONTROL)]);
+        assert_eq!(a.mode, Mode::Browse);
+        drive(&mut a, vec![Ev::Msg(Msg::TaskBegin("running".into()))]);
+        let acts = drive(&mut a, vec![key(KeyCode::Char('c'), KeyModifiers::CONTROL)]);
+        assert_eq!(acts, vec![Action::Cancel], "the ladder starts");
+        assert!(a.cancel_sent);
+        // idle: Ctrl-C leaves the overlay
+        let mut b = seeded();
+        drive(&mut b, vec![key(KeyCode::Char('o'), KeyModifiers::CONTROL)]);
+        let acts = drive(&mut b, vec![key(KeyCode::Char('c'), KeyModifiers::CONTROL)]);
+        assert_eq!(acts, vec![Action::None]);
+        assert_eq!(b.mode, Mode::Input, "the overlay closes");
+    }
+
+    /// The overlay scrolls: a row at a time, a page at a time, and not
+    /// at all for a key it does not use.
+    #[test]
+    fn the_overlay_scrolls_a_row_and_a_page_at_a_time() {
+        let mut a = seeded();
+        drive(&mut a, vec![key(KeyCode::Char('o'), KeyModifiers::CONTROL)]);
+        drive(&mut a, vec![key(KeyCode::Up, KeyModifiers::NONE)]);
+        assert_eq!(a.scroll, Scroll::Up(1), "one row up");
+        drive(&mut a, vec![key(KeyCode::Char('j'), KeyModifiers::NONE)]);
+        assert_eq!(a.scroll, Scroll::Tail, "one row down, back to the tail");
+        drive(&mut a, vec![key(KeyCode::Char('k'), KeyModifiers::NONE)]);
+        assert_eq!(a.scroll, Scroll::Up(1), "'k' scrolls up too");
+        drive(&mut a, vec![key(KeyCode::PageDown, KeyModifiers::NONE)]);
+        assert_eq!(a.scroll, Scroll::Tail, "a page down returns to the tail");
+        drive(&mut a, vec![key(KeyCode::PageUp, KeyModifiers::NONE)]);
+        assert_eq!(a.scroll, Scroll::Up(10), "a page up lifts ten rows");
+        drive(&mut a, vec![key(KeyCode::Char('x'), KeyModifiers::NONE)]);
+        assert_eq!(a.scroll, Scroll::Up(10), "a key the overlay does not use scrolls nothing");
+    }
+
+    /// With no history behind it, the recall keys do nothing.
+    #[test]
+    fn a_key_with_nothing_behind_it_is_ignored() {
+        let mut a = App::new();
+        type_str(&mut a, "draft");
+        drive(&mut a, vec![key(KeyCode::Up, KeyModifiers::NONE)]);
+        assert_eq!(a.input.text, "draft", "an empty history recalls nothing");
+        assert_eq!(a.input.cursor, "draft".len());
+    }
 }
