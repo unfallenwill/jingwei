@@ -245,6 +245,22 @@ attribution — the inner usage and the inner end-of-turn belong to that
 agent and never to the session's totals, so a worker's spending cannot
 inflate the bar, and a worker can never end the human's turn.
 
+The **lifecycle** (`src/agent/instance.rs`, `src/agent/manager.rs`) is the
+other end of the same idea: a *top-level* agent that outlives one task. An
+**instance** holds a session, a context, a config and a fleet of its own,
+and it runs task after task in that one context, so the second task knows
+what the first one was about. It has four states — idle, running, stopping,
+stopped — and the table between them is the whole story: a stop owns the
+state from the moment it begins, so a task that ends while the instance is
+stopping does not put it back. The **manager** is the four operations on
+those instances — create, execute, stop, dispose — and the one policy it
+holds: a session is advanced by one instance at a time, because two
+instances on one session would write one transcript over each other. A
+stop is the cooperative cancel the run boundary already uses; a task that
+will not let go is reported as such rather than pretended away. The layer
+is crate-internal for now: the frontends still drive the run boundary
+directly, and the layer is called by the crate's own tests.
+
 Providers sit behind a port of their own. The core speaks one internal
 history and asks the composition root which wire to hand it to; each wire
 is a self-contained adapter that owns its translation *and* its rules —
@@ -420,7 +436,7 @@ taken offline does not bring it back.
 
 ```sh
 cargo check --tests    # the gate: cheap, catches signature drift
-cargo test             # 939 unit tests + 23 integration tests
+cargo test             # 953 unit tests + 23 integration tests
 ```
 
 The architecture test (`tests/architecture.rs`) checks the layering: it
