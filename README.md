@@ -127,8 +127,9 @@ finished lines are appended to it, so the mouse wheel, text selection, and
 whatever was on screen before jingwei started keep working; there is no
 alternate screen and no mouse capture while the REPL runs. The editor is
 ours — grapheme-safe caret, **multi-line composing** (Ctrl-J breaks the
-line everywhere; Shift-Enter too, where the terminal speaks the kitty
-keyboard protocol), line-wise Home/End, history recall
+line — on every terminal, and with an input method too: the text stays
+plain UTF-8, which is what a Chinese IME needs), line-wise Home/End,
+history recall
 (`~/.jingwei_history`), word deletes — no readline dependency. Submitting
 clears the input line for the next task; Up recalls the last one. Pipes,
 one-shot runs get the plain line-oriented log

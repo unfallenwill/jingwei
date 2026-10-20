@@ -228,9 +228,9 @@ TUI (interactive, on a terminal):
     jingwei stays put, and the mouse is never captured
     Enter               submit the task — the input line clears; Up
                         recalls it from history
-    Ctrl-J / Shift-Enter  break the line — compose multi-line tasks
-                        (Shift-Enter needs a terminal with the kitty
-                        keyboard protocol; Ctrl-J works everywhere)
+    Ctrl-J              break the line — compose multi-line tasks; it
+                        works on every terminal, and with an input
+                        method too (the text stays plain UTF-8)
     Up/Down             recall input history · Home/End line-wise
     Ctrl-O              unfold every folded block (thoughts, tool tails)
                         into a full-screen review; q or Ctrl-O returns to

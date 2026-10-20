@@ -160,6 +160,24 @@ fn send_frame<W: Write>(w: &mut W, frame: &[u8]) -> io::Result<()> {
     w.flush()
 }
 
+/// The keyboard flags the TUI asks the terminal for.
+///
+/// One flag, and the reason is the *text*. The kitty protocol's "report
+/// all keys as escape codes" makes the terminal send every key as a
+/// `CSI u` record — and the text an input method commits goes with it,
+/// in a field crossterm cannot read: crossterm parses the key code and
+/// drops the text, and it cannot ask for the text another way. A
+/// Chinese input method would type nothing at all.
+///
+/// So the text stays plain UTF-8, which is what an input method
+/// produces and what crossterm reads. What that costs is Shift-Enter:
+/// telling it apart from Enter needs the "report all keys" mode, so the
+/// line break is Ctrl-J everywhere instead — it works on every
+/// terminal, and it is what the hint says.
+fn keyboard_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+}
+
 /// The exit burst: erase the pane's rows, park the caret where the
 /// shell's prompt will land, and roll back the session's modes —
 /// composed like any frame (see [`send_frame`]) so the pane dissolves
@@ -427,7 +445,7 @@ pub async fn run(cfg: Config, ctx: crate::core::context::Context, convo: Convo, 
         "jingwei — 精卫填海，一石一石 · {}",
         cfg.identity())));
     sink.show(Msg::Banner(
-        "type a task · Ctrl-J / Shift-Enter breaks the line · Ctrl-O unfolds · Ctrl-C interrupts (twice exits) · /exit or Ctrl-D rests".into()));
+        "type a task · Ctrl-J breaks the line · Ctrl-O unfolds · Ctrl-C interrupts (twice exits) · /exit or Ctrl-D rests".into()));
     for b in banners {
         sink.show(Msg::Banner(b));
     }
@@ -459,18 +477,13 @@ pub async fn run(cfg: Config, ctx: crate::core::context::Context, convo: Convo, 
     // single owner of the real state.
     let hub = hub;
 
-    // Raw mode, bracketed paste, and the kitty keyboard protocol (which
-    // makes Shift-Enter distinguishable from Enter on terminals that
-    // support it; the rest ignore it). No alternate screen, no mouse.
+    // Raw mode, bracketed paste, and the kitty keyboard protocol. No
+    // alternate screen, no mouse.
     crossterm::terminal::enable_raw_mode().map_err(|e| Error::Msg(format!("raw mode: {e}")))?;
     crossterm::execute!(
         io::stdout(),
         EnableBracketedPaste,
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-        )
+        PushKeyboardEnhancementFlags(keyboard_flags())
     )
     .map_err(|e| Error::Msg(format!("keyboard protocol: {e}")))?;
     let mut stage = Stage::new(4)
@@ -1200,6 +1213,20 @@ fn key_channel() -> tokio::sync::mpsc::UnboundedReceiver<crossterm::event::Event
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    /// The text an input method commits has to arrive as plain UTF-8.
+    /// The kitty protocol's "report all keys as escape codes" would
+    /// carry it in a field crossterm drops — so a Chinese input method
+    /// would type nothing at all. The flag stays off, and the text
+    /// keeps arriving the way an IME sends it.
+    #[test]
+    fn the_text_stays_plain_utf8_so_an_ime_can_type() {
+        let flags = keyboard_flags();
+        assert!(
+            !flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES),
+            "the text must stay plain: {flags:?}"
+        );
+    }
 
     #[test]
     fn scrolling_is_line_feeds_never_csi_s() {

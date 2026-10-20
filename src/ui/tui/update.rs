@@ -6,7 +6,7 @@
 
 use super::model::{App, Completion, CompletionItem, CompletionKind, Mode, Row, Scroll, Task};
 use crate::ui::{agent_tag, AgentId, AgentMsg, Msg, TurnState};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::Duration;
 
 /// What the run loop should do after an update.
@@ -164,7 +164,10 @@ fn agent_event(app: &mut App, id: AgentId, ev: AgentMsg) {
 }
 
 fn key(app: &mut App, k: KeyEvent) -> Action {
-    if k.kind != crossterm::event::KeyEventKind::Press {
+    // A release is not a key. A terminal that reports event types sends
+    // one for every press, and acting on it would type every character
+    // twice. A repeat is the key still down — that one acts.
+    if k.kind == KeyEventKind::Release {
         return Action::None;
     }
     match app.mode {
@@ -424,7 +427,13 @@ fn input_mode(app: &mut App, k: KeyEvent) -> Action {
             dismiss_completion(app);
             Action::Submit(line)
         }
-        KeyCode::Char(c) if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+        // A control character is not text. A terminal that reports a text
+        // event it has no key for sends key number 0, and a NUL in the
+        // input line is invisible: it would be typed, and never seen.
+        KeyCode::Char(c)
+            if !c.is_control()
+                && !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             input_insert(app, &c.to_string());
             Action::None
         }
@@ -626,19 +635,32 @@ mod tests {
     use super::*;
     use super::super::model::TICK;
     use crate::ui::{AgentId, AgentMsg, Sev, TurnState, Usage};
-    use crossterm::event::KeyEventKind;
+    use crossterm::event::{KeyEventKind, KeyEventState};
 
     fn key(code: KeyCode, mods: KeyModifiers) -> Ev {
         Ev::Key(KeyEvent { code, modifiers: mods, kind: KeyEventKind::Press, state: KeyEventState::NONE })
     }
-    use crossterm::event::KeyEventState;
+
+    /// A key event of a given kind: a terminal that reports event types
+    /// sends a release for every press, and a repeat for every
+    /// auto-repeat.
+    fn key_kind(code: KeyCode, mods: KeyModifiers, kind: KeyEventKind) -> Ev {
+        Ev::Key(KeyEvent { code, modifiers: mods, kind, state: KeyEventState::NONE })
+    }
 
     fn drive(app: &mut App, evs: Vec<Ev>) -> Vec<Action> {
         evs.into_iter().map(|e| update(app, e)).collect()
     }
 
+    /// Type a string the way a person types it: every character is its
+    /// own key event, and a line break is Ctrl-J — the key the terminal
+    /// sends for it, not a character.
     fn type_str(app: &mut App, s: &str) {
         for c in s.chars() {
+            if c == '\n' {
+                drive(app, vec![key(KeyCode::Char('j'), KeyModifiers::CONTROL)]);
+                continue;
+            }
             drive(app, vec![key(KeyCode::Char(c), KeyModifiers::NONE)]);
         }
     }
@@ -669,6 +691,54 @@ mod tests {
         drive(&mut a, vec![key(KeyCode::Backspace, KeyModifiers::NONE)]);
         assert_eq!(a.input.text, "x", "the whole grapheme went, not its mark alone");
         assert_eq!(a.input.cursor, 0);
+    }
+
+    /// The input method's shape: the committed text arrives as ordinary
+    /// characters, one key event each, and every one of them lands.
+    #[test]
+    fn a_committed_chinese_line_lands_whole() {
+        let mut a = App::new();
+        type_str(&mut a, "精卫填海");
+        assert_eq!(a.input.text, "精卫填海", "every character the IME sent is here");
+        assert_eq!(a.input.cursor, "精卫填海".len(), "the caret is at the end");
+        // and a pasted one lands whole too
+        let mut b = App::new();
+        drive(&mut b, vec![Ev::Paste("精卫填海".into())]);
+        assert_eq!(b.input.text, "精卫填海", "the paste landed whole");
+    }
+
+    /// A terminal that reports event types sends a release for every
+    /// press. Acting on it would type every character twice.
+    #[test]
+    fn a_key_release_does_nothing() {
+        let mut a = App::new();
+        drive(&mut a, vec![key_kind(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Press)]);
+        drive(&mut a, vec![key_kind(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Release)]);
+        assert_eq!(a.input.text, "a", "the release did not type a second 'a'");
+        let acts =
+            drive(&mut a, vec![key_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release)]);
+        assert_eq!(acts, vec![Action::None], "a released Enter does not submit");
+        assert_eq!(a.input.text, "a", "the text is still there");
+    }
+
+    /// A repeat is the key still down — it acts, like the press it
+    /// repeats.
+    #[test]
+    fn a_key_repeat_types_again() {
+        let mut a = App::new();
+        drive(&mut a, vec![key_kind(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Repeat)]);
+        assert_eq!(a.input.text, "a", "the repeat typed, like the press it repeats");
+    }
+
+    /// A control character is not text: a terminal that has text but no
+    /// key for it reports key number 0, and a NUL in the input line is
+    /// invisible — typed, and never seen.
+    #[test]
+    fn a_control_character_is_not_text() {
+        let mut a = App::new();
+        drive(&mut a, vec![key_kind(KeyCode::Char('\0'), KeyModifiers::NONE, KeyEventKind::Press)]);
+        assert_eq!(a.input.text, "", "a NUL is not typed");
+        assert_eq!(a.input.cursor, 0, "and the caret did not move");
     }
 
     #[test]
