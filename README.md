@@ -420,7 +420,7 @@ taken offline does not bring it back.
 
 ```sh
 cargo check --tests    # the gate: cheap, catches signature drift
-cargo test             # 638 unit tests + 23 integration tests
+cargo test             # 939 unit tests + 23 integration tests
 ```
 
 The architecture test (`tests/architecture.rs`) checks the layering: it
